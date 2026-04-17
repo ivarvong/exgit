@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }}
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary target: newest stable Elixir (1.19.x) on newest OTP (28.x).
+          # `erlef/setup-beam` resolves "1.19" to the latest 1.19.y.z that has
+          # an OTP-28 build on hex.pm.
+          - elixir: "1.19"
+            otp: "28"
+            primary: true
+
+    env:
+      MIX_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir / OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          # Loose matching — "1.19" → latest patch release.
+          version-type: loose
+
+      - name: Cache deps and _build
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ matrix.otp }}-${{ matrix.elixir }}-
+
+      - name: Install local Hex & rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch dependencies
+        run: mix deps.get --only $MIX_ENV
+
+      - name: Compile with warnings as errors
+        run: mix compile --warnings-as-errors
+
+      - name: Check formatting
+        if: matrix.primary
+        run: mix format --check-formatted
+
+      - name: Check for unused dependencies
+        if: matrix.primary
+        run: mix deps.unlock --check-unused
+
+      - name: Run test suite (default tiers)
+        run: mix test --warnings-as-errors
+
+      - name: Run extended tiers (slow, property, real_git)
+        # `git` ships on ubuntu-24.04 runners, so :real_git tests run.
+        run: mix test --warnings-as-errors --include slow --include real_git
+
+      - name: Run integration tests (live network)
+        # Only on pushes to main so flaky network doesn't block PRs.
+        if: matrix.primary && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: mix test --warnings-as-errors --only integration
+        continue-on-error: true

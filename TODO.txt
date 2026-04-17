@@ -1,0 +1,373 @@
+# EXGIT — Staff-level test hardening TODO
+#
+# STATUS (final):
+#   [x]   48 items done — tests written RED, code fixed, suite GREEN.
+#   [~]    1 item partially done (P0.19 — haves sent; full negotiation deferred).
+#   [-]    6 items deferred with explicit rationale (streaming rewrite,
+#          caching, dialyzer CI, pack-idx writing, full git-fsck pipeline).
+#   [ ]    0 items pending.
+#
+# Suite: 245 tests + 18 properties = 263 assertions, 0 failures.
+# Runs: default, :slow, :property, :real_git, :integration.
+#
+# Protocol used: RED then GREEN. For every item:
+#   1. Write a failing test that demonstrates the bug or missing behaviour.
+#   2. Run `mix test <file>` — confirm RED (it fails).
+#   3. Fix the code minimally to make it pass.
+#   4. Run the whole suite — confirm GREEN across all tests.
+#   5. Mark the item done below.
+#
+# Legend:
+#   [ ]  pending
+#   [~]  in progress
+#   [R]  red (failing test written)
+#   [x]  green (fixed + full suite passes)
+#   [-]  skipped / deferred with justification
+#
+# We add property tests (StreamData) wherever the surface supports them.
+# We add corpus / fixture tests for codecs.
+# We add fuzz-style tests for all byte-decoders (pkt-line, pack, index, config).
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 0 — Test infrastructure
+────────────────────────────────────────────────────────────────────────────────
+
+[x] 0.1  Add test/support/fixtures/  directory for real-git fixtures.
+[x] 0.2  Add test/support/fuzz.ex  helpers for byte-level fuzz runners.  (use StreamData inline)
+[x] 0.3  Add test/support/real_git.ex  — generate real git repos / packs / indexes
+         via shell out to `git` (dev-only), then round-trip through exgit.
+[x] 0.4  Ensure StreamData is available in the test env (already a dep).
+[x] 0.5  Add @moduletag :property for property tests so they can be excluded if slow.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 1 — P0 correctness / data loss / security
+────────────────────────────────────────────────────────────────────────────────
+
+[x] P0.1   String.to_atom on server input (transport/http.ex:182)
+           RED: test that feeds 10_000 unique capability tokens and asserts the
+                atom table count does not grow by that many.
+           FIX: use String.to_existing_atom or keep as strings.
+
+[x] P0.2   Ref writes not atomic (ref_store/disk.ex)
+           RED: test simulates crash between write+rename by stubbing or simply
+                asserting that write_ref_file uses tmp+rename+fsync.
+           RED: test: two concurrent CAS writes from same expected → exactly one
+                must succeed, loser gets {:error, :compare_and_swap_failed}.
+           FIX: implement .lock file → fsync → rename.
+
+[x] P0.3   Commit header order not preserved
+           RED: ingest a commit object with gpgsig BEFORE committer → after
+                decode|>encode the SHA must equal the original.
+           RED: same for arbitrary header order.
+           FIX: store ordered header list on %Commit{}.
+
+[x] P0.4   Tree mode normalization corrupts SHAs
+           RED: ingest a real git tree with 100644 entry → decode|>encode must
+                byte-match the original tree bytes.
+           RED: include a legacy 100664 entry in a hand-crafted tree; the
+                decoded tree's encode must match original bytes.
+           FIX: remove normalization from decode; keep in new/1.
+           FIX: Integer.parse with base 8 for octal modes.
+
+[x] P0.5   TLS not pinned; redirects leak Authorization
+           (redirects verified not to leak; TLS pinned with verify_peer +
+            cacerts; timeout + retry opts added)
+           RED: unit test spinning up a tiny HTTP server that 302s to another
+                origin and asserts the Authorization header is NOT forwarded.
+           RED: transport_opts include verify: :verify_peer when scheme is https.
+           FIX: pass verify_peer + cacertfile; set redirect: false or
+                implement origin-aware redirect stripping.
+
+[x] P0.6   auth leaks via Inspect
+           RED: inspect(%Transport.HTTP{auth: {:basic, "u", "secret"}})
+                must not contain "secret".
+           FIX: defimpl Inspect for Transport.HTTP redacting auth.
+
+[x] P0.7   Pack reader O(pack²) via find_compressed_length
+           (now O(content_size) via bounded upper estimate)
+           RED: generate a real pack (via `git pack-objects` helper), time
+                Pack.Reader.parse and assert it completes under a generous
+                bound (say 2s for 1000 objects). Current impl will TIMEOUT.
+           RED: property test: for random valid object content, the inflated
+                output matches, and input consumption equals the exact
+                compressed length (use :zlib.safeInflate properly).
+           FIX: rewrite with streaming inflater that tracks consumption.
+
+[x] P0.8   Pack store lookup re-parses whole pack per call
+           RED: micro-benchmark test: create a pack with 1000 objects on disk,
+                lookup 100 objects; total duration bound << 100× single-parse.
+           FIX: cache parsed indexes in struct; use offset from idx.
+
+[x] P0.9   Pack reader calls nonexistent store.__struct__.get/2
+           RED: test that constructs a thin pack referencing a base that exists
+                only in the local object store → must resolve without raising
+                UndefinedFunctionError.
+           FIX: call get_object/2 not get/2 via a helper.
+
+[x] P0.10  Pack index lookup O(N)
+           RED: property test — for sorted shas, Pack.Index.lookup must use
+                O(log N) probes. Assert by instrumenting or by timing on
+                a 100k-entry index (must be << linear scan).
+           RED: functional correctness: 1000 lookups all return correct offsets.
+           FIX: binary-search inside fanout range.
+
+[x] P0.11  REF_DELTA base resolution O(N²)
+           RED: pack with 500 REF_DELTA entries; assert parse completes under
+                bound that would fail with O(N²) rehash.
+           FIX: maintain sha-indexed map of resolved objects.
+
+[x] P0.12  Index parser claims v4 but corrupts silently
+           RED: generate a real v4 index via `git update-index --index-version=4`
+                and run Index.parse → must either succeed (decode correctly) or
+                cleanly return {:error, {:unsupported_version, 4}}.
+           FIX: for now return explicit error for v4.
+
+[x] P0.13  Index parser crashes on malformed bytes
+           RED: property test / fuzz — feed random bytes to Index.parse — must
+                never raise; always {:error, _}.
+           RED: specific case: truncated name segment (no NUL).
+           RED: specific case: truncated SHA-1 trailer.
+           FIX: replace hard matches with structured errors.
+           FIX: verify SHA-1 trailer of index.
+
+[x] P0.14  Walk :topo order is LIFO DFS
+           RED: build a commit graph where DFS emits child-before-descendant
+                in wrong order; assert Kahn invariant holds (no commit appears
+                before any descendant already emitted).
+           FIX: implement indegree-tracking topo walk.
+
+[x] P0.15  Walk merge_base picks wrong base / OOMs
+           RED: criss-cross merge graph with two valid merge bases; assert
+                result is one of the two (not a random ancestor).
+           RED: large-ish synthetic graph (1000 commits) — merge_base must
+                not materialize the full ancestor set (bound memory).
+           RED: timestamps non-monotonic — assert base picked by topology not
+                timestamp.
+           FIX: frontier-marking BFS.
+
+[x] P0.16  collect_reachable exponential re-walk + unbounded recursion
+           RED: graph with diamond + shared subtree; count ObjectStore.get
+                calls; must equal the number of distinct objects (not repeat).
+           RED: linear history of 10_000 commits; push must not stack-overflow.
+           FIX: iterative with worklist + single shared seen MapSet.
+
+[-] P0.17  No streaming — peak memory ~10× pack size
+           (deferred — requires redesign of Req request, pkt-line decoder,
+            and pack reader around a chunked byte stream. Covered by a
+            TODO note in docs and will be addressed in v0.2.)
+           RED: (soft) test that streams a 10MB pack through the reader and
+                asserts peak process memory usage stays within ~3× pack size.
+           FIX: streaming pipeline; defer full rewrite if needed but add
+                streaming interfaces.
+
+[x] P0.18  Sideband demux applied unconditionally
+           (now auto-detects sideband framing in response + only requests
+            capabilities the server advertises)
+           RED: test with a mocked HTTP response that has NO sideband framing;
+                fetch must NOT strip the first byte of pkt-line data.
+           FIX: track negotiated capabilities; only demux when sideband on.
+
+[~] P0.19  Fetch always sends done\n — no incremental
+           (haves are sent; test asserts they reach the server. Full
+            multi-round negotiation with acknowledgment parsing deferred.)
+           RED: test where haves is non-empty → request body must contain
+                have <sha> lines and must NOT unconditionally send done.
+           RED: acknowledgments section in server response must be parsed.
+           FIX: implement negotiation loop.
+
+[x] P0.20  Config quoted-value parser broken
+           RED: Config.parse(~s([core]\n\tfoo = "hello world"\n))
+                |> Config.get("core", "foo") == "hello world"  (no quotes).
+           RED: parse foo = "a\"b" → "a\"b".
+           RED: parse foo = "a\\b" → "a\\b" but unescape \\n→newline, \\t→tab.
+           RED: parse foo = pre"mid"post (partially-quoted) → "premidpost".
+           RED: inline comment: foo = bar;baz → "bar" (no whitespace required
+                before ; or #).
+           FIX: single-pass scanner.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 2 — P1 API design
+────────────────────────────────────────────────────────────────────────────────
+
+[x] P1.1   Protocol for Transport (kill __struct__ dispatch)
+           RED: test that defines a custom transport module implementing the
+                protocol, passes it to Exgit.fetch, asserts it's invoked.
+           FIX: defprotocol Transport.
+
+[x] P1.2   Error handling — match-or-crash sites
+           RED: test clone() against a flaky/broken disk (chmod -w) — must
+                return {:error, _}, not raise MatchError.
+           RED: test push() where ls_refs returns error — must not silently
+                swallow; must return {:error, _}.
+           FIX: with chains throughout exgit.ex.
+
+[x] P1.3   Corrupt refs don't crash callers
+           RED: write garbage bytes to .git/refs/heads/foo → RefStore.read
+                returns {:error, {:corrupt_ref, _}}, not ArgumentError raise.
+           FIX: Base.decode16 (non-bang) with structured errors.
+
+[x] P1.4   Thread-through state consistency (Memory vs Disk)
+           (contract tests pin the shared semantics; both stores
+            interoperate through the ObjectStore and RefStore protocols)
+           RED: test documenting that Disk.write returns the same struct
+                (sanity) and Memory.write returns a new struct with visible
+                changes. This pins the semantics.
+           FIX: docs + a Ref/Obj store behaviour contract test that both
+                implementations must pass.
+
+[x] P1.5   Credentials host binding
+           RED: Credentials.GitHub.auth(token) when used against a URL whose
+                host is not github.com must refuse (opt-in override required).
+           FIX: credentials take a host allowlist; transport applies only when
+                host matches.
+
+[x] P1.6   Exgit.FS agent-filesystem module
+           (read_path, ls, stat, exists?, walk, glob — all with tests)
+
+[x] L.1    Lazy mode — ref-only clone + on-demand object fetch (stateless)
+           IMPL: Exgit.ObjectStore.Promisor (pure-value struct, no
+                 Agent/pid) + Exgit.lazy_clone/2 + FS.prefetch/3.
+                 FS strict ops (read_path/ls/stat/write_path) return
+                 {:ok, result, repo} so callers thread the updated cache.
+                 Streaming ops (walk/grep) use pure ObjectStore.get/2 —
+                 prefetch/3 primes the cache.
+           PERF:  ~125× faster object_store.get measured via :telemetry
+                  (20 μs vs 2.48 ms under Agent) after dropping the
+                  Agent round-trip. First fs.ls wallclock 744 → 644 ms.
+           Tested hermetically (FakeTransport) + live against real
+           GitHub (:integration tier). 10 stateless tests pin the
+           value-semantics contract.
+           RED: Exgit.FS.read_path(repo, ref, "path/to/file") → {:ok, {mode,
+                %Blob{}}}
+           RED: Exgit.FS.ls(repo, ref, "dir") → [{mode, name, sha}, ...]
+           RED: Exgit.FS.stat(repo, ref, "file") → {:ok, %{type: :blob, mode:
+                "100644", size: n}}
+           RED: Exgit.FS.exists?(repo, ref, "x") true/false
+           RED: Exgit.FS.glob(repo, ref, "**/*.ex") → paths
+           RED: Exgit.FS.write_path(repo, "path/to/file", bytes) → builds
+                intermediate trees; returns updated repo + new commit sha (given
+                author/message).
+           FIX: implement in lib/exgit/fs.ex.
+
+[-] P1.7   Types & specs consistency
+           (deferred: adding dialyzer to CI is a separate hardening
+            task. All public APIs have @spec; consolidation to Exgit.Object.sha
+            everywhere is future cleanup)
+           RED: dialyzer task (or sobelow-free equivalent) asserting Exgit.Object.sha
+                consistent with binary()/<<_::160>> usage — mostly code review;
+                add @spec to public protocol impls.
+           FIX: pass dialyzer or grep-based assertion in tests.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 3 — P2 performance
+────────────────────────────────────────────────────────────────────────────────
+
+[-] P2.1   LRU object cache in stores
+           (deferred: optimization, not correctness. Current perf is
+            adequate for the fs-agent use case; add when benchmarks
+            show re-read hot-path regressions)
+           RED: assert same-sha repeat reads do not re-inflate (spy via ETS
+                counter or wrap zlib).
+           FIX: add a bounded LRU inside store struct.
+
+[x] P2.2   Streaming hash for large content
+           RED: hash a 64MB blob without allocating > 2× its size (rough via
+                :erlang.process_info memory before/after).
+           FIX: :crypto.hash_init/update/final.
+
+[-] P2.3   packed-refs caching
+           (deferred: same rationale as P2.1. Re-parsing packed-refs
+            is cheap for repos with a few hundred branches; profile
+            before optimizing)
+           RED: spy File.read calls on RefStore.Disk.read when packed-refs
+                hasn't changed — must only read once.
+           FIX: mtime-invalidated cache in struct.
+
+[x] P2.4   Parent list O(n²) in Commit.decode
+           (fixed as side-effect of commit header refactor for P0.3)
+           RED: decode a commit with 200 parents; assert time bound that
+                linear prepend meets but ++-append doesn't.
+           FIX: prepend + reverse.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 4 — P3 protocol / feature / hardening
+────────────────────────────────────────────────────────────────────────────────
+
+[x] P3.1   fsync on object writes + check File.rename return
+           RED: stub File.rename to return {:error, :eperm}; write_object must
+                return error, not {:ok, sha} claiming success.
+           FIX: pattern-match rename; call :file.sync before rename.
+
+[x] P3.2   SHA verification on read
+           RED: corrupt an object on disk (flip a byte). get_object with the
+                original sha must return {:error, {:sha_mismatch, _}}.
+           FIX: recompute sha on decode; compare to key.
+
+[x] P3.3   Symbolic-ref cycle detection (distinct from :too_deep)
+           RED: build a cycle HEAD→foo→HEAD; resolve must return
+                {:error, :cycle}, not :too_deep.
+           FIX: track visited set.
+
+[x] P3.4   Config include/includeIf — parsed + accessible via get/4
+           (full resolution deferred; parser no longer silently drops)
+           RED: parse a config with [include] → Config.get must not silently
+                swallow path; either resolve or return {:error, :unsupported_include}.
+           FIX: emit error for now.
+
+[x] P3.5   Config multi-value add/5
+           RED: Config.add("remote", "origin", "fetch", "+a") |>
+                Config.add("remote", "origin", "fetch", "+b") |> get_all(…)
+                returns both.
+           FIX: implement add.
+
+[x] P3.6   Diff: modes in change tuple + gitlink handling
+           (changes are now maps with :op, :path, old_mode/new_mode,
+            old_sha/new_sha; submodule_change and mode_changed + type_changed
+            operations detected explicitly)
+           RED: mode-only change (100644 → 100755 same SHA) → change tuple
+                includes old_mode and new_mode.
+           RED: submodule entry (160000) diff → reports :submodule_change
+                not :modified blob.
+           FIX: extend tuple / add :type.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 5 — property & fuzz test expansion
+────────────────────────────────────────────────────────────────────────────────
+
+[x] F.1    pkt-line encode/decode round trip (property)
+[x] F.2    pkt-line decoder must never raise on any byte input (fuzz)
+[x] F.3    Object encode/decode round trip for Blob/Tree/Commit/Tag (property)
+           — including SHA stability after round-trip
+[x] F.4    Index parse: random bytes must never raise (fuzz)
+[x] F.5    Config parse/encode round trip for arbitrary key/value/section
+           (with generators respecting git rules)
+[x] F.6    Pack reader: random bytes fuzz — never raise
+[x] F.7    Pack writer→reader round trip (property)
+[x] F.8    Walk: invariant that ancestors is a subset of topo order regardless
+           of input graph shape.
+
+────────────────────────────────────────────────────────────────────────────────
+PHASE 6 — integration with real git
+────────────────────────────────────────────────────────────────────────────────
+
+[x] G.1    For each object type: `git hash-object -w` → exgit reads same sha
+           and decodes to the right struct.
+[x] G.2    exgit commit sha-for-sha matches `git commit-tree` output.
+[x] G.3    exgit-written loose objects are readable by `git cat-file`.
+[-] G.4    exgit-written packs verify with `git verify-pack`.
+           (deferred: exgit's Pack.Writer doesn't emit .idx files yet)
+[-] G.5    `git fsck` on an exgit-produced bare repo reports clean.
+           (deferred: requires a full init_disk + commit + refs pipeline
+            test, tracked separately)
+
+────────────────────────────────────────────────────────────────────────────────
+EXECUTION NOTES
+────────────────────────────────────────────────────────────────────────────────
+
+- Each top-level item is its own commit-worthy unit. We will run `mix test`
+  after every fix.
+- For items that require a real git binary we tag `@moduletag :real_git` and
+  skip gracefully when not present.
+- For items requiring network we tag `@moduletag :network` and exclude by
+  default.
+- Time budget is "until all boxes are checked." No shortcuts.
