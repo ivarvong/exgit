@@ -367,15 +367,27 @@ defmodule Exgit.Pack.Reader do
         {:error, :zlib_truncated}
 
       true ->
-        case safe_full_inflate(data, expected_size) do
-          {:ok, content} ->
-            case find_compressed_length(data, expected_size) do
-              {:ok, n} -> {:ok, content, n}
-              {:error, _} = err -> err
-            end
+        # Only hand zlib the bytes it could possibly need. Passing the
+        # full remaining pack copies O(remaining_pack_size) into the
+        # zlib port per object → O(N²) total for N objects. Slicing
+        # down to `compressed_upper_bound` keeps it O(object_size).
+        upper = compressed_upper_bound(expected_size, byte_size(data))
 
-          {:error, _} = err ->
-            err
+        if upper < @zlib_min do
+          {:error, :zlib_bounds_invalid}
+        else
+          sliced = binary_part(data, 0, upper)
+
+          case safe_full_inflate(sliced, expected_size) do
+            {:ok, content} ->
+              case find_compressed_length(sliced, expected_size) do
+                {:ok, n} -> {:ok, content, n}
+                {:error, _} = err -> err
+              end
+
+            {:error, _} = err ->
+              err
+          end
         end
     end
   end
