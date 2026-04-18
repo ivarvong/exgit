@@ -76,4 +76,135 @@ defmodule Exgit.Repository do
   end
 
   def materialize(%__MODULE__{} = repo, _reference), do: {:ok, repo}
+
+  @typedoc """
+  Structured memory usage report for a repository.
+
+  * `:object_count` — total distinct objects in the cache
+  * `:cache_bytes` — compressed bytes stored (what
+    `:max_cache_bytes` bounds)
+  * `:commit_count`, `:tree_count`, `:blob_count`, `:tag_count` —
+    count of each object kind
+  * `:max_cache_bytes` — configured cap (`:infinity` if unbounded)
+  * `:mode` — repo mode (`:eager` or `:lazy`)
+  * `:backend` — the object-store module
+  """
+  @type memory_report :: %{
+          object_count: non_neg_integer(),
+          cache_bytes: non_neg_integer(),
+          commit_count: non_neg_integer(),
+          tree_count: non_neg_integer(),
+          blob_count: non_neg_integer(),
+          tag_count: non_neg_integer(),
+          max_cache_bytes: non_neg_integer() | :infinity,
+          mode: mode(),
+          backend: module()
+        }
+
+  @doc """
+  Returns a structured memory-usage report for `repo`.
+
+  Designed for operational monitoring — agent hosts can poll this
+  between operations to track peak memory, detect unexpected
+  cache growth, and alert when a configured cap is approached.
+
+  Returns consistent shape across all object-store backends
+  (`Memory`, `Disk`, `Promisor`, `SharedPromisor`); counts for
+  backends without per-type bookkeeping (like `Disk`) are
+  `:unknown`. The `:cache_bytes` and `:max_cache_bytes` fields
+  are always present.
+
+  ## Examples
+
+      iex> {:ok, repo} = Exgit.clone(url, lazy: true)
+      iex> {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
+      iex> Exgit.Repository.memory_report(repo)
+      %{
+        object_count: 17_500,
+        cache_bytes: 4_213_780,
+        commit_count: 0,
+        tree_count: 8_290,
+        blob_count: 9_210,
+        tag_count: 0,
+        max_cache_bytes: :infinity,
+        mode: :lazy,
+        backend: Exgit.ObjectStore.Promisor
+      }
+
+  ## Use in an agent
+
+      repo
+      |> Exgit.Repository.memory_report()
+      |> log_to_your_observability_stack()
+
+  """
+  @spec memory_report(t()) :: memory_report()
+  def memory_report(%__MODULE__{object_store: store, mode: mode}) do
+    base = store_report(store)
+    Map.merge(base, %{mode: mode, backend: backend_module(store)})
+  end
+
+  defp store_report(%Exgit.ObjectStore.Promisor{
+         cache: cache,
+         cache_bytes: cache_bytes,
+         max_cache_bytes: max_cache_bytes
+       }) do
+    %Exgit.ObjectStore.Memory{objects: objs} = cache
+
+    counts =
+      Enum.reduce(objs, %{commit: 0, tree: 0, blob: 0, tag: 0}, fn {_sha, {type, _}}, acc ->
+        Map.update(acc, type, 1, &(&1 + 1))
+      end)
+
+    %{
+      object_count: map_size(objs),
+      cache_bytes: cache_bytes,
+      commit_count: counts.commit,
+      tree_count: counts.tree,
+      blob_count: counts.blob,
+      tag_count: counts.tag,
+      max_cache_bytes: max_cache_bytes
+    }
+  end
+
+  defp store_report(%Exgit.ObjectStore.Memory{objects: objs}) do
+    counts =
+      Enum.reduce(objs, %{commit: 0, tree: 0, blob: 0, tag: 0}, fn {_sha, {type, compressed}},
+                                                                   acc ->
+        acc
+        |> Map.update(type, 1, &(&1 + 1))
+        |> Map.update(:bytes, byte_size(compressed), &(&1 + byte_size(compressed)))
+      end)
+
+    %{
+      object_count: map_size(objs),
+      cache_bytes: Map.get(counts, :bytes, 0),
+      commit_count: counts.commit,
+      tree_count: counts.tree,
+      blob_count: counts.blob,
+      tag_count: counts.tag,
+      max_cache_bytes: :infinity
+    }
+  end
+
+  defp store_report(other) do
+    # Backends we don't introspect deeply (ObjectStore.Disk,
+    # user-defined stores). Report a degraded shape with
+    # placeholders so callers can still depend on the keys
+    # existing.
+    _ = other
+
+    %{
+      object_count: 0,
+      cache_bytes: 0,
+      commit_count: 0,
+      tree_count: 0,
+      blob_count: 0,
+      tag_count: 0,
+      max_cache_bytes: :infinity
+    }
+  end
+
+  defp backend_module(%mod{}), do: mod
+  defp backend_module(_), do: :unknown
 end

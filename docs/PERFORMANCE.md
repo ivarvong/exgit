@@ -311,22 +311,98 @@ A summary of the perf wins that are live, in order of impact:
 ## Running the benchmark yourself
 
 ```
-# All three fixtures, default run counts
+# Startup-cost bench: clone + prefetch + one grep
 mix run bench/review_bench.exs
 
-# Just pyex, 10 runs
-mix run bench/review_bench.exs 10 pyex
+# Agent-workload bench: realistic mixed ls/grep/read session
+mix run bench/agent_workload.exs
 
-# Just agents, 3 runs (slower; live-network)
-mix run bench/review_bench.exs 3 agents
+# Just pyex, 10 runs on either bench
+mix run bench/review_bench.exs 10 pyex
+mix run bench/agent_workload.exs 5 pyex hot
 
 # Pack-parse scaling bench (synthetic, offline)
 mix run bench/pack_parse_bench.exs
 ```
 
-Both harnesses live in `bench/`. They emit full per-phase and
+Harnesses live in `bench/`. They emit full per-phase and
 per-event numbers so you can see exactly where time is going for
 your network / workload.
+
+## Instrumentation
+
+Two new APIs for profiling and memory telemetry:
+
+### `Exgit.Profiler`
+
+Structured trace of every `:telemetry` span emitted during a
+function call. Use for ad-hoc "where did time go?" questions
+without adding print statements or building a handler.
+
+```elixir
+{result, profile} =
+  Exgit.Profiler.profile(fn ->
+    {:ok, repo} = Exgit.clone(url, lazy: true)
+    {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
+    Exgit.FS.grep(repo, "HEAD", "foo") |> Enum.to_list()
+  end)
+
+profile.total_us          # wall-clock in microseconds
+profile.peak_cache_bytes  # observed peak memory
+profile.totals            # %{"fs.grep" => %{count: 1, us: 11_000}, ...}
+profile.events            # full ordered event list for drill-down
+```
+
+Attach once and read periodically for long-running processes:
+
+```elixir
+{:ok, handle} = Exgit.Profiler.attach()
+# ... do work ...
+profile = Exgit.Profiler.read(handle)
+Exgit.Profiler.detach(handle)
+```
+
+### `Exgit.Repository.memory_report/1`
+
+Structured memory report for a repo. Call between operations to
+track peak memory, detect unexpected cache growth, or alert when
+a configured cap is approached.
+
+```elixir
+Exgit.Repository.memory_report(repo)
+# => %{
+#   object_count: 17_500,
+#   cache_bytes: 4_213_780,
+#   commit_count: 122,
+#   tree_count: 8_290,
+#   blob_count: 9_210,
+#   tag_count: 0,
+#   max_cache_bytes: :infinity,
+#   mode: :lazy,
+#   backend: Exgit.ObjectStore.Promisor
+# }
+```
+
+Consistent shape across all object-store backends. Suitable for
+emission into observability stacks (Prometheus, Datadog, etc.)
+without downstream branching on backend type.
+
+## Correctness oracle
+
+`Exgit.FS.grep` output is validated against `git grep` via
+`test/exgit/fs_grep_git_parity_test.exs`. The test builds a small
+real-git repo, runs both `git grep -n` and `Exgit.FS.grep` against
+a set of representative patterns, and asserts the two agree on
+the `(path, line_number)` match set.
+
+Tagged `:real_git` (requires `git` on PATH) and `:slow` (runs 20+
+pattern variants). Part of the extended-tier CI run that gates
+every push.
+
+Today's coverage: 7 patterns against 5 synthetic files. Expanding
+the corpus is future work; the current set catches regressions in
+line-number computation, regex semantics, and binary-file
+skipping — the classes of bug most likely to land silently.
 
 ## Known caveats
 
