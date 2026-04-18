@@ -164,12 +164,32 @@ defmodule Exgit.Profiler do
     do_handle_event(event_name, measurements, metadata, table)
   end
 
-  @doc "Read the profile accumulated so far on `handle`."
+  @doc """
+  Read the profile accumulated so far on `handle`.
+
+  Only events fired from the calling process are included. This
+  matters when multiple profilers (or async tests) are attached
+  concurrently: each profiler sees only its own caller's events.
+
+  ## Caveat: child processes
+
+  Events fired in processes spawned by `fun` (e.g.
+  `Task.async_stream` workers from parallel `FS.grep`) will
+  NOT be captured — they fire in worker pids, not the caller.
+  For profiling parallel workloads, use `attach/0` + read from
+  each worker, or emit your own spanning event at the parent
+  level.
+  """
   @spec read(handle()) :: t()
   def read(%{table: table}) do
+    caller = self()
+
     events =
       :ets.tab2list(table)
-      |> Enum.map(fn {_key, record} -> record end)
+      |> Enum.flat_map(fn
+        {:event, %{pid: ^caller} = record} -> [record]
+        _ -> []
+      end)
       |> Enum.sort_by(& &1.started_at)
 
     totals = aggregate_totals(events)
@@ -210,7 +230,12 @@ defmodule Exgit.Profiler do
       event: event_name_to_string(event_name),
       duration_us: duration_us,
       metadata: metadata,
-      started_at: started_at
+      started_at: started_at,
+      # Record the firing process so `read/1` can filter down to
+      # events fired by the profiler's caller (important for async
+      # test suites where multiple profilers are attached
+      # simultaneously).
+      pid: self()
     }
 
     :ets.insert(table, {:event, record})
