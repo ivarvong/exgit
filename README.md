@@ -249,8 +249,30 @@ Every mutating operation returns the updated store. Thread the repo struct throu
 
 ## Status
 
-v0.1 — functional for clone, fetch, push over HTTPS. Tested against
-GitHub, validated with `git fsck`.
+v0.1 — production-hardened. All P0 security and crash-safety work
+from the staff-engineering review is closed:
+
+- **Ref-name validation** at the transport boundary. A hostile
+  remote cannot escape the repo root via a crafted ref name.
+- **Credentials are host-bound by default.** Bare auth tuples are
+  auto-wrapped into host-scoped `%Exgit.Credentials{}` on
+  `Transport.HTTP.new/2`. Cross-origin redirects cannot leak tokens
+  regardless of Req's behavior.
+- **Every decoder returns `{:error, _}`, never raises.** 1000-case
+  property/fuzz tests across `Pack.Reader`, `Pack.Delta`,
+  `Pack.Common`, `Index.parse`, and config parsing.
+- **Pack parse memory is bounded** (`:max_pack_bytes` default 2 GiB,
+  `:max_object_bytes` default 100 MiB).
+- **`:file.pread/3`** for disk pack lookups — single-object latency
+  is now independent of pack size.
+- **360+ tests, 29 properties, 0 failures** across default, slow,
+  real_git, and live-integration tiers.
+- **CI gates**: Elixir 1.19 / OTP 28 on ubuntu-24.04 with
+  warnings-as-errors, Credo, Dialyzer, format check, partial-clone
+  roundtrip against GitHub.
+
+See [CHANGELOG.md](./CHANGELOG.md) for details and
+[SECURITY.md](./SECURITY.md) for the threat model.
 
 ## Versioning
 
