@@ -9,7 +9,7 @@ defmodule Exgit.Security.RefEscapeTest do
   use ExUnit.Case, async: true
 
   alias Exgit.Object.Blob
-  alias Exgit.{ObjectStore, Transport}
+  alias Exgit.ObjectStore
 
   defmodule HostileTransport do
     defstruct [:origin, :ref_name]

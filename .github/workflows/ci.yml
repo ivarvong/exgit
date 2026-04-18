@@ -80,6 +80,8 @@ jobs:
 
       - name: Credo (strict)
         if: matrix.primary
+        env:
+          MIX_ENV: dev
         run: mix credo --strict
         continue-on-error: true
 
