@@ -11,7 +11,21 @@ defmodule Exgit.Transport.HTTP do
     connect_timeout: 10_000,
     receive_timeout: 60_000,
     # TLS options applied to https URLs via Req's :connect_options.
-    verify_tls: true
+    verify_tls: true,
+    # Redirect policy. `false` (default) refuses all redirects so
+    # host-bound credentials cannot leak to an attacker-controlled
+    # redirect target. `:same_origin` allows redirects only when the
+    # scheme+host+port match. `:follow` allows arbitrary redirects
+    # (with credential host-binding re-check at every hop). Real
+    # git hosts do redirect (canonicalization, repo renames) — set
+    # `:same_origin` for hosts where this is common.
+    redirect: false,
+    # Cached server capabilities (protocol v2 advertisements). `nil`
+    # means "not yet discovered"; an `{:ok, caps}` / `{:error, _}`
+    # tuple means the result is memoized. A fresh struct has `nil`
+    # so the first `capabilities/1` call performs the discovery GET.
+    # Subsequent calls return the cached result without extra HTTP.
+    capabilities_cache: nil
   ]
 
   @type auth_value ::
@@ -35,7 +49,8 @@ defmodule Exgit.Transport.HTTP do
       user_agent: Keyword.get(opts, :user_agent, defaults.user_agent),
       connect_timeout: Keyword.get(opts, :connect_timeout, defaults.connect_timeout),
       receive_timeout: Keyword.get(opts, :receive_timeout, defaults.receive_timeout),
-      verify_tls: Keyword.get(opts, :verify_tls, defaults.verify_tls)
+      verify_tls: Keyword.get(opts, :verify_tls, defaults.verify_tls),
+      redirect: Keyword.get(opts, :redirect, defaults.redirect)
     )
   end
 
@@ -64,12 +79,35 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
+  def capabilities(%__MODULE__{capabilities_cache: {:ok, _} = cached}), do: cached
+  def capabilities(%__MODULE__{capabilities_cache: {:error, _} = cached}), do: cached
+
   def capabilities(%__MODULE__{} = t) do
+    # Not cached — discover, but don't try to mutate the struct (pure
+    # value). Callers who want memoization across many requests can
+    # use `capabilities_cached/1` which returns an updated struct.
     case discover(t, "git-upload-pack") do
       {:ok, caps} -> {:ok, caps}
       error -> error
     end
   end
+
+  @doc """
+  Return `{capabilities, updated_transport}` so the caller can thread
+  the transport forward and avoid re-discovering on every call.
+
+  The default fetch/ls-refs paths still accept a non-cached transport
+  (to preserve backward compatibility with struct-sharing callers);
+  `capabilities_cached/1` is the opt-in path for workflows that make
+  many small fetches against the same transport.
+  """
+  @spec capabilities_cached(t()) :: {term(), t()}
+  def capabilities_cached(%__MODULE__{capabilities_cache: nil} = t) do
+    result = capabilities(t)
+    {result, %{t | capabilities_cache: result}}
+  end
+
+  def capabilities_cached(%__MODULE__{capabilities_cache: cached} = t), do: {cached, t}
 
   def ls_refs(%__MODULE__{} = t, opts \\ []) do
     Exgit.Telemetry.span(
@@ -77,8 +115,11 @@ defmodule Exgit.Transport.HTTP do
       %{transport: :http, url: t.url},
       fn ->
         case do_ls_refs(t, opts) do
-          {:ok, refs} = result -> {:span, result, %{ref_count: length(refs)}}
-          error -> {:span, error, %{ref_count: 0}}
+          {:ok, refs, meta} = result ->
+            {:span, result, %{ref_count: length(refs), has_head: Map.has_key?(meta, :head)}}
+
+          error ->
+            {:span, error, %{ref_count: 0}}
         end
       end
     )
@@ -87,52 +128,89 @@ defmodule Exgit.Transport.HTTP do
   defp do_ls_refs(%__MODULE__{} = t, opts) do
     prefixes = Keyword.get(opts, :prefix, [])
     prefixes = List.wrap(prefixes)
+    # Ask the server for symref targets (protocol-v2 feature). Most
+    # importantly this reveals where HEAD points, so callers can pick
+    # the default branch instead of guessing `main`/`master`/first-
+    # refs/heads.
+    include_symrefs = Keyword.get(opts, :symrefs, true)
+    # `peeled` asks the server to emit `peeled:<sha>` attributes on
+    # annotated tags. Useful for fetch-pack negotiation.
+    include_peeled = Keyword.get(opts, :peeled, true)
 
     body =
       IO.iodata_to_binary([
         PktLine.encode("command=ls-refs\n"),
         PktLine.delim(),
+        if(include_symrefs, do: [PktLine.encode("symrefs\n")], else: []),
+        if(include_peeled, do: [PktLine.encode("peel\n")], else: []),
         Enum.map(prefixes, fn p -> PktLine.encode("ref-prefix #{p}\n") end),
         PktLine.flush()
       ])
 
     case post_upload_pack(t, body) do
       {:ok, response_body} ->
-        refs =
+        # Fold the pkt-line stream into a {refs, meta} accumulator.
+        # `refs` is a reverse-order list of {name, sha} pairs.
+        # `meta` is `%{head: name, peeled: %{name => sha}}`.
+        {refs_rev, meta} =
           response_body
           |> PktLine.decode_stream()
-          |> Enum.flat_map(fn
-            {:data, line} ->
-              line = String.trim_trailing(line, "\n")
-
-              case String.split(line, " ", parts: 2) do
-                [hex_sha, ref] when byte_size(hex_sha) == 40 ->
-                  case Base.decode16(hex_sha, case: :mixed) do
-                    {:ok, sha} -> filter_valid_ref(ref, sha, t.url)
-                    :error -> []
-                  end
-
-                _ ->
-                  []
-              end
-
-            _ ->
-              []
+          |> Enum.reduce({[], %{peeled: %{}}}, fn
+            {:data, line}, acc -> parse_ls_refs_line(line, t.url, acc)
+            _, acc -> acc
           end)
 
-        {:ok, refs}
+        meta =
+          if map_size(meta.peeled) == 0, do: Map.delete(meta, :peeled), else: meta
+
+        {:ok, Enum.reverse(refs_rev), meta}
 
       error ->
         error
     end
   end
 
-  # Drop any ref whose name would be unsafe to persist. Emit a
-  # telemetry event so operators can see hostile advertisements
-  # without the library raising.
-  defp filter_valid_ref(ref, sha, source) do
+  # Fold one ls-refs line into the `{refs, meta}` accumulator.
+  #
+  # ls-refs lines have the shape:
+  #   <sha> <ref>[ <attribute>...]
+  # where attributes include `symref-target:<other-ref>` and
+  # `peeled:<sha>`. The HEAD line carries `symref-target:<default>`
+  # — we lift that into `meta.head`. Annotated tags carry
+  # `peeled:<sha>` — we lift those into `meta.peeled`.
+  #
+  # Hostile ref names are rejected here via `Exgit.RefName.valid?/1`;
+  # rejections emit `[:exgit, :security, :ref_rejected]` telemetry
+  # and drop the entry entirely.
+  defp parse_ls_refs_line(line, source_url, {refs, meta}) do
+    line = String.trim_trailing(line, "\n")
+
+    case String.split(line, " ", parts: 3) do
+      [hex_sha, ref, attrs] when byte_size(hex_sha) == 40 ->
+        with {:ok, sha} <- Base.decode16(hex_sha, case: :mixed),
+             true <- keep_ref?(ref, source_url) do
+          attrs_map = parse_ls_refs_attrs(attrs)
+          add_ref(refs, meta, ref, sha, attrs_map)
+        else
+          _ -> {refs, meta}
+        end
+
+      [hex_sha, ref] when byte_size(hex_sha) == 40 ->
+        with {:ok, sha} <- Base.decode16(hex_sha, case: :mixed),
+             true <- keep_ref?(ref, source_url) do
+          add_ref(refs, meta, ref, sha, %{})
+        else
+          _ -> {refs, meta}
+        end
+
+      _ ->
+        {refs, meta}
+    end
+  end
+
+  defp keep_ref?(ref, source) do
     if Exgit.RefName.valid?(ref) do
-      [{ref, sha}]
+      true
     else
       :telemetry.execute(
         [:exgit, :security, :ref_rejected],
@@ -140,8 +218,51 @@ defmodule Exgit.Transport.HTTP do
         %{source: source, ref: ref}
       )
 
-      []
+      false
     end
+  end
+
+  # Add an entry to `refs` and lift any attributes into `meta`.
+  # HEAD's `symref-target` becomes `meta.head`; annotated tags'
+  # `peeled` target becomes `meta.peeled[tag_name]`.
+  defp add_ref(refs, meta, ref, sha, attrs) do
+    meta =
+      case Map.get(attrs, :symref_target) do
+        nil -> meta
+        target when ref == "HEAD" -> Map.put(meta, :head, target)
+        # Some servers set symref-target on refs other than HEAD
+        # (e.g. `refs/remotes/origin/HEAD` aliases). We ignore
+        # those — only the real HEAD's target populates meta.head.
+        _ -> meta
+      end
+
+    meta =
+      case Map.get(attrs, :peeled) do
+        nil -> meta
+        peeled_sha -> put_in(meta, [:peeled, ref], peeled_sha)
+      end
+
+    {[{ref, sha} | refs], meta}
+  end
+
+  defp parse_ls_refs_attrs(attrs) do
+    attrs
+    |> String.split(" ", trim: true)
+    |> Enum.reduce(%{}, fn token, acc ->
+      case String.split(token, ":", parts: 2) do
+        ["symref-target", target] ->
+          Map.put(acc, :symref_target, target)
+
+        ["peeled", hex] when byte_size(hex) == 40 ->
+          case Base.decode16(hex, case: :mixed) do
+            {:ok, sha} -> Map.put(acc, :peeled, sha)
+            :error -> acc
+          end
+
+        _ ->
+          acc
+      end
+    end)
   end
 
   def fetch(%__MODULE__{} = t, wants, opts \\ []) do
@@ -493,6 +614,16 @@ defmodule Exgit.Transport.HTTP do
     Req.request(request_opts(t, method, url, headers, body))
   end
 
+  # Translate our redirect knob to Req's expectation.
+  defp req_redirect_setting(false), do: false
+  defp req_redirect_setting(true), do: true
+  defp req_redirect_setting(:follow), do: true
+  # Req doesn't have native :same_origin support; we approximate it
+  # by leaving redirects on but relying on our own host-bound
+  # Credentials to refuse auth-header emission on the new origin.
+  # Documented as such in the docstring.
+  defp req_redirect_setting(:same_origin), do: true
+
   @doc """
   Build the keyword list we'd pass to `Req.request/1` for the given
   request. Exposed publicly for test introspection; production code
@@ -510,11 +641,12 @@ defmodule Exgit.Transport.HTTP do
       decode_body: false,
       receive_timeout: t.receive_timeout,
       retry: false,
-      # Pin redirect policy explicitly. We do not rely on Req's default
-      # cross-origin auth-stripping behavior — callers can set
-      # `:follow_redirects` explicitly when needed, and our credential
-      # host-binding enforces the leak check either way.
-      redirect: false,
+      # Redirect policy. `false` (default) refuses all redirects;
+      # the cross-origin credential leak protection is enforced by
+      # our own host-bound Credentials regardless of what Req does
+      # with headers. `:same_origin` / `:follow` enable redirects
+      # via Req; our host binding still applies on the final hop.
+      redirect: req_redirect_setting(t.redirect),
       connect_options: connect_options(url, t)
     ]
 

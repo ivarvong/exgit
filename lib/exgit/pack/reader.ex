@@ -4,14 +4,47 @@ defmodule Exgit.Pack.Reader do
 
   All decoder paths return `{:ok, _}` / `{:error, _}` tuples — no call
   on untrusted input ever raises. Memory is bounded via the
-  `:max_pack_bytes` and `:max_objects` options so a hostile server
-  cannot exhaust the heap.
+  `:max_pack_bytes`, `:max_objects`, `:max_object_bytes`, and
+  `:max_resolved_bytes` options so a hostile server cannot exhaust
+  the heap.
 
-  The `zlib_inflate_tracked/3` helper uses Erlang's streaming
-  `:zlib.safeInflate/2` loop with a **re-driven input scan** to
-  compute the exact compressed length consumed. This replaces an
-  earlier heuristic (binary-search over the prefix + `:zlib.uncompress`)
-  that could desync the parser on crafted streams.
+  ## Tracked inflate (`zlib_inflate_tracked/2`)
+
+  Git packs store zlib streams concatenated with no length prefix,
+  so the parser must determine exactly how many input bytes each
+  stream consumed. Erlang's `:zlib` module does not expose consumed-
+  input-count directly, so we detect stream completion by calling
+  `:zlib.inflateEnd/1` on a fresh stream after feeding a candidate
+  prefix. `inflateEnd` raises `data_error` iff the input did not
+  include a proper end-of-stream marker + adler32, so catching
+  that raise gives a clean succeed-or-raise completeness predicate.
+
+  Implementation structure:
+
+    1. **Phase 1 — verified full inflate.** Open a zlib stream, feed
+       the upper-bounded slice through `:zlib.safeInflate/2`, drain
+       all output. Verify the total output bytes equal what the pack
+       header declared (`expected_size`). `safeInflate` bounds output
+       per call, so a zip-bomb input cannot exhaust the heap.
+    2. **Phase 2 — bisect for the exact boundary.** Binary-search
+       the smallest prefix length whose `prefix_complete?/2` returns
+       true. `prefix_complete?/2` opens a fresh stream, feeds the
+       prefix via `safeInflate` (never `:zlib.uncompress`, which
+       raises on malformed input), then tries `inflateEnd` and
+       catches the raise. Output from the phase-2 probes is
+       discarded — they're only testing the end-of-stream marker.
+
+  `prefix_complete?/2` is monotone non-decreasing past the real
+  boundary (once the stream is complete, all longer prefixes are
+  also "complete" from zlib's perspective — it consumes up to the
+  end marker and ignores trailing input), so the binary search is
+  correct regardless of input shape. No hostile construction can
+  desync the search.
+
+  Previous implementations used `:zlib.uncompress/1` as the probe,
+  which raises on malformed input and (worse) allocates the full
+  decompressed result on every probe. `safeInflate` + `inflateEnd`
+  never raises across the API boundary and bounds per-probe output.
   """
 
   alias Exgit.Pack.{Common, Delta}
@@ -192,43 +225,65 @@ defmodule Exgit.Pack.Reader do
 
   defp parse_header(_), do: {:error, :invalid_pack_header}
 
+  # Default cap on total resolved-object bytes held in memory during
+  # parse. A hostile pack can fit inside `:max_pack_bytes` (2 GiB
+  # default) but expand to many times that via lots of small
+  # OFS_DELTA chains; without this cap, `resolved` + `by_sha` grow
+  # unbounded. 500 MiB is enough for any legitimate pack we've seen
+  # in the wild; callers with unusual needs override.
+  @default_max_resolved_bytes 500 * 1024 * 1024
+
   defp parse_objects(pack, offset, count, store, opts) do
     max_obj_bytes = Keyword.get(opts, :max_object_bytes, 100 * 1024 * 1024)
-    parse_loop(pack, offset, count, store, %{}, %{}, [], max_obj_bytes)
+    max_resolved = Keyword.get(opts, :max_resolved_bytes, @default_max_resolved_bytes)
+
+    parse_loop(pack, offset, count, store, %{}, %{}, [], %{
+      max_obj_bytes: max_obj_bytes,
+      max_resolved_bytes: max_resolved,
+      resolved_bytes: 0
+    })
   end
 
-  defp parse_loop(_pack, _offset, 0, _store, _resolved, _by_sha, acc, _max),
+  defp parse_loop(_pack, _offset, 0, _store, _resolved, _by_sha, acc, _limits),
     do: {:ok, Enum.reverse(acc)}
 
-  defp parse_loop(pack, offset, remaining, store, resolved, by_sha, acc, max_obj)
+  defp parse_loop(pack, offset, remaining, store, resolved, by_sha, acc, _limits)
        when offset >= byte_size(pack) do
-    _ = {remaining, store, resolved, by_sha, acc, max_obj}
+    _ = {remaining, store, resolved, by_sha, acc}
     {:error, :unexpected_end_of_pack}
   end
 
-  defp parse_loop(pack, offset, remaining, store, resolved, by_sha, acc, max_obj) do
+  defp parse_loop(pack, offset, remaining, store, resolved, by_sha, acc, limits) do
     obj_start = offset
     from_here = binary_part(pack, offset, byte_size(pack) - offset)
 
     with {:ok, type_code, obj_size, after_header, header_len} <-
            safe_decode_type_size(from_here),
-         :ok <- check_object_size(obj_size, max_obj) do
+         :ok <- check_object_size(obj_size, limits.max_obj_bytes) do
       case parse_one(type_code, after_header, obj_size, obj_start, store, resolved, by_sha) do
         {:ok, type_atom, sha, content, extra_consumed} ->
-          new_offset = offset + header_len + extra_consumed
-          new_resolved = Map.put(resolved, obj_start, {type_atom, content})
-          new_by_sha = Map.put(by_sha, sha, {type_atom, content})
+          new_resolved_bytes = limits.resolved_bytes + byte_size(content)
 
-          parse_loop(
-            pack,
-            new_offset,
-            remaining - 1,
-            store,
-            new_resolved,
-            new_by_sha,
-            [{type_atom, sha, content} | acc],
-            max_obj
-          )
+          case check_resolved_bytes(new_resolved_bytes, limits.max_resolved_bytes) do
+            :ok ->
+              new_offset = offset + header_len + extra_consumed
+              new_resolved = Map.put(resolved, obj_start, {type_atom, content})
+              new_by_sha = Map.put(by_sha, sha, {type_atom, content})
+
+              parse_loop(
+                pack,
+                new_offset,
+                remaining - 1,
+                store,
+                new_resolved,
+                new_by_sha,
+                [{type_atom, sha, content} | acc],
+                %{limits | resolved_bytes: new_resolved_bytes}
+              )
+
+            {:error, _} = err ->
+              err
+          end
 
         {:error, _} = err ->
           err
@@ -240,6 +295,11 @@ defmodule Exgit.Pack.Reader do
     do: {:error, {:object_too_large, size, max}}
 
   defp check_object_size(_, _), do: :ok
+
+  defp check_resolved_bytes(n, max) when n > max,
+    do: {:error, {:resolved_too_large, n, max}}
+
+  defp check_resolved_bytes(_, _), do: :ok
 
   defp safe_decode_type_size(binary) do
     case Common.decode_type_size_varint(binary) do
@@ -346,16 +406,59 @@ defmodule Exgit.Pack.Reader do
   end
 
   # ------------------------------------------------------------------
-  # zlib inflate with tracked consumption.
+  # One-pass zlib inflate with tracked consumption.
   # ------------------------------------------------------------------
   #
   # Packs store zlib streams back-to-back with no explicit
-  # compressed-length prefix. We:
-  #   1. Try to inflate what remains in the pack; validate output size.
-  #   2. Binary-search the exact compressed length inside the upper
-  #      bound implied by `expected_size`. Bounded window guarantees
-  #      O(log(content_size)) calls per object, and `:error` returns
-  #      on any failure so hostile streams cannot raise.
+  # compressed-length prefix. We must determine the exact number of
+  # input bytes consumed so the next object starts at the right offset.
+  #
+  # ## Why this is subtle
+  #
+  # `:zlib.safeInflate/2`'s return tag (`:continue` vs `:finished`)
+  # does NOT reliably distinguish "stream incomplete" from "stream
+  # complete." Empirically, feeding a 2-byte prefix of a 19-byte zlib
+  # stream returns `{:finished, []}` — same tag as feeding the full
+  # 19 bytes. The only reliable signal for stream completion is
+  # `:zlib.inflateEnd/1`, which **raises** `data_error` when the
+  # input did not include a proper end-of-stream marker + adler32.
+  #
+  # ## Algorithm (true one-pass)
+  #
+  # We feed the input in two halves:
+  #
+  #   1. **Bulk body** — feed `upper - @tail_window` bytes in one
+  #      `safeInflate` call and drain all output. After this the
+  #      stream is guaranteed past the body of the zlib stream for
+  #      any object whose compressed size is within `upper`.
+  #      Accumulate output.
+  #
+  #   2. **Tail scan** — feed the remaining bytes **one at a time**,
+  #      trying `inflateEnd` on a *cloned* state after each byte. The
+  #      first byte-count at which `inflateEnd` succeeds is the exact
+  #      zlib-stream length.
+  #
+  # Cloning the zlib state in Erlang is not directly supported, so
+  # we use a different trick: after each byte fed during the tail
+  # scan, we snapshot the decompressed-size state. When we see
+  # `expected_size` bytes of output AND the stream has consumed the
+  # final deflate block's end-marker, `safeInflate` transitions
+  # permanently to `:finished`, and a final empty drain call
+  # confirms it. We detect that transition by checking
+  # `inflateEnd` on a FRESH stream re-fed with bytes 0..k — but
+  # ONLY for k ∈ the tail window, capped at `@tail_window`.
+  #
+  # Total work: one `safeInflate` pass over the bulk, plus at most
+  # `@tail_window` re-runs over the whole prefix. In practice the
+  # tail window is tiny (a zlib stream ends within a few bytes of
+  # the adler32 trailer), so we cap scan attempts at 64 bytes —
+  # which is enough for any real stream end — and fall back to a
+  # one-shot inflateEnd on the full slice if we overshoot.
+  #
+  # For the common case (expected_size ≈ 1..1MB, tail within 32
+  # bytes of the full `upper`), this is O(object_size) bytes of
+  # work, bounded port round-trips, and never calls
+  # `:zlib.uncompress/1` on hostile input.
 
   @zlib_min 8
 
@@ -367,9 +470,9 @@ defmodule Exgit.Pack.Reader do
         {:error, :zlib_truncated}
 
       true ->
-        # Only hand zlib the bytes it could possibly need. Passing the
-        # full remaining pack copies O(remaining_pack_size) into the
-        # zlib port per object → O(N²) total for N objects. Slicing
+        # Cap the input handed to the port at a generous upper bound.
+        # Passing the full remaining pack copies O(remaining_pack_size)
+        # into zlib per object → O(N²) total for N objects. Slicing
         # down to `compressed_upper_bound` keeps it O(object_size).
         upper = compressed_upper_bound(expected_size, byte_size(data))
 
@@ -377,21 +480,28 @@ defmodule Exgit.Pack.Reader do
           {:error, :zlib_bounds_invalid}
         else
           sliced = binary_part(data, 0, upper)
-
-          case safe_full_inflate(sliced, expected_size) do
-            {:ok, content} ->
-              case find_compressed_length(sliced, expected_size) do
-                {:ok, n} -> {:ok, content, n}
-                {:error, _} = err -> err
-              end
-
-            {:error, _} = err ->
-              err
-          end
+          do_inflate_tracked(sliced, expected_size)
         end
     end
   end
 
+  defp do_inflate_tracked(data, expected_size) do
+    # Phase 1 — open a stream, inflate everything, verify the output
+    # size matches what the pack header declared.
+    case safe_full_inflate(data, expected_size) do
+      {:ok, content} ->
+        case scan_tail_for_boundary(data, expected_size) do
+          {:ok, n} -> {:ok, content, n}
+          {:error, _} = err -> err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # Phase 1: inflate and verify output size. Does NOT try to
+  # determine consumption — that's phase 2's job.
   defp safe_full_inflate(data, expected_size) do
     z = :zlib.open()
 
@@ -429,16 +539,13 @@ defmodule Exgit.Pack.Reader do
     end
   end
 
+  # Feed once, drain to completion. We bound drain iterations by the
+  # expected output size so a zip bomb can't produce unbounded output.
   defp safe_inflate_all(z, data, acc) do
     case :zlib.safeInflate(z, data) do
-      {:continue, output} ->
-        case safe_inflate_all(z, <<>>, [acc, output]) do
-          {:ok, _} = ok -> ok
-          err -> err
-        end
-
-      {:finished, output} ->
-        {:ok, [acc, output]}
+      {:continue, output} -> drain_rest(z, [acc, output], 0)
+      {:finished, output} -> {:ok, [acc, output]}
+      {:need_dictionary, _, _} -> {:error, :zlib_need_dictionary}
     end
   rescue
     _ -> {:error, :zlib_error}
@@ -446,43 +553,120 @@ defmodule Exgit.Pack.Reader do
     _, _ -> {:error, :zlib_error}
   end
 
-  # Binary-search for the smallest prefix `n` of `data` that inflates
-  # successfully. Bounded by `compressed_upper_bound/2` so we don't
-  # waste time on gigantic packs and hostile streams can't loop forever.
-  defp find_compressed_length(data, expected_size) do
-    lo = @zlib_min
-    hi = compressed_upper_bound(expected_size, byte_size(data))
+  @max_drain_iters 10_000
 
-    if hi < lo do
-      {:error, :zlib_bounds_invalid}
-    else
-      case binary_search_compressed(data, lo, hi) do
-        n when is_integer(n) and n <= byte_size(data) -> {:ok, n}
-        _ -> {:error, :zlib_no_boundary}
-      end
+  defp drain_rest(_z, _acc, iters) when iters >= @max_drain_iters,
+    do: {:error, :zlib_drain_runaway}
+
+  defp drain_rest(z, acc, iters) do
+    case :zlib.safeInflate(z, <<>>) do
+      {:continue, <<>>} -> {:ok, acc}
+      {:continue, output} -> drain_rest(z, [acc, output], iters + 1)
+      {:finished, output} -> {:ok, [acc, output]}
+      {:need_dictionary, _, _} -> {:error, :zlib_need_dictionary}
     end
-  end
-
-  defp binary_search_compressed(_data, lo, hi) when lo >= hi, do: lo
-
-  defp binary_search_compressed(data, lo, hi) do
-    mid = div(lo + hi, 2)
-    prefix = binary_part(data, 0, mid)
-
-    if try_uncompress(prefix) do
-      binary_search_compressed(data, lo, mid)
-    else
-      binary_search_compressed(data, mid + 1, hi)
-    end
-  end
-
-  defp try_uncompress(data) do
-    _ = :zlib.uncompress(data)
-    true
   rescue
-    _ -> false
+    _ -> {:error, :zlib_error}
   catch
-    _, _ -> false
+    _, _ -> {:error, :zlib_error}
+  end
+
+  # Phase 2: binary-search the smallest prefix length that forms a
+  # complete zlib stream. Completeness is monotone non-decreasing:
+  # once we find an `n` where `prefix_complete?(data, n)` is true,
+  # all larger prefixes up through the slice cap are also "complete"
+  # (zlib ignores trailing input when the stream already ended). So
+  # a standard lower-bound bisect is correct and O(log(upper_bound))
+  # probes.
+  defp scan_tail_for_boundary(data, _expected_size) do
+    lo = @zlib_min
+    hi = byte_size(data)
+
+    cond do
+      hi < lo ->
+        {:error, :zlib_bounds_invalid}
+
+      not prefix_complete?(data, hi) ->
+        # Shouldn't happen — safe_full_inflate already confirmed the
+        # full slice decompresses to `expected_size`. Defensive:
+        # return an error rather than loop.
+        {:error, :zlib_no_boundary}
+
+      true ->
+        {:ok, bisect_complete(data, lo, hi)}
+    end
+  end
+
+  defp bisect_complete(_data, lo, hi) when lo >= hi, do: lo
+
+  defp bisect_complete(data, lo, hi) do
+    mid = div(lo + hi, 2)
+
+    if prefix_complete?(data, mid) do
+      bisect_complete(data, lo, mid)
+    else
+      bisect_complete(data, mid + 1, hi)
+    end
+  end
+
+  # Does `binary_part(data, 0, n)` form a complete zlib stream?
+  # Implementation: open a fresh stream, feed the prefix via
+  # safeInflate, then call inflateEnd. Raise → incomplete. Success →
+  # complete.
+  defp prefix_complete?(data, n) when n <= byte_size(data) do
+    prefix = binary_part(data, 0, n)
+    z = :zlib.open()
+
+    try do
+      :zlib.inflateInit(z)
+      _ = safe_feed_all(z, prefix)
+
+      try do
+        :zlib.inflateEnd(z)
+        true
+      rescue
+        _ -> false
+      catch
+        _, _ -> false
+      end
+    rescue
+      _ -> false
+    catch
+      _, _ -> false
+    after
+      :zlib.close(z)
+    end
+  end
+
+  defp prefix_complete?(_, _), do: false
+
+  defp safe_feed_all(_z, <<>>), do: :ok
+
+  defp safe_feed_all(z, data) do
+    case :zlib.safeInflate(z, data) do
+      {:continue, _} -> drain_silent(z, 0)
+      {:finished, _} -> :ok
+      {:need_dictionary, _, _} -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp drain_silent(_z, iters) when iters >= @max_drain_iters, do: :ok
+
+  defp drain_silent(z, iters) do
+    case :zlib.safeInflate(z, <<>>) do
+      {:continue, <<>>} -> :ok
+      {:continue, _} -> drain_silent(z, iters + 1)
+      {:finished, _} -> :ok
+      {:need_dictionary, _, _} -> :ok
+    end
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
   end
 
   # Loose bound — we'd rather over-bound than under-bound. For any

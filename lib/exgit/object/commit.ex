@@ -99,9 +99,18 @@ defmodule Exgit.Object.Commit do
             # Minimal structural validation: a commit must have tree +
             # author + committer. This catches e.g. a malformed header
             # block without being strict about order or unknown headers.
+            #
+            # We additionally validate that `tree` and every `parent`
+            # header is a syntactically-valid 40-char hex string so that
+            # accessor calls (`tree/1`, `parents/1`) are infallible.
+            # Without this, a hostile remote can ship a commit with
+            # `tree not-actually-hex` and DoS any downstream walk, diff,
+            # or FS operation that touches the tree accessor.
             with :ok <- ensure_header(headers, "tree"),
                  :ok <- ensure_header(headers, "author"),
-                 :ok <- ensure_header(headers, "committer") do
+                 :ok <- ensure_header(headers, "committer"),
+                 :ok <- ensure_hex_header(headers, "tree"),
+                 :ok <- ensure_hex_headers(headers, "parent") do
               {:ok, %__MODULE__{headers: headers, message: message}}
             end
 
@@ -120,6 +129,32 @@ defmodule Exgit.Object.Commit do
     if Enum.any?(headers, fn {n, _} -> n == name end),
       do: :ok,
       else: {:error, {:missing_header, name}}
+  end
+
+  defp ensure_hex_header(headers, name) do
+    case Enum.find(headers, fn {n, _} -> n == name end) do
+      {_, v} ->
+        case Hex.decode(v) do
+          {:ok, _} -> :ok
+          :error -> {:error, {:invalid_hex_header, name, v}}
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp ensure_hex_headers(headers, name) do
+    Enum.reduce_while(headers, :ok, fn
+      {^name, v}, :ok ->
+        case Hex.decode(v) do
+          {:ok, _} -> {:cont, :ok}
+          :error -> {:halt, {:error, {:invalid_hex_header, name, v}}}
+        end
+
+      _, :ok ->
+        {:cont, :ok}
+    end)
   end
 
   # Parse headers preserving order. Continuation lines (lines starting with

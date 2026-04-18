@@ -127,16 +127,16 @@ defmodule Exgit.GithubPrivateRoundtripTest do
 
   describe "read path — works with any PAT that can access the repo" do
     test "HTTPS + PAT basic auth lists refs on a private repo" do
-      assert {:ok, refs} = Transport.ls_refs(transport(), prefix: ["refs/heads/"])
+      assert {:ok, refs, _meta} = Transport.ls_refs(transport(), prefix: ["refs/heads/"])
       assert is_list(refs)
     end
 
-    test "lazy_clone returns a usable repo with populated ref_store" do
-      assert {:ok, repo} = Exgit.lazy_clone(transport())
+    test "lazy clone returns a usable repo with populated ref_store" do
+      assert {:ok, repo} = Exgit.clone(transport(), lazy: true)
 
       # Even on an empty repo this returns {:ok, repo} with no refs —
       # and on a populated repo we get real refs back.
-      assert %Repository{} = repo
+      assert %Repository{mode: :lazy} = repo
     end
   end
 
@@ -180,7 +180,7 @@ defmodule Exgit.GithubPrivateRoundtripTest do
       try do
         assert {:ok, _} = Exgit.push(repo, transport(), refspecs: [branch])
 
-        {:ok, clone} = Exgit.lazy_clone(transport())
+        {:ok, clone} = Exgit.clone(transport(), lazy: true)
         assert {:ok, ^commit_sha} = RefStore.resolve(clone.ref_store, branch)
 
         assert {:ok, {_mode, fetched_blob}, _clone} =
@@ -308,7 +308,7 @@ defmodule Exgit.GithubPrivateRoundtripTest do
         try do
           assert {:ok, _} = Exgit.push(repo, transport(), refspecs: [branch])
 
-          {:ok, clone} = Exgit.lazy_clone(transport())
+          {:ok, clone} = Exgit.clone(transport(), lazy: true)
 
           repo_for_read =
             Enum.reduce(tree_spec, clone, fn {name, expected}, r ->

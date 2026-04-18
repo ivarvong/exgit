@@ -18,7 +18,7 @@ defmodule Exgit.LazyStreamingUXTest do
   defimpl Exgit.Transport, for: Exgit.LazyStreamingUXTest.FakeT do
     alias Exgit.LazyStreamingUXTest.FakeT
     def capabilities(_), do: {:ok, %{version: 2}}
-    def ls_refs(%FakeT{refs: r}, _), do: {:ok, r}
+    def ls_refs(%FakeT{refs: r}, _), do: {:ok, r, %{}}
     def push(_, _, _, _), do: {:error, :unsupported}
 
     def fetch(%FakeT{store: store}, wants, _opts) do
@@ -83,7 +83,7 @@ defmodule Exgit.LazyStreamingUXTest do
 
       transport = %FakeT{store: store, refs: [{"refs/heads/main", commit_sha}]}
 
-      {:ok, repo} = Exgit.lazy_clone(transport)
+      {:ok, repo} = Exgit.clone(transport, lazy: true)
 
       msg =
         assert_raise ArgumentError, fn ->
@@ -99,7 +99,7 @@ defmodule Exgit.LazyStreamingUXTest do
       {store, commit_sha} = seed_repo()
 
       transport = %FakeT{store: store, refs: [{"refs/heads/main", commit_sha}]}
-      {:ok, repo} = Exgit.lazy_clone(transport)
+      {:ok, repo} = Exgit.clone(transport, lazy: true)
 
       assert_raise ArgumentError, fn ->
         Exgit.FS.grep(repo, "HEAD", "hello") |> Enum.to_list()
@@ -110,7 +110,7 @@ defmodule Exgit.LazyStreamingUXTest do
       {store, commit_sha} = seed_repo()
 
       transport = %FakeT{store: store, refs: [{"refs/heads/main", commit_sha}]}
-      {:ok, repo} = Exgit.lazy_clone(transport)
+      {:ok, repo} = Exgit.clone(transport, lazy: true)
       {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
 
       paths = Exgit.FS.walk(repo, "HEAD") |> Enum.to_list() |> Enum.map(&elem(&1, 0))
@@ -123,7 +123,7 @@ defmodule Exgit.LazyStreamingUXTest do
       {store, commit_sha} = seed_repo()
 
       transport = %FakeT{store: store, refs: [{"refs/heads/main", commit_sha}]}
-      {:ok, repo} = Exgit.lazy_clone(transport)
+      {:ok, repo} = Exgit.clone(transport, lazy: true)
 
       # Before: store is a Promisor.
       assert %ObjectStore.Promisor{} = repo.object_store

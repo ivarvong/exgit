@@ -45,8 +45,18 @@ defmodule Exgit.DiffModesTest do
       a_target = :binary.copy(<<1>>, 20)
       b_target = :binary.copy(<<2>>, 20)
 
-      tree_a = Tree.new([{"160000", "vendor/lib", a_target}])
-      tree_b = Tree.new([{"160000", "vendor/lib", b_target}])
+      # Real git trees never contain `/` in entry names — a nested
+      # submodule path is a tree-of-trees-of-gitlinks. Build the
+      # canonical shape so `Tree.decode/1`'s tree-entry-name
+      # validation (which rejects `/` for path-traversal reasons)
+      # is satisfied.
+      inner_a = Tree.new([{"160000", "lib", a_target}])
+      inner_b = Tree.new([{"160000", "lib", b_target}])
+      {:ok, inner_a_sha, store} = ObjectStore.put(store, inner_a)
+      {:ok, inner_b_sha, store} = ObjectStore.put(store, inner_b)
+
+      tree_a = Tree.new([{"40000", "vendor", inner_a_sha}])
+      tree_b = Tree.new([{"40000", "vendor", inner_b_sha}])
 
       {:ok, a_sha, store} = ObjectStore.put(store, tree_a)
       {:ok, b_sha, store} = ObjectStore.put(store, tree_b)

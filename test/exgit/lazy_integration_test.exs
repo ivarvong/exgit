@@ -8,8 +8,9 @@ defmodule Exgit.LazyIntegrationTest do
 
   @repo_url "https://github.com/elixir-ai-tools/just_bash"
 
-  test "lazy_clone against real GitHub fetches only what FS.read_path touches" do
-    assert {:ok, repo} = Exgit.lazy_clone(@repo_url)
+  test "lazy clone against real GitHub fetches only what FS.read_path touches" do
+    assert {:ok, repo} = Exgit.clone(@repo_url, lazy: true)
+    assert repo.mode == :lazy
 
     # Read a couple of files. Each read triggers an on-demand fetch.
     # Thread the updated repo forward so subsequent reads benefit from

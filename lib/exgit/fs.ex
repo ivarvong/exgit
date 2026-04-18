@@ -145,9 +145,21 @@ defmodule Exgit.FS do
   end
 
   @doc """
-  Prefetch all trees reachable from `reference` (and optionally all
-  blobs) into the object store. Useful before a streaming `walk/2` or
-  `grep/4` on a lazy repo.
+  Prefetch trees reachable from `reference` (and optionally all
+  blobs) into the object store.
+
+  Options:
+
+    * `:blobs` — when `true`, fetch blobs in addition to trees. When
+      the call fetches blobs AND the repo is `:lazy`, the returned
+      repo's `:mode` flips to `:eager` because every reachable object
+      from `reference` is now resident and streaming ops can proceed
+      without further transport calls. When `blobs: false`, mode is
+      unchanged.
+
+  Prefer `Exgit.Repository.materialize/2` for the one-shot
+  "lazy-to-eager" conversion; `prefetch/3` is the progressive
+  variant that lets you stage trees and blobs independently.
   """
   @spec prefetch(Repository.t(), ref(), keyword()) ::
           {:ok, Repository.t()} | {:error, term()}
@@ -155,7 +167,14 @@ defmodule Exgit.FS do
     include_blobs = Keyword.get(opts, :blobs, false)
 
     with {:ok, tree_sha, repo} <- resolve_tree(repo, reference) do
-      {:ok, prefetch_tree(repo, tree_sha, include_blobs)}
+      prefetched = prefetch_tree(repo, tree_sha, include_blobs)
+
+      # After a full prefetch (trees + blobs) every object reachable
+      # from `reference` is resident in the Promisor cache, so the
+      # repo is functionally eager for streaming ops.
+      new_mode = if include_blobs and repo.mode == :lazy, do: :eager, else: prefetched.mode
+
+      {:ok, %{prefetched | mode: new_mode}}
     end
   end
 
@@ -184,7 +203,7 @@ defmodule Exgit.FS do
   """
   @spec walk(Repository.t(), ref()) :: Enumerable.t()
   def walk(%Repository{} = repo, reference) do
-    :ok = require_non_promisor!(repo, :walk)
+    :ok = require_eager!(repo, :walk)
     start_time = System.monotonic_time()
 
     :telemetry.execute(
@@ -254,7 +273,7 @@ defmodule Exgit.FS do
   """
   @spec grep(Repository.t(), ref(), String.t() | Regex.t(), keyword()) :: Enumerable.t()
   def grep(%Repository{} = repo, reference, pattern, opts \\ []) do
-    :ok = require_non_promisor!(repo, :grep)
+    :ok = require_eager!(repo, :grep)
     regex = compile_grep_pattern(pattern, opts)
     path_glob = Keyword.get(opts, :path, "**")
     path_regex = compile_glob(path_glob)
@@ -445,25 +464,70 @@ defmodule Exgit.FS do
 
   # Resolve a reference to a TREE sha. Threads the repo in case the
   # resolution grew the cache.
+  #
+  # A 20-byte binary MIGHT be a SHA or a 20-char ASCII-printable ref
+  # name. Disambiguate: if every byte is a printable-ASCII character
+  # and the binary doesn't look like random hash output, try it as a
+  # ref name FIRST; otherwise treat as a raw SHA. This avoids the
+  # "`refs/heads/exactly_20chars` interpreted as SHA" footgun the
+  # reviewer flagged (#41).
   defp resolve_tree(repo, reference) when is_binary(reference) and byte_size(reference) == 20 do
-    case fetch_object(repo, reference) do
-      {:ok, %Commit{} = c, repo} -> {:ok, Commit.tree(c), repo}
-      {:ok, %Tree{}, repo} -> {:ok, reference, repo}
-      {:ok, _, _repo} -> {:error, :not_a_commit_or_tree}
-      {:error, _} = err -> err
+    cond do
+      printable_ascii_ref?(reference) ->
+        resolve_tree_as_refname(repo, reference)
+
+      true ->
+        case fetch_object(repo, reference) do
+          {:ok, %Commit{} = c, repo} -> {:ok, Commit.tree(c), repo}
+          {:ok, %Tree{}, repo} -> {:ok, reference, repo}
+          {:ok, _, _repo} -> {:error, :not_a_commit_or_tree}
+          {:error, _} = err -> err
+        end
     end
   end
 
-  defp resolve_tree(repo, reference) when is_binary(reference) do
+  defp resolve_tree(repo, reference) when is_binary(reference),
+    do: resolve_tree_as_refname(repo, reference)
+
+  # Extracted so both the 20-byte-printable branch and the general
+  # string branch share the same "ref → commit/tree → tree-sha" path.
+  # Accepts refs that point to a tree object directly (some workflows
+  # persist tree SHAs as refs for intermediate state); previously the
+  # string-ref branch rejected trees with :ref_points_to_tree_not_commit,
+  # which was inconsistent with the raw-SHA branch.
+  defp resolve_tree_as_refname(repo, reference) do
     with {:ok, sha} <- RefStore.resolve(repo.ref_store, reference),
-         {:ok, %Commit{} = c, repo} <- fetch_object(repo, sha) do
-      {:ok, Commit.tree(c), repo}
+         {:ok, obj, repo} <- fetch_object(repo, sha) do
+      case obj do
+        %Commit{} = c -> {:ok, Commit.tree(c), repo}
+        %Tree{} -> {:ok, sha, repo}
+        _ -> {:error, :not_a_commit_or_tree}
+      end
     else
-      {:ok, %Tree{}, _} -> {:error, :ref_points_to_tree_not_commit}
       {:error, _} = err -> err
       _ -> {:error, :unresolvable_reference}
     end
   end
+
+  # True if every byte in the 20-byte binary is a printable-ASCII
+  # character AND at least one byte is NOT in the hex alphabet. A
+  # binary that's all hex digits AND exactly 20 bytes is unusual as
+  # a ref name (too long for a branch, no slashes) — treat as a SHA.
+  # Real ref names almost always contain `/` anyway; the branch
+  # is just defensive for callers who pass e.g. `"HEAD"` padded to
+  # 20 bytes somehow.
+  defp printable_ascii_ref?(<<_::binary-size(20)>> = bin) do
+    printable? = for <<b <- bin>>, reduce: true, do: (acc -> acc and b in 0x20..0x7E)
+
+    has_non_hex? =
+      for <<b <- bin>>,
+        reduce: false,
+        do: (acc -> acc or not (b in ?0..?9 or b in ?a..?f or b in ?A..?F))
+
+    printable? and has_non_hex?
+  end
+
+  defp printable_ascii_ref?(_), do: false
 
   # Traverse tree entries by path segments; return the {mode, sha} of
   # the final segment's entry. Threads the repo.
@@ -519,30 +583,26 @@ defmodule Exgit.FS do
     |> String.split("/", trim: true)
   end
 
-  # Streaming FS operations use pure `ObjectStore.get/2` and don't
-  # grow a Promisor cache. Running them on a freshly-lazy-cloned repo
-  # whose cache is empty would silently return empty results — a UX
-  # footgun. We raise with a clear message pointing at `FS.prefetch/3`
-  # (to populate) or `Repository.materialize/2` (to unwrap).
+  # Streaming FS operations (`walk/2`, `grep/4`) use pure
+  # `ObjectStore.get/2` and do NOT grow a Promisor cache. Running
+  # them on a `:lazy` repo would either trigger unbounded
+  # mid-iteration fetches or silently skip missing objects — both
+  # worse than a clear error. We raise `ArgumentError` with a
+  # pointer at `FS.prefetch/3` (populate in place) or
+  # `Repository.materialize/2` (convert to `:eager`).
   #
-  # A Promisor whose cache is non-empty is fine: `prefetch/3` just
-  # returned and every reachable object is now resident.
-  defp require_non_promisor!(%Repository{object_store: %Exgit.ObjectStore.Promisor{} = p}, op) do
-    %Exgit.ObjectStore.Memory{objects: objs} = p.cache
+  # `:lazy` is the one source of truth; `FS` does NOT poke at the
+  # object_store struct shape.
+  defp require_eager!(%Repository{mode: :eager}, _op), do: :ok
 
-    if map_size(objs) == 0 do
-      raise ArgumentError,
-            "Exgit.FS.#{op}/* was called on an un-prefetched Promisor repo. " <>
-              "Call `Exgit.FS.prefetch(repo, ref, blobs: true)` first to populate " <>
-              "the cache, or `Exgit.Repository.materialize(repo, ref)` to convert " <>
-              "the Promisor into a plain in-memory store. Streaming ops use pure " <>
-              "reads; silent empty results would be worse than this error."
-    end
-
-    :ok
+  defp require_eager!(%Repository{mode: :lazy}, op) do
+    raise ArgumentError,
+          "Exgit.FS.#{op}/* requires an :eager repository; this one is :lazy. " <>
+            "Call `Exgit.Repository.materialize(repo, ref)` to convert in one " <>
+            "step (recommended), or `Exgit.FS.prefetch(repo, ref, blobs: true)` " <>
+            "to populate the Promisor cache in place. Streaming ops use pure " <>
+            "reads; silent empty results would be worse than this error."
   end
-
-  defp require_non_promisor!(_repo, _op), do: :ok
 
   defp compile_grep_pattern(%Regex{} = r, _opts), do: r
 
@@ -578,9 +638,18 @@ defmodule Exgit.FS do
   # Unclosed `{` is treated as a literal. Empty alternatives are
   # allowed (`{,.bak}` matches either empty or `.bak`). Nested braces
   # are not supported; the first `}` closes the group.
+  #
+  # Returns the Regex, falling back to an always-false regex if
+  # the generated source fails to compile (shouldn't happen for any
+  # legitimate glob but we return a tagged error rather than raising
+  # on user input).
   defp compile_glob(pattern) do
     regex_src = pattern |> to_charlist() |> compile_glob_chars([]) |> IO.iodata_to_binary()
-    Regex.compile!("^" <> regex_src <> "$")
+
+    case Regex.compile("^" <> regex_src <> "$") do
+      {:ok, r} -> r
+      {:error, _} -> ~r/$^/
+    end
   end
 
   defp compile_glob_chars([], acc), do: Enum.reverse(acc)

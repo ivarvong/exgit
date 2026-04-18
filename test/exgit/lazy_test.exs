@@ -47,7 +47,7 @@ defmodule Exgit.LazyTest do
     def ls_refs(%FakeTransport{agent: a}, _opts) do
       Agent.update(a, &%{&1 | ls_refs_calls: &1.ls_refs_calls + 1})
       refs = Agent.get(a, & &1.refs)
-      {:ok, refs}
+      {:ok, refs, %{}}
     end
 
     def fetch(%FakeTransport{agent: a}, wants, _opts) do
@@ -138,7 +138,7 @@ defmodule Exgit.LazyTest do
 
   describe "lazy_clone (L.1)" do
     test "clones refs only, no objects fetched up front", %{transport: t} do
-      assert {:ok, repo} = Exgit.lazy_clone(t)
+      assert {:ok, repo} = Exgit.clone(t, lazy: true)
 
       # Refs present.
       assert {:ok, _head_sha} = RefStore.resolve(repo.ref_store, "HEAD")
@@ -152,7 +152,7 @@ defmodule Exgit.LazyTest do
 
     test "FS.read_path on a lazy repo triggers a fetch and returns the blob + updated repo",
          %{transport: t, shas: shas} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       assert {:ok, {_mode, %Blob{data: "hello\n"}}, _repo} =
                FS.read_path(repo, "HEAD", "README.md")
@@ -167,7 +167,7 @@ defmodule Exgit.LazyTest do
 
     test "threading the returned repo forward hits the cache on the next read",
          %{transport: t} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       {:ok, _, repo} = FS.read_path(repo, "HEAD", "README.md")
       first_count = length(FakeTransport.fetch_calls(t))
@@ -183,7 +183,7 @@ defmodule Exgit.LazyTest do
 
     test "NOT threading the repo back re-triggers a fetch (documenting stateless semantics)",
          %{transport: t} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       # Discard the updated repo.
       {:ok, _, _discarded} = FS.read_path(repo, "HEAD", "README.md")
@@ -202,7 +202,7 @@ defmodule Exgit.LazyTest do
 
     test "FS.ls threads an updated repo — second ls via threaded repo skips fetch",
          %{transport: t} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       {:ok, entries, repo} = FS.ls(repo, "HEAD", "src")
       names = for {_, n, _} <- entries, do: n
@@ -216,7 +216,7 @@ defmodule Exgit.LazyTest do
     end
 
     test "reading a different blob after the first still works", %{transport: t} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       assert {:ok, {_, %Blob{data: "hello\n"}}, repo} =
                FS.read_path(repo, "HEAD", "README.md")
@@ -226,7 +226,7 @@ defmodule Exgit.LazyTest do
     end
 
     test "missing paths surface as :not_found, not as transport errors", %{transport: t} do
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       assert {:error, :not_found} = FS.read_path(repo, "HEAD", "does/not/exist")
     end

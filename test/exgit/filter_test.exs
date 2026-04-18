@@ -11,7 +11,7 @@ defmodule Exgit.FilterTest do
     * `Exgit.Filter.encode/1` — validates + formats filter specs to
       protocol strings.
     * `Exgit.Transport.HTTP.fetch` honors the `filter:` option.
-    * `Exgit.lazy_clone(url, filter: ...)` eagerly fetches commits+trees
+    * `Exgit.clone(url, filter: ...)` eagerly fetches commits+trees
       and satisfies subsequent blob reads via on-demand fetches.
     * Filter unsupported by server → error by default; silent fallback
       via `if_unsupported: :ignore`.
@@ -54,7 +54,7 @@ defmodule Exgit.FilterTest do
       # Refs are injected by the test via :persistent_term keyed on the
       # transport's calls-agent pid.
       refs = :persistent_term.get({FilterFakeT, calls, :refs}, [])
-      {:ok, refs}
+      {:ok, refs, %{}}
     end
 
     def push(_, _, _, _), do: {:error, :unsupported}
@@ -193,7 +193,7 @@ defmodule Exgit.FilterTest do
         {"HEAD", origin.commit}
       ])
 
-      assert {:ok, repo} = Exgit.lazy_clone(transport, filter: {:blob, :none})
+      assert {:ok, repo} = Exgit.clone(transport, filter: {:blob, :none})
 
       # The cache has commits + trees but NOT the blobs.
       store = repo.object_store
@@ -214,7 +214,7 @@ defmodule Exgit.FilterTest do
         {"HEAD", origin.commit}
       ])
 
-      {:ok, repo} = Exgit.lazy_clone(transport, filter: {:blob, :none})
+      {:ok, repo} = Exgit.clone(transport, filter: {:blob, :none})
 
       fetches_before = length(FilterFakeT.fetch_calls(transport))
       assert fetches_before == 1, "lazy_clone did the initial tree-only fetch"
@@ -237,7 +237,7 @@ defmodule Exgit.FilterTest do
       ])
 
       assert {:error, {:filter_unsupported, _}} =
-               Exgit.lazy_clone(transport, filter: {:blob, :none})
+               Exgit.clone(transport, filter: {:blob, :none})
     end
 
     test "tree:0 filter (shallow-commit-only) encodes correctly" do
@@ -266,7 +266,7 @@ defmodule Exgit.FilterTest do
       # An invalid filter spec (neither :none nor a known tuple) fails
       # at encode time before we hit the transport.
       assert {:error, {:invalid_filter, _}} =
-               Exgit.lazy_clone(transport, filter: :invalid_filter_form)
+               Exgit.clone(transport, filter: :invalid_filter_form)
     end
 
     test "server without filter + if_unsupported: :ignore → falls back to full fetch" do
@@ -280,7 +280,7 @@ defmodule Exgit.FilterTest do
       ])
 
       assert {:ok, repo} =
-               Exgit.lazy_clone(transport,
+               Exgit.clone(transport,
                  filter: {:blob, :none},
                  if_unsupported: :ignore
                )

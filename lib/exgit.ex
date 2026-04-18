@@ -38,26 +38,160 @@ defmodule Exgit do
     end
   end
 
+  @doc """
+  Clone a git repository.
+
+      {:ok, repo} = Exgit.clone("https://github.com/user/repo")
+
+  ## Options
+
+    * `:path` — persistent on-disk clone. When set, the clone is
+      backed by `ObjectStore.Disk`/`RefStore.Disk` and survives
+      process death. Default: in-memory (lost on process exit).
+
+    * `:lazy` — when `true`, defer object fetching. Returns a
+      `%Repository{mode: :lazy}` whose object store is an
+      `ObjectStore.Promisor` that fetches on demand. The initial
+      clone pulls **refs only** — any subsequent object read
+      triggers a `want <sha>` fetch against the transport. Great
+      for agent loops that read a handful of files from large
+      repos. Default: `false` (full clone).
+
+    * `:filter` — partial-clone filter spec. Valid values:
+      `{:blob, :none}`, `{:blob, {:limit, bytes}}`,
+      `{:tree, depth}`, `{:raw, "filter=..."}`. When set, the
+      server ships a pack that omits blobs (or trees) matching
+      the filter; omitted objects are fetched on demand. Implies
+      `:lazy`-like semantics for omitted objects but keeps the
+      default branch's commit+tree history resident.
+
+    * `:if_unsupported` — `:error` (default) or `:ignore`. When
+      `:filter` is set but the server doesn't advertise `filter`
+      capability, `:error` fails the clone and `:ignore` proceeds
+      as a full clone.
+
+    * `:remote` — remote name to record. Default: `"origin"`.
+
+  ## Matrix of modes
+
+  | Options | Clone-time fetch | On read |
+  |---|---|---|
+  | `clone(url)` | refs + all objects | local always |
+  | `clone(url, lazy: true)` | refs only | per-object fetch |
+  | `clone(url, filter: {:blob, :none})` | refs + commits + trees | blobs fetched on read |
+  | `clone(url, filter: ..., lazy: true)` | refs only | everything on read |
+
+  ## `:path` + `:lazy` / `:filter`
+
+  On-disk partial clones are not yet supported; `:path` combined
+  with `:lazy` or `:filter` returns
+  `{:error, :disk_partial_clone_unsupported}`.
+
+  ## Returns
+
+  `{:ok, %Repository{}}` with `:mode => :eager` for full clones
+  and `:mode => :lazy` for any form of partial/lazy clone. Use
+  `Exgit.Repository.materialize/2` to convert `:lazy` → `:eager`
+  after reading what you need.
+  """
   @spec clone(String.t() | Transport.File.t() | Transport.HTTP.t(), keyword()) ::
           {:ok, Repository.t()} | {:error, term()}
   def clone(source, opts \\ []) do
+    cond do
+      disk_partial_clone?(opts) ->
+        {:error, :disk_partial_clone_unsupported}
+
+      Keyword.get(opts, :lazy, false) or Keyword.has_key?(opts, :filter) ->
+        clone_partial(source, opts)
+
+      true ->
+        clone_full(source, opts)
+    end
+  end
+
+  defp disk_partial_clone?(opts) do
+    Keyword.has_key?(opts, :path) and
+      (Keyword.get(opts, :lazy, false) or Keyword.has_key?(opts, :filter))
+  end
+
+  # Full (eager) clone: pull every reachable object up front, populate
+  # a Memory or Disk object store, return an `:eager` repo.
+  defp clone_full(source, opts) do
     transport = to_transport(source, opts)
 
     with {:ok, repo} <- init(opts),
-         {:ok, refs} <- safe_ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]),
+         # Asking for `HEAD` as a ref-prefix pulls the server's HEAD
+         # line into the ls-refs output, complete with a symref-target
+         # attribute — so we pick the server's actual default branch
+         # instead of guessing from the advertised refs.
+         {:ok, refs, meta} <-
+           safe_ls_refs(transport, prefix: ["HEAD", "refs/heads/", "refs/tags/"]),
          {:ok, repo} <- fetch_into(repo, transport, refs, opts),
-         {:ok, repo} <- set_head_to_default(repo, refs) do
+         {:ok, repo} <- set_head_to_default(repo, refs, meta) do
       {:ok, repo}
+    end
+  end
+
+  # Partial / lazy clone: return an `:lazy` repo with a Promisor
+  # object store. Triggered by `:lazy` or `:filter` opts.
+  defp clone_partial(source, opts) do
+    transport = to_transport(source, opts)
+
+    with {:ok, filter_spec} <- resolve_filter(opts),
+         :ok <- check_filter_capability(transport, filter_spec, opts),
+         {:ok, refs, meta} <-
+           safe_ls_refs(transport, prefix: ["HEAD", "refs/heads/", "refs/tags/"]) do
+      promisor =
+        ObjectStore.Promisor.new(transport,
+          default_fetch_opts: promisor_fetch_opts(filter_spec)
+        )
+
+      ref_store =
+        Enum.reduce(refs, RefStore.Memory.new(), fn {name, sha}, rs ->
+          case RefStore.write(rs, name, sha, []) do
+            {:ok, rs2} ->
+              rs2
+
+            {:error, reason} ->
+              # Memory-backed stores shouldn't fail a write, but
+              # if they do we at least surface the fact via
+              # telemetry so a lazy-cloned repo that's missing
+              # refs isn't a silent mystery.
+              :telemetry.execute(
+                [:exgit, :ref_store, :write_failed],
+                %{count: 1},
+                %{ref: name, reason: reason, context: :clone_partial}
+              )
+
+              rs
+          end
+        end)
+
+      repo = Repository.new(promisor, ref_store, mode: :lazy)
+
+      with {:ok, repo} <- set_head_to_default(repo, refs, meta),
+           {:ok, repo} <- maybe_eager_prefetch(repo, refs, meta, filter_spec) do
+        {:ok, repo}
+      end
     end
   end
 
   # All ref reads from a transport MUST go through this wrapper. Ref
   # names from the wire are hostile input; see Exgit.RefName for the
   # validation rules and `[:exgit, :security, :ref_rejected]` telemetry.
+  #
+  # Transports are responsible for applying `Exgit.RefName.valid?/1`
+  # to their output; this wrapper applies the check again as
+  # defense-in-depth for third-party transports that forgot. The
+  # return shape mirrors `Transport.ls_refs/2` exactly:
+  # `{:ok, refs, meta}`.
   defp safe_ls_refs(transport, opts) do
     case Transport.ls_refs(transport, opts) do
-      {:ok, refs} -> {:ok, Enum.filter(refs, &keep_ref?(&1, transport))}
-      other -> other
+      {:ok, refs, meta} ->
+        {:ok, Enum.filter(refs, &keep_ref?(&1, transport)), meta}
+
+      other ->
+        other
     end
   end
 
@@ -78,82 +212,6 @@ defmodule Exgit do
   defp describe_transport(%{url: url}), do: url
   defp describe_transport(%{path: path}), do: path
   defp describe_transport(other), do: inspect(other.__struct__)
-
-  @doc """
-  Lazily clone `source` — fetch refs only, defer all object fetching.
-
-  Objects are fetched on demand through a promisor object store wrapped
-  around the transport. The first `Exgit.FS.read_path/3` (or any other
-  call that reads an object) triggers a `want <sha>` fetch; subsequent
-  reads of the same sha are served from an in-memory cache.
-
-  ## Use case
-
-  Agent loops and exploratory tools that only read a handful of files
-  from a large repository. A lazy clone of a multi-gigabyte repo takes
-  milliseconds; an agent that reads five files then exits pays only for
-  those five fetches instead of the full history.
-
-  ## Limitations
-
-  * Memory-backed cache only — the cache evaporates when the process
-    dies. Pass `path:` if you want persistent storage (not yet
-    implemented; `{:error, :disk_lazy_unsupported}`).
-  * Requires the server to answer `want <sha>` for arbitrary
-    (non-tip) object SHAs. Most modern git servers do; some older
-    ones only allow reachable-from-advertised-refs. Errors surface
-    from `Transport.fetch/3` unchanged.
-
-  ## Examples
-
-      {:ok, repo} = Exgit.lazy_clone("https://github.com/user/repo")
-      {:ok, {_mode, blob}, _repo} = Exgit.FS.read_path(repo, "HEAD", "README.md")
-
-  > #### Experimental {: .warning}
-  >
-  > Lazy clone, Promisor semantics, and `FS.prefetch/3` /
-  > `Repository.materialize/2` are **experimental in v0.x**. The
-  > Promisor struct shape and the threading contract for
-  > `FS.read_path/3` etc. returning `{:ok, result, repo}` may change
-  > before v1.0. File an issue if you find the shape awkward.
-  """
-  @doc experimental: true
-  @spec lazy_clone(String.t() | term(), keyword()) ::
-          {:ok, Repository.t()} | {:error, term()}
-  def lazy_clone(source, opts \\ []) do
-    cond do
-      Keyword.has_key?(opts, :path) ->
-        {:error, :disk_lazy_unsupported}
-
-      true ->
-        transport = to_transport(source, opts)
-
-        with {:ok, filter_spec} <- resolve_filter(opts),
-             :ok <- check_filter_capability(transport, filter_spec, opts),
-             {:ok, refs} <-
-               safe_ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]) do
-          promisor =
-            ObjectStore.Promisor.new(transport,
-              default_fetch_opts: promisor_fetch_opts(filter_spec)
-            )
-
-          ref_store =
-            Enum.reduce(refs, RefStore.Memory.new(), fn {name, sha}, rs ->
-              case RefStore.write(rs, name, sha, []) do
-                {:ok, rs2} -> rs2
-                _ -> rs
-              end
-            end)
-
-          repo = Repository.new(promisor, ref_store)
-
-          with {:ok, repo} <- set_head_to_default(repo, refs),
-               {:ok, repo} <- maybe_eager_prefetch(repo, refs, filter_spec) do
-            {:ok, repo}
-          end
-        end
-    end
-  end
 
   # Translate a user-facing filter option into a wire string (or :none).
   defp resolve_filter(opts) do
@@ -203,11 +261,11 @@ defmodule Exgit do
   defp promisor_fetch_opts(_wire), do: []
 
   # When a filter is in effect, pull the commits+trees pack eagerly at
-  # clone time. Without a filter, lazy_clone stays fast (refs only).
-  defp maybe_eager_prefetch(repo, _refs, :none), do: {:ok, repo}
+  # clone time. Without a filter, a lazy clone stays fast (refs only).
+  defp maybe_eager_prefetch(repo, _refs, _meta, :none), do: {:ok, repo}
 
-  defp maybe_eager_prefetch(repo, refs, wire) do
-    case find_default_ref(refs) do
+  defp maybe_eager_prefetch(repo, refs, meta, wire) do
+    case find_default_ref(refs, meta) do
       nil ->
         {:ok, repo}
 
@@ -224,8 +282,8 @@ defmodule Exgit do
     end
   end
 
-  defp set_head_to_default(repo, refs) do
-    case find_default_ref(refs) do
+  defp set_head_to_default(repo, refs, meta) do
+    case find_default_ref(refs, meta) do
       nil ->
         {:ok, repo}
 
@@ -245,7 +303,7 @@ defmodule Exgit do
     remote_name = Keyword.get(opts, :remote, "origin")
     prefix = Keyword.get(opts, :prefix, ["refs/heads/", "refs/tags/"])
 
-    with {:ok, refs} <- safe_ls_refs(transport, prefix: prefix) do
+    with {:ok, refs, _meta} <- safe_ls_refs(transport, prefix: prefix) do
       fetch_into(repo, transport, refs, Keyword.put(opts, :remote, remote_name))
     end
   end
@@ -279,7 +337,7 @@ defmodule Exgit do
 
     remote_refs =
       case safe_ls_refs(transport, prefix: ref_names) do
-        {:ok, refs} -> Map.new(refs)
+        {:ok, refs, _meta} -> Map.new(refs)
         _ -> %{}
       end
 
@@ -302,16 +360,33 @@ defmodule Exgit do
     if updates == [] do
       {:ok, %{ref_results: []}}
     else
+      # A receive-pack request body ends with the pkt-line flush
+      # followed by the pack bytes. An empty-objects list is legal
+      # for:
+      #
+      #   (a) pure ref-delete pushes — no new objects needed
+      #   (b) pure ref-move pushes where every commit referenced is
+      #       already present on the remote (e.g. fast-forward to a
+      #       commit the remote learned about via another branch)
+      #
+      # Most git servers accept an empty body after the flush in
+      # case (a), but some reject a completely-missing PACK header
+      # in case (b). Emit an empty PACK (header + 0 objects + SHA
+      # trailer) when we have updates that aren't all deletes — this
+      # is the shape `git send-pack` produces for the same case and
+      # is accepted by every modern server we've tested.
       pack =
-        if objects == [] do
-          <<>>
-        else
-          Pack.Writer.build(objects)
+        cond do
+          objects != [] -> Pack.Writer.build(objects)
+          all_deletes?(updates) -> <<>>
+          true -> Pack.Writer.build([])
         end
 
       Transport.push(transport, Enum.reverse(updates), pack, [])
     end
   end
+
+  defp all_deletes?(updates), do: Enum.all?(updates, fn {_ref, _old, new} -> new == nil end)
 
   # Translate one user-supplied refspec entry into a concrete update.
   defp plan_push({:delete, ref_name}, _repo, remote_refs) when is_binary(ref_name) do
@@ -452,10 +527,34 @@ defmodule Exgit do
     {:ok, %{repo | ref_store: ref_store}}
   end
 
-  defp find_default_ref(refs) do
-    Enum.find(refs, fn {ref, _} -> ref == "refs/heads/main" end) ||
-      Enum.find(refs, fn {ref, _} -> ref == "refs/heads/master" end) ||
-      Enum.find(refs, fn {ref, _} -> String.starts_with?(ref, "refs/heads/") end)
+  # Pick the default ref to point HEAD at. Prefer the server's own
+  # HEAD symref target (surfaced via `meta.head` from the
+  # protocol-v2 `symrefs` argument). Falls back to
+  # `refs/heads/main` / `refs/heads/master` / any `refs/heads/*`
+  # only when the server didn't advertise HEAD's target.
+  # Previously we always guessed — that meant consecutive clones of
+  # a repo whose default was neither `main` nor `master` could land
+  # on different branches depending on wire-order.
+  defp find_default_ref(refs, meta) do
+    case Map.get(meta, :head) do
+      nil ->
+        fallback_default_ref(refs)
+
+      target ->
+        case Enum.find(refs, fn {ref, _} -> ref == target end) do
+          nil -> fallback_default_ref(refs)
+          entry -> entry
+        end
+    end
+  end
+
+  defp fallback_default_ref(refs) do
+    heads =
+      Enum.filter(refs, fn {ref, _} -> String.starts_with?(ref, "refs/heads/") end)
+
+    Enum.find(heads, fn {ref, _} -> ref == "refs/heads/main" end) ||
+      Enum.find(heads, fn {ref, _} -> ref == "refs/heads/master" end) ||
+      List.first(heads)
   end
 
   defp collect_push_objects(store, sha, remote_refs) do

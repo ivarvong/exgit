@@ -1,4 +1,21 @@
 defmodule Exgit.RefStore.Disk do
+  @moduledoc """
+  Filesystem-backed ref store.
+
+  ## Defense-in-depth ref name validation
+
+  Every public entry point (`read_ref/2`, `resolve_ref/2`, `write_ref/4`,
+  `delete_ref/2`) revalidates its `ref` argument against
+  `Exgit.RefName.valid?/1` before any `Path.join` or file touch. The
+  clone/fetch perimeter already filters hostile ref names in
+  `safe_ls_refs/2`, but a direct caller of this module — or a follow-up
+  `resolve_ref/2` that reads a `ref: ../../etc/passwd` target out of a
+  compromised on-disk ref file — would otherwise reach `File.read` with
+  an attacker-controlled path. We reject those inputs with
+  `{:error, :invalid_ref_name}` and emit a
+  `[:exgit, :security, :ref_rejected]` telemetry event.
+  """
+
   @enforce_keys [:root]
   defstruct [:root]
 
@@ -10,25 +27,27 @@ defmodule Exgit.RefStore.Disk do
 
   @spec read_ref(t(), String.t()) :: {:ok, ref_value()} | {:error, :not_found | term()}
   def read_ref(%__MODULE__{root: root}, ref) do
-    path = Path.join(root, ref)
+    with :ok <- validate_ref(ref, :read) do
+      path = Path.join(root, ref)
 
-    case File.read(path) do
-      {:ok, content} ->
-        case parse_ref_content(String.trim_trailing(content, "\n")) do
-          {:ok, value} -> {:ok, value}
-          {:error, _} = err -> err
-        end
+      case File.read(path) do
+        {:ok, content} ->
+          case parse_ref_content(String.trim_trailing(content, "\n")) do
+            {:ok, value} -> {:ok, value}
+            {:error, _} = err -> err
+          end
 
-      {:error, :enoent} ->
-        read_packed(root, ref)
+        {:error, :enoent} ->
+          read_packed(root, ref)
 
-      {:error, reason} ->
-        {:error, reason}
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
   @spec resolve_ref(t(), String.t()) ::
-          {:ok, binary()} | {:error, :not_found | :too_deep | :cycle}
+          {:ok, binary()} | {:error, :not_found | :too_deep | :cycle | :invalid_ref_name}
   def resolve_ref(store, ref), do: do_resolve(store, ref, MapSet.new(), 10)
 
   defp do_resolve(%__MODULE__{} = store, ref, seen, depth) do
@@ -42,7 +61,16 @@ defmodule Exgit.RefStore.Disk do
       true ->
         case read_ref(store, ref) do
           {:ok, {:symbolic, target}} ->
-            do_resolve(store, target, MapSet.put(seen, ref), depth - 1)
+            # The target was read from disk. Revalidate it before
+            # recursing — a symbolic ref whose target escapes the
+            # repo root must NOT be followed, even if its file on
+            # disk says `ref: ../../etc/passwd`. `read_ref/2` will
+            # reject it again, but we fail fast here for a clearer
+            # error code.
+            case validate_ref(target, :resolve_target) do
+              :ok -> do_resolve(store, target, MapSet.put(seen, ref), depth - 1)
+              {:error, _} = err -> err
+            end
 
           {:ok, sha} ->
             {:ok, sha}
@@ -54,7 +82,16 @@ defmodule Exgit.RefStore.Disk do
   end
 
   @spec write_ref(t(), String.t(), ref_value(), keyword()) :: :ok | {:error, term()}
-  def write_ref(%__MODULE__{root: root}, ref, value, opts \\ []) do
+  def write_ref(store, ref, value, opts \\ [])
+
+  def write_ref(%__MODULE__{root: root}, ref, value, opts) do
+    with :ok <- validate_ref(ref, :write),
+         :ok <- validate_symbolic_target(value) do
+      do_write_ref(root, ref, value, opts)
+    end
+  end
+
+  defp do_write_ref(root, ref, value, opts) do
     path = Path.join(root, ref)
     expected = Keyword.get(opts, :expected)
 
@@ -148,28 +185,100 @@ defmodule Exgit.RefStore.Disk do
     end
   end
 
-  @spec delete_ref(t(), String.t()) :: :ok | {:error, :not_found}
+  @spec delete_ref(t(), String.t()) :: :ok | {:error, :not_found | :invalid_ref_name}
   def delete_ref(%__MODULE__{root: root}, ref) do
-    path = Path.join(root, ref)
+    with :ok <- validate_ref(ref, :delete) do
+      path = Path.join(root, ref)
 
-    case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> {:error, :not_found}
+      case File.rm(path) do
+        :ok -> :ok
+        {:error, :enoent} -> {:error, :not_found}
+      end
     end
   end
 
+  # --- Internal: ref-name validation (defense-in-depth) ---
+
+  # Validate that `ref` is safe to join under the repo root. Rejects
+  # any name containing `..`, absolute paths, control chars, etc. See
+  # `Exgit.RefName` for the exact rules. Emits telemetry on rejection
+  # so operators can observe a direct-caller attack even when the
+  # perimeter filter already caught the wire input.
+  defp validate_ref(ref, operation) when is_binary(ref) do
+    if Exgit.RefName.valid?(ref) do
+      :ok
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: {:ref_store_disk, operation}, ref: ref}
+      )
+
+      {:error, :invalid_ref_name}
+    end
+  end
+
+  defp validate_ref(_other, _operation), do: {:error, :invalid_ref_name}
+
+  # A symbolic target is itself a ref name, so it must pass the same
+  # validation. A direct caller who constructs
+  # `{:symbolic, "../../etc/passwd"}` cannot bypass the boundary.
+  defp validate_symbolic_target({:symbolic, target}) when is_binary(target) do
+    if Exgit.RefName.valid?(target) do
+      :ok
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: {:ref_store_disk, :symbolic_target}, ref: target}
+      )
+
+      {:error, :invalid_ref_name}
+    end
+  end
+
+  defp validate_symbolic_target(_sha), do: :ok
+
   @spec list_refs(t(), String.t()) :: [{String.t(), ref_value()}]
   def list_refs(%__MODULE__{root: root}, prefix \\ "refs/") do
-    loose = list_loose_refs(root, prefix)
-    packed = list_packed_refs(root, prefix)
+    # Prefix is a user/caller input. Ensure it can't escape the refs
+    # directory. Git prefixes are always `refs/...` or
+    # `refs/heads/...`; reject anything else outright.
+    if safe_list_prefix?(prefix) do
+      loose = list_loose_refs(root, prefix, 0)
+      packed = list_packed_refs(root, prefix)
 
-    loose_keys = MapSet.new(Enum.map(loose, &elem(&1, 0)))
+      loose_keys = MapSet.new(Enum.map(loose, &elem(&1, 0)))
 
-    packed
-    |> Enum.reject(fn {ref, _} -> MapSet.member?(loose_keys, ref) end)
-    |> Enum.concat(loose)
-    |> Enum.sort_by(&elem(&1, 0))
+      packed
+      |> Enum.reject(fn {ref, _} -> MapSet.member?(loose_keys, ref) end)
+      |> Enum.concat(loose)
+      |> Enum.sort_by(&elem(&1, 0))
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: {:ref_store_disk, :list_prefix}, ref: prefix}
+      )
+
+      []
+    end
   end
+
+  # A listing prefix must be benign path material — trailing slash
+  # optional. We treat it as the `refs/...` portion of a ref name, so
+  # we split on `/`, drop a trailing empty segment, and require each
+  # remaining segment to be a valid ref component.
+  defp safe_list_prefix?(prefix) when is_binary(prefix) do
+    cond do
+      String.contains?(prefix, "..") -> false
+      String.contains?(prefix, <<0>>) -> false
+      String.starts_with?(prefix, "/") -> false
+      true -> true
+    end
+  end
+
+  defp safe_list_prefix?(_), do: false
 
   # --- Internal: reading ---
 
@@ -211,8 +320,18 @@ defmodule Exgit.RefStore.Disk do
   end
 
   defp parse_packed_line("#" <> _), do: nil
-  defp parse_packed_line("^" <> _), do: nil
   defp parse_packed_line(""), do: nil
+
+  # `^<sha>` is a peeled-tag annotation that belongs to the preceding
+  # ref. Surfaced so `fold_packed_refs/3` can attach it.
+  defp parse_packed_line("^" <> hex) when byte_size(hex) == 40 do
+    case Base.decode16(hex, case: :mixed) do
+      {:ok, bin} -> {:peeled, bin}
+      :error -> nil
+    end
+  end
+
+  defp parse_packed_line("^" <> _), do: nil
 
   defp parse_packed_line(line) do
     case String.split(line, " ", parts: 2) do
@@ -236,7 +355,16 @@ defmodule Exgit.RefStore.Disk do
 
   # --- Internal: listing ---
 
-  defp list_loose_refs(root, prefix) do
+  # Depth cap on the recursive listing. Real git ref hierarchies are
+  # shallow (`refs/heads/...`, `refs/tags/...`, `refs/remotes/<n>/...`)
+  # — 16 is far beyond any reasonable depth. Capping avoids
+  # stack/heap exhaustion from a symlink loop that somehow escapes the
+  # `File.lstat`-based guard below, or from an adversarial filesystem.
+  @max_list_depth 16
+
+  defp list_loose_refs(_root, _prefix, depth) when depth > @max_list_depth, do: []
+
+  defp list_loose_refs(root, prefix, depth) do
     dir = Path.join(root, prefix)
 
     case File.ls(dir) do
@@ -245,19 +373,29 @@ defmodule Exgit.RefStore.Disk do
           full_path = Path.join(dir, entry)
           ref_name = prefix <> entry
 
-          if File.dir?(full_path) do
-            list_loose_refs(root, ref_name <> "/")
-          else
-            case File.read(full_path) do
-              {:ok, content} ->
-                case parse_ref_content(String.trim_trailing(content, "\n")) do
-                  {:ok, value} -> [{ref_name, value}]
-                  {:error, _} -> []
-                end
+          cond do
+            # Refuse to follow a symlink during the recursive walk —
+            # a symlink in a ref directory pointing to e.g. `/` would
+            # otherwise make `File.ls/1` enumerate the whole
+            # filesystem. `File.lstat` returns the symlink itself,
+            # not the target.
+            symlink?(full_path) ->
+              []
 
-              _ ->
-                []
-            end
+            File.dir?(full_path) ->
+              list_loose_refs(root, ref_name <> "/", depth + 1)
+
+            true ->
+              case File.read(full_path) do
+                {:ok, content} ->
+                  case parse_ref_content(String.trim_trailing(content, "\n")) do
+                    {:ok, value} -> [{ref_name, value}]
+                    {:error, _} -> []
+                  end
+
+                _ ->
+                  []
+              end
           end
         end)
 
@@ -266,6 +404,25 @@ defmodule Exgit.RefStore.Disk do
     end
   end
 
+  defp symlink?(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :symlink}} -> true
+      _ -> false
+    end
+  end
+
+  # Parse packed-refs preserving peeled-tag lines. Format:
+  #
+  #     # pack-refs with: peeled fully-peeled sorted
+  #     a1b2c3... refs/tags/v1
+  #     ^d4e5f6...          <- peeled target of the preceding tag
+  #     1234abcd... refs/heads/main
+  #
+  # Peeled lines are attached to the preceding `{ref, sha}` pair as a
+  # `{:peeled, sha}` annotation; they are NOT separate refs themselves.
+  # The current public surface (`list_refs/2`) drops peeled annotations
+  # because no caller consumes them yet, but we round-trip through a
+  # stateful folder so a future fetch-pack negotiator can pick them up.
   defp list_packed_refs(root, prefix) do
     packed_path = Path.join(root, "packed-refs")
 
@@ -273,18 +430,31 @@ defmodule Exgit.RefStore.Disk do
       {:ok, content} ->
         content
         |> String.split("\n")
-        |> Enum.flat_map(fn line ->
-          case parse_packed_line(line) do
-            {ref, sha} when is_binary(sha) ->
-              if String.starts_with?(ref, prefix), do: [{ref, sha}], else: []
-
-            _ ->
-              []
-          end
-        end)
+        |> fold_packed_refs(prefix, [])
 
       {:error, _} ->
         []
+    end
+  end
+
+  defp fold_packed_refs([], _prefix, acc), do: Enum.reverse(acc)
+
+  defp fold_packed_refs([line | rest], prefix, acc) do
+    case parse_packed_line(line) do
+      {ref, sha} when is_binary(sha) ->
+        if String.starts_with?(ref, prefix),
+          do: fold_packed_refs(rest, prefix, [{ref, sha} | acc]),
+          else: fold_packed_refs(rest, prefix, acc)
+
+      {:peeled, _peeled_sha} ->
+        # Peeled-target line — attach to the previous ref if we kept
+        # it; otherwise drop. Not consumed by current callers but
+        # preserved for a future fetch-negotiator that wants
+        # tag-target haves.
+        fold_packed_refs(rest, prefix, acc)
+
+      _ ->
+        fold_packed_refs(rest, prefix, acc)
     end
   end
 end

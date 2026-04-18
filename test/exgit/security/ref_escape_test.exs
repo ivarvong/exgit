@@ -31,7 +31,7 @@ defmodule Exgit.Security.RefEscapeTest do
          # Also include one valid ref so the caller has something to
          # resolve normally.
          {"refs/heads/main", Blob.sha(blob)}
-       ]}
+       ], %{}}
     end
 
     def fetch(%HostileTransport{origin: store}, _wants, _opts) do

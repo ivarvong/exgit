@@ -24,6 +24,12 @@ defmodule Exgit.Walk do
 
   alias Exgit.Object.Commit
 
+  # Compiled once at module load; reused on every
+  # `parse_timestamp/1`. Previously compiled per call — at ~1M
+  # commits per full-history walk of a large repo this was
+  # measurable.
+  @timestamp_regex ~r/(\d+)\s+[+-]\d{4}$/
+
   @type repo :: %{object_store: term()}
 
   @spec ancestors(repo(), binary(), keyword()) :: Enumerable.t()
@@ -40,6 +46,26 @@ defmodule Exgit.Walk do
     if limit, do: Stream.take(stream, limit), else: stream
   end
 
+  @doc """
+  Find a **single** lowest-common-ancestor (LCA) commit for the given
+  SHAs.
+
+  When multiple LCAs exist (a criss-cross merge has two), `merge_base/2`
+  picks one deterministically:
+
+    * newest by author timestamp, wins
+    * ties broken by SHA (ascending)
+
+  This is **not identical to `git merge-base`'s tie-break** in every
+  case: git uses a traversal-order-dependent choice that can be hard
+  to replicate without cloning git's exact implementation. Both
+  libraries return a semantically-correct LCA; for workflows that
+  need the full set (e.g. a three-way merge), use
+  `merge_base_all/2`.
+
+  Returns `{:ok, sha}` on success or `{:error, :none}` when the
+  commits share no common ancestor.
+  """
   @spec merge_base(repo(), [binary()]) :: {:ok, binary()} | {:error, :none}
   def merge_base(_repo, []), do: {:error, :none}
   def merge_base(_repo, [sha]), do: {:ok, sha}
@@ -51,6 +77,28 @@ defmodule Exgit.Walk do
   def merge_base(repo, [a, b | rest]) do
     case find_merge_base(repo, a, b) do
       {:ok, base} -> merge_base(repo, [base | rest])
+      error -> error
+    end
+  end
+
+  @doc """
+  Find **all** lowest-common-ancestor commits for a pair of SHAs.
+
+  Equivalent to `git merge-base --all` — returns every commit that
+  is an ancestor of both inputs AND is not an ancestor of any other
+  such commit. Most histories return a singleton list; criss-cross
+  merges return 2+.
+
+  Currently only supports pairs. For N > 2, compose pairwise.
+  """
+  @spec merge_base_all(repo(), [binary()]) :: {:ok, [binary()]} | {:error, :none}
+  def merge_base_all(_repo, []), do: {:error, :none}
+  def merge_base_all(_repo, [sha]), do: {:ok, [sha]}
+
+  def merge_base_all(repo, [a, b]) do
+    case find_merge_base_raw(repo, a, b) do
+      {:ok, []} -> {:error, :none}
+      {:ok, list} -> {:ok, list}
       error -> error
     end
   end
@@ -189,7 +237,7 @@ defmodule Exgit.Walk do
   end
 
   defp parse_timestamp(author_line) do
-    case Regex.run(~r/(\d+)\s+[+-]\d{4}$/, author_line) do
+    case Regex.run(@timestamp_regex, author_line) do
       [_, ts] -> String.to_integer(ts)
       _ -> 0
     end
@@ -207,94 +255,166 @@ defmodule Exgit.Walk do
   @flag_stale 4
 
   defp find_merge_base(repo, sha_a, sha_b) do
-    # Merge both "seed" flags so that seeding the same sha twice produces
-    # a commit already tagged as both-reachable.
+    case find_merge_base_raw(repo, sha_a, sha_b) do
+      {:ok, []} -> {:error, :none}
+      {:ok, candidates} -> {:ok, pick_best_candidate(repo, candidates)}
+      error -> error
+    end
+  end
+
+  # Run the frontier BFS and return the raw candidate list without
+  # picking a single winner. Used by `find_merge_base/3` (which then
+  # calls `pick_best_candidate/2`) and by the public
+  # `merge_base_all/2`.
+  defp find_merge_base_raw(repo, sha_a, sha_b) do
     flags =
       %{}
       |> Map.update(sha_a, @flag_a, &Bitwise.bor(&1, @flag_a))
       |> Map.update(sha_b, @flag_b, &Bitwise.bor(&1, @flag_b))
 
-    queue =
-      :gb_sets.empty()
-      |> maybe_enqueue_mb(repo, sha_a)
-      |> if_different_enqueue(sha_a, sha_b, repo)
+    {queue, in_queue_count, stale_in_queue} =
+      enqueue_seed(:gb_sets.empty(), repo, sha_a, flags)
+      |> enqueue_seed_second(repo, sha_a, sha_b, flags)
 
-    case mb_loop(repo, queue, flags, MapSet.new()) do
-      {:ok, candidates} when candidates != [] ->
-        {:ok, hd(candidates)}
+    state = %{
+      queue: queue,
+      flags: flags,
+      candidates: MapSet.new(),
+      in_queue: in_queue_count,
+      stale_in_queue: stale_in_queue
+    }
 
-      {:ok, _} ->
-        {:error, :none}
-
-      :none ->
-        {:error, :none}
-    end
+    mb_loop(repo, state)
   end
 
-  defp if_different_enqueue(queue, same, same, _repo), do: queue
-  defp if_different_enqueue(queue, _a, b, repo), do: maybe_enqueue_mb(queue, repo, b)
+  # When the frontier BFS produces multiple candidate LCAs (classic
+  # criss-cross merge), `hd(candidates)` is nondeterministic — MapSet
+  # iteration order depends on insertion hashing.
+  #
+  # Git's `merge-base` resolves ties by picking the newest commit by
+  # author timestamp, with SHA as a stable tiebreaker. Emulate that
+  # so single-base queries produce git-compatible output. Callers who
+  # want the full set of LCAs should use `merge_base_all/2` (future
+  # addition).
+  defp pick_best_candidate(repo, candidates) do
+    candidates
+    |> Enum.map(fn sha ->
+      ts =
+        case get_commit(repo, sha) do
+          {:ok, c} -> parse_timestamp(Commit.author(c))
+          _ -> 0
+        end
 
-  defp maybe_enqueue_mb(queue, repo, sha) do
+      {sha, ts}
+    end)
+    |> Enum.sort_by(fn {sha, ts} -> {-ts, sha} end)
+    |> hd()
+    |> elem(0)
+  end
+
+  defp enqueue_seed(queue, repo, sha, _flags) do
     case get_commit(repo, sha) do
       {:ok, commit} ->
         ts = parse_timestamp(Commit.author(commit))
-        :gb_sets.add({-ts, sha, commit}, queue)
+        q = :gb_sets.add({-ts, sha, commit}, queue)
+        {q, 1, 0}
 
       _ ->
-        queue
+        {queue, 0, 0}
     end
   end
 
-  defp mb_loop(repo, queue, flags, candidates) do
+  defp enqueue_seed_second({queue, n, stale}, _repo, same, same, _flags), do: {queue, n, stale}
+
+  defp enqueue_seed_second({queue, n, stale}, repo, _a, b, flags) do
+    case get_commit(repo, b) do
+      {:ok, commit} ->
+        ts = parse_timestamp(Commit.author(commit))
+        q = :gb_sets.add({-ts, b, commit}, queue)
+        stale_delta = if Bitwise.band(Map.get(flags, b, 0), @flag_stale) != 0, do: 1, else: 0
+        {q, n + 1, stale + stale_delta}
+
+      _ ->
+        {queue, n, stale}
+    end
+  end
+
+  # Enqueue a parent for merge-base traversal, updating the
+  # in-queue and stale-in-queue counters. Returns `{queue, n, stale}`.
+  defp enqueue_parent({queue, n, stale}, repo, sha, flags) do
+    case get_commit(repo, sha) do
+      {:ok, commit} ->
+        ts = parse_timestamp(Commit.author(commit))
+        q = :gb_sets.add({-ts, sha, commit}, queue)
+        is_stale = Bitwise.band(Map.get(flags, sha, 0), @flag_stale) != 0
+        {q, n + 1, if(is_stale, do: stale + 1, else: stale)}
+
+      _ ->
+        {queue, n, stale}
+    end
+  end
+
+  defp mb_loop(repo, %{queue: queue} = state) do
     if :gb_sets.is_empty(queue) do
-      {:ok, MapSet.to_list(candidates)}
+      {:ok, MapSet.to_list(state.candidates)}
     else
       {{_ts, sha, commit}, queue} = :gb_sets.take_smallest(queue)
 
-      f = Map.fetch!(flags, sha)
+      f = Map.fetch!(state.flags, sha)
+      was_stale = Bitwise.band(f, @flag_stale) != 0
+
+      # Decrement in-queue counters for the item we just popped.
+      in_queue = state.in_queue - 1
+      stale_in_queue = if was_stale, do: state.stale_in_queue - 1, else: state.stale_in_queue
+
       both = Bitwise.band(@flag_a, f) != 0 and Bitwise.band(@flag_b, f) != 0
 
       {candidates, propagate_flag} =
-        if both and Bitwise.band(f, @flag_stale) == 0 do
-          # New candidate LCA. Mark its ancestors stale so we don't pick
-          # something further back.
-          {MapSet.put(candidates, sha), @flag_stale}
+        if both and not was_stale do
+          {MapSet.put(state.candidates, sha), @flag_stale}
         else
-          {candidates, 0}
+          {state.candidates, 0}
         end
 
-      # Early termination: if every item remaining in the queue is stale,
-      # we can stop.
-      if not :gb_sets.is_empty(queue) and all_stale?(queue, flags) do
+      # Early termination in O(1): if every remaining entry is stale,
+      # there's no way to find a better candidate. The old scan over
+      # the whole gb_set for this check was O(|queue|) per iteration,
+      # making merge_base O(|queue|^2) in the worst case. Now we
+      # maintain stale_in_queue incrementally.
+      if in_queue > 0 and in_queue == stale_in_queue do
         {:ok, MapSet.to_list(candidates)}
       else
-        {flags, queue} =
-          Enum.reduce(Commit.parents(commit), {flags, queue}, fn p, {fs, q} ->
-            pf = Bitwise.bor(f, propagate_flag)
-            old = Map.get(fs, p, 0)
-            new_flags = Bitwise.bor(old, pf)
+        {flags, {queue, in_queue, stale_in_queue}} =
+          Enum.reduce(
+            Commit.parents(commit),
+            {state.flags, {queue, in_queue, stale_in_queue}},
+            fn p, {fs, q_state} ->
+              pf = Bitwise.bor(f, propagate_flag)
+              old = Map.get(fs, p, 0)
+              new_flags = Bitwise.bor(old, pf)
 
-            fs = Map.put(fs, p, new_flags)
+              fs = Map.put(fs, p, new_flags)
 
-            q =
-              if new_flags != old do
-                maybe_enqueue_mb(q, repo, p)
-              else
-                q
-              end
+              q_state =
+                if new_flags != old do
+                  enqueue_parent(q_state, repo, p, fs)
+                else
+                  q_state
+                end
 
-            {fs, q}
-          end)
+              {fs, q_state}
+            end
+          )
 
-        mb_loop(repo, queue, flags, candidates)
+        mb_loop(repo, %{
+          queue: queue,
+          flags: flags,
+          candidates: candidates,
+          in_queue: in_queue,
+          stale_in_queue: stale_in_queue
+        })
       end
     end
-  end
-
-  defp all_stale?(queue, flags) do
-    Enum.all?(:gb_sets.to_list(queue), fn {_ts, sha, _} ->
-      Bitwise.band(Map.get(flags, sha, 0), @flag_stale) != 0
-    end)
   end
 
   # --- Helpers ---

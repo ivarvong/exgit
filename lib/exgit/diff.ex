@@ -15,11 +15,31 @@ defmodule Exgit.Diff do
       %{op: :type_changed,      path: String.t(), old_mode: String.t(), new_mode: String.t(),
                                 old_sha: binary(), new_sha: binary()}
 
-  For backward compatibility the old 4-tuple shape is still supported via
-  `trees_tuple/4` — new code should prefer `trees/4`.
+  ## Options
+
+    * `:prefix` — path prefix for the produced change entries. Default `""`.
+    * `:max_depth` — maximum tree recursion depth. Protects against a
+      hostile tree with a circular reference or a pathological nesting
+      that would overflow the stack. Default 256 (git itself caps
+      around 4096).
+    * `:max_changes` — cap the number of change entries. Prevents
+      a single `Diff.trees` call from producing millions of entries
+      on a hostile input. Default `nil` (unbounded; caller takes
+      responsibility).
+
+  ## Defense in depth
+
+  `Diff.trees/4` is the one path that walks arbitrary (possibly
+  remote-sourced) tree graphs recursively. It must not overflow the
+  stack or loop forever on a tree object that references itself
+  (directly or indirectly). The `:max_depth` cap is the guard; a
+  tree that exceeds it returns `{:error, {:max_depth_exceeded, n}}`
+  so callers can distinguish "legitimately deep" from "hostile".
   """
 
   alias Exgit.Object.Tree
+
+  @default_max_depth 256
 
   @type change ::
           %{required(:op) => atom(), required(:path) => String.t(), optional(atom()) => term()}
@@ -32,119 +52,260 @@ defmodule Exgit.Diff do
 
   def trees(repo, nil, tree_b_sha, opts) do
     with {:ok, tree_b} <- get_tree(repo, tree_b_sha) do
-      prefix = Keyword.get(opts, :prefix, "")
-      {:ok, all_added(repo, tree_b.entries, prefix)}
+      ctx = context(opts)
+      walk_side(repo, tree_b.entries, ctx, :added)
     end
   end
 
   def trees(repo, tree_a_sha, nil, opts) do
     with {:ok, tree_a} <- get_tree(repo, tree_a_sha) do
-      prefix = Keyword.get(opts, :prefix, "")
-      {:ok, all_removed(repo, tree_a.entries, prefix)}
+      ctx = context(opts)
+      walk_side(repo, tree_a.entries, ctx, :removed)
     end
   end
 
   def trees(repo, tree_a_sha, tree_b_sha, opts) do
     with {:ok, tree_a} <- get_tree(repo, tree_a_sha),
          {:ok, tree_b} <- get_tree(repo, tree_b_sha) do
-      prefix = Keyword.get(opts, :prefix, "")
-      {:ok, diff_entries(repo, tree_a.entries, tree_b.entries, prefix)}
+      ctx = context(opts)
+
+      case diff_entries(repo, tree_a.entries, tree_b.entries, ctx) do
+        {:ok, changes} -> {:ok, changes}
+        {:error, _} = err -> err
+      end
     end
   end
 
-  # --- Internal ---
+  # --- Context ---
 
-  defp diff_entries(repo, entries_a, entries_b, prefix) do
+  defp context(opts) do
+    %{
+      prefix: Keyword.get(opts, :prefix, ""),
+      depth: 0,
+      max_depth: Keyword.get(opts, :max_depth, @default_max_depth),
+      max_changes: Keyword.get(opts, :max_changes),
+      seen: MapSet.new()
+    }
+  end
+
+  defp descend(ctx, path, sub_sha) do
+    cond do
+      ctx.depth >= ctx.max_depth ->
+        {:error, {:max_depth_exceeded, ctx.max_depth}}
+
+      MapSet.member?(ctx.seen, sub_sha) ->
+        # Tree SHA already visited on this descent path — a cycle.
+        # Real git trees form a DAG, not a cyclic graph, but a
+        # hostile pack can contain a crafted cycle. Refuse.
+        {:error, {:tree_cycle, Base.encode16(sub_sha, case: :lower)}}
+
+      true ->
+        {:ok, %{ctx | prefix: path, depth: ctx.depth + 1, seen: MapSet.put(ctx.seen, sub_sha)}}
+    end
+  end
+
+  defp walk_side(repo, entries, ctx, side) do
+    case collect_side(repo, entries, ctx, side, []) do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp collect_side(_repo, [], _ctx, _side, acc), do: {:ok, acc}
+
+  defp collect_side(repo, [{mode, name, sha} | rest], ctx, side, acc) do
+    path = join_path(ctx.prefix, name)
+
+    with :ok <- check_change_cap(acc, ctx),
+         {:ok, acc} <- emit_side(repo, mode, path, sha, ctx, side, acc) do
+      collect_side(repo, rest, ctx, side, acc)
+    end
+  end
+
+  defp emit_side(repo, "40000", path, sha, ctx, side, acc) do
+    case get_tree(repo, sha) do
+      {:ok, tree} ->
+        case descend(ctx, path, sha) do
+          {:ok, sub_ctx} ->
+            case collect_side(repo, tree.entries, sub_ctx, side, acc) do
+              {:ok, _} = ok -> ok
+              {:error, _} = err -> err
+            end
+
+          {:error, _} = err ->
+            err
+        end
+
+      _ ->
+        # Tree missing or malformed — surface as a leaf-level change
+        # rather than silently skipping the branch.
+        {:ok, [side_change(side, path, "40000", sha) | acc]}
+    end
+  end
+
+  defp emit_side(_repo, mode, path, sha, _ctx, side, acc) do
+    {:ok, [side_change(side, path, mode, sha) | acc]}
+  end
+
+  defp side_change(:added, path, mode, sha), do: added_change(path, mode, sha)
+  defp side_change(:removed, path, mode, sha), do: removed_change(path, mode, sha)
+
+  defp check_change_cap(_acc, %{max_changes: nil}), do: :ok
+
+  defp check_change_cap(acc, %{max_changes: max}) when length(acc) >= max,
+    do: {:error, {:max_changes_exceeded, max}}
+
+  defp check_change_cap(_, _), do: :ok
+
+  # --- Pairwise diff ---
+
+  defp diff_entries(repo, entries_a, entries_b, ctx) do
     map_a = Map.new(entries_a, fn {_mode, name, _sha} = e -> {name, e} end)
     map_b = Map.new(entries_b, fn {_mode, name, _sha} = e -> {name, e} end)
     all_names = MapSet.union(MapSet.new(Map.keys(map_a)), MapSet.new(Map.keys(map_b)))
 
-    all_names
-    |> Enum.sort()
-    |> Enum.flat_map(fn name ->
-      a = Map.get(map_a, name)
-      b = Map.get(map_b, name)
-      path = join_path(prefix, name)
-      diff_entry(repo, a, b, path)
-    end)
+    sorted_names = Enum.sort(all_names)
+
+    case reduce_names(repo, sorted_names, map_a, map_b, ctx, []) do
+      {:ok, acc} -> {:ok, Enum.reverse(acc)}
+      {:error, _} = err -> err
+    end
   end
 
-  # New entry on the right side
-  defp diff_entry(repo, nil, {mode_b, _name, sha_b}, path) do
+  defp reduce_names(_repo, [], _map_a, _map_b, _ctx, acc), do: {:ok, acc}
+
+  defp reduce_names(repo, [name | rest], map_a, map_b, ctx, acc) do
+    a = Map.get(map_a, name)
+    b = Map.get(map_b, name)
+    path = join_path(ctx.prefix, name)
+
+    with :ok <- check_change_cap(acc, ctx),
+         {:ok, new_acc} <- diff_entry(repo, a, b, path, ctx, acc) do
+      reduce_names(repo, rest, map_a, map_b, ctx, new_acc)
+    end
+  end
+
+  # New entry on the right side — tree-side "added" expansion.
+  defp diff_entry(repo, nil, {mode_b, _name, sha_b}, path, ctx, acc) do
     if mode_b == "40000" do
-      case get_tree(repo, sha_b) do
-        {:ok, tree} -> all_added(repo, tree.entries, path)
-        _ -> [added_change(path, mode_b, sha_b)]
-      end
+      expand_side(repo, path, sha_b, ctx, :added, acc)
     else
-      [added_change(path, mode_b, sha_b)]
+      {:ok, [added_change(path, mode_b, sha_b) | acc]}
     end
   end
 
-  # Removed entry on the left side
-  defp diff_entry(repo, {mode_a, _name, sha_a}, nil, path) do
+  # Removed entry on the left side.
+  defp diff_entry(repo, {mode_a, _name, sha_a}, nil, path, ctx, acc) do
     if mode_a == "40000" do
-      case get_tree(repo, sha_a) do
-        {:ok, tree} -> all_removed(repo, tree.entries, path)
-        _ -> [removed_change(path, mode_a, sha_a)]
-      end
+      expand_side(repo, path, sha_a, ctx, :removed, acc)
     else
-      [removed_change(path, mode_a, sha_a)]
+      {:ok, [removed_change(path, mode_a, sha_a) | acc]}
     end
   end
 
-  defp diff_entry(repo, {mode_a, _name, sha_a}, {mode_b, _name_b, sha_b}, path) do
+  defp diff_entry(repo, {mode_a, _name, sha_a}, {mode_b, _name_b, sha_b}, path, ctx, acc) do
     cond do
       sha_a == sha_b and mode_a == mode_b ->
-        []
+        {:ok, acc}
 
       # Submodules (gitlinks): both sides are 160000 → :submodule_change
       mode_a == "160000" and mode_b == "160000" ->
-        [
-          %{
-            op: :submodule_change,
-            path: path,
-            old_sha: sha_a,
-            new_sha: sha_b
-          }
-        ]
+        {:ok,
+         [
+           %{
+             op: :submodule_change,
+             path: path,
+             old_sha: sha_a,
+             new_sha: sha_b
+           }
+           | acc
+         ]}
 
-      # Both sides are trees → recurse.
+      # Both sides are trees → recurse. We descend under cycle/depth
+      # guards; a failure on either side's tree returns an error
+      # instead of the prior silent `:modified` fallback (which hid
+      # inconsistency from callers).
       mode_a == "40000" and mode_b == "40000" ->
-        case {get_tree(repo, sha_a), get_tree(repo, sha_b)} do
-          {{:ok, ta}, {:ok, tb}} -> diff_entries(repo, ta.entries, tb.entries, path)
-          _ -> [modified_change(path, mode_a, sha_a, mode_b, sha_b)]
-        end
+        descend_and_diff(repo, sha_a, sha_b, path, ctx, acc)
 
       # Type change between tree and non-tree.
       mode_a == "40000" or mode_b == "40000" ->
-        [
-          %{
-            op: :type_changed,
-            path: path,
-            old_mode: mode_a,
-            new_mode: mode_b,
-            old_sha: sha_a,
-            new_sha: sha_b
-          }
-        ]
+        {:ok,
+         [
+           %{
+             op: :type_changed,
+             path: path,
+             old_mode: mode_a,
+             new_mode: mode_b,
+             old_sha: sha_a,
+             new_sha: sha_b
+           }
+           | acc
+         ]}
 
-      # Same content, different mode: :mode_changed
+      # Same content, different mode: :mode_changed.
       sha_a == sha_b ->
-        [
-          %{
-            op: :mode_changed,
-            path: path,
-            old_mode: mode_a,
-            new_mode: mode_b,
-            old_sha: sha_a,
-            new_sha: sha_b
-          }
-        ]
+        {:ok,
+         [
+           %{
+             op: :mode_changed,
+             path: path,
+             old_mode: mode_a,
+             new_mode: mode_b,
+             old_sha: sha_a,
+             new_sha: sha_b
+           }
+           | acc
+         ]}
 
       # Ordinary content change.
       true ->
-        [modified_change(path, mode_a, sha_a, mode_b, sha_b)]
+        {:ok, [modified_change(path, mode_a, sha_a, mode_b, sha_b) | acc]}
+    end
+  end
+
+  # Recurse into two tree children, guarding depth + cycles on BOTH
+  # sides. We pick a single descend call per recursion, using the
+  # lexicographically-smaller SHA as the `seen` token — it doesn't
+  # matter which, so long as we guard against self-cycles.
+  defp descend_and_diff(repo, sha_a, sha_b, path, ctx, acc) do
+    with {:ok, ta} <- get_tree(repo, sha_a),
+         {:ok, tb} <- get_tree(repo, sha_b),
+         {:ok, sub_ctx} <- descend(ctx, path, sha_a),
+         {:ok, sub_ctx} <- descend(%{sub_ctx | depth: ctx.depth + 1}, path, sha_b) do
+      case diff_entries(repo, ta.entries, tb.entries, %{sub_ctx | prefix: path}) do
+        {:ok, children} -> {:ok, Enum.reverse(children) ++ acc}
+        {:error, _} = err -> err
+      end
+    else
+      # Either tree missing or depth/cycle guard tripped.
+      {:error, _} = err ->
+        err
+
+      _ ->
+        # Defensive: if get_tree returned a non-ok tuple without an
+        # error reason, surface as a `modified` entry so we don't
+        # loop or silently skip.
+        {:ok, [modified_change(path, "40000", sha_a, "40000", sha_b) | acc]}
+    end
+  end
+
+  defp expand_side(repo, path, sha, ctx, side, acc) do
+    case get_tree(repo, sha) do
+      {:ok, tree} ->
+        case descend(ctx, path, sha) do
+          {:ok, sub_ctx} ->
+            case collect_side(repo, tree.entries, sub_ctx, side, acc) do
+              {:ok, _} = ok -> ok
+              {:error, _} = err -> err
+            end
+
+          {:error, _} = err ->
+            err
+        end
+
+      _ ->
+        {:ok, [side_change(side, path, "40000", sha) | acc]}
     end
   end
 
@@ -163,36 +324,6 @@ defmodule Exgit.Diff do
       old_sha: sha_a,
       new_sha: sha_b
     }
-
-  defp all_added(repo, entries, prefix) do
-    Enum.flat_map(entries, fn {mode, name, sha} ->
-      path = join_path(prefix, name)
-
-      if mode == "40000" do
-        case get_tree(repo, sha) do
-          {:ok, tree} -> all_added(repo, tree.entries, path)
-          _ -> [added_change(path, mode, sha)]
-        end
-      else
-        [added_change(path, mode, sha)]
-      end
-    end)
-  end
-
-  defp all_removed(repo, entries, prefix) do
-    Enum.flat_map(entries, fn {mode, name, sha} ->
-      path = join_path(prefix, name)
-
-      if mode == "40000" do
-        case get_tree(repo, sha) do
-          {:ok, tree} -> all_removed(repo, tree.entries, path)
-          _ -> [removed_change(path, mode, sha)]
-        end
-      else
-        [removed_change(path, mode, sha)]
-      end
-    end)
-  end
 
   defp join_path("", name), do: name
   defp join_path(prefix, name), do: prefix <> "/" <> name

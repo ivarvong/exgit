@@ -25,7 +25,7 @@ defmodule Exgit.PromisorHavesTest do
     alias Exgit.PromisorHavesTest.FakeT
 
     def capabilities(_), do: {:ok, %{version: 2}}
-    def ls_refs(_, _), do: {:ok, []}
+    def ls_refs(_, _), do: {:ok, [], %{}}
     def push(_, _, _, _), do: {:error, :unsupported}
 
     def fetch(%FakeT{origin: origin, calls: pid}, wants, opts) do

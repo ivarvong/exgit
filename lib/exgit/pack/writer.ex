@@ -63,10 +63,26 @@ defmodule Exgit.Pack.Writer do
 
   defp deflate(data) do
     z = :zlib.open()
-    :zlib.deflateInit(z)
-    compressed = :zlib.deflate(z, data, :finish)
-    :zlib.deflateEnd(z)
-    :zlib.close(z)
-    IO.iodata_to_binary(compressed)
+
+    try do
+      :zlib.deflateInit(z)
+      compressed = :zlib.deflate(z, data, :finish)
+      IO.iodata_to_binary(compressed)
+    after
+      # Always deflateEnd + close, even on an exception from
+      # deflate/3 (OOM, port closed, etc.). Without the try/after the
+      # port leaks; a long-running push-heavy service eventually
+      # runs out of BEAM port slots.
+      _ =
+        try do
+          :zlib.deflateEnd(z)
+        rescue
+          _ -> :ok
+        catch
+          _, _ -> :ok
+        end
+
+      :zlib.close(z)
+    end
   end
 end

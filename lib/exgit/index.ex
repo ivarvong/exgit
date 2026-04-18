@@ -8,6 +8,19 @@ defmodule Exgit.Index do
 
   All parse errors are returned as `{:error, _}`; malformed inputs never
   raise.
+
+  ## Bounds
+
+    * `:max_entries` — maximum number of entries the parser will
+      attempt to decode. A hostile index with `count = 2^32-1`
+      would otherwise trigger billions of iterations. Default
+      1,000,000 — comfortably above any real monorepo
+      (linux/linux is ~75k).
+    * `:max_bytes` — maximum input size. Default 512 MiB. Paired
+      with `:max_entries` as defense-in-depth.
+    * `:verify_checksum` — when `true` (default), verify the
+      trailing SHA-1 checksum and reject corrupt indexes. Disable
+      only for forensic analysis of known-corrupt files.
   """
 
   alias Exgit.Index.Entry
@@ -18,10 +31,13 @@ defmodule Exgit.Index do
 
   @signature "DIRC"
 
-  @spec read(Path.t()) :: {:ok, t()} | {:error, term()}
-  def read(path) do
+  @default_max_entries 1_000_000
+  @default_max_bytes 512 * 1024 * 1024
+
+  @spec read(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
+  def read(path, opts \\ []) do
     case File.read(path) do
-      {:ok, data} -> parse(data)
+      {:ok, data} -> parse(data, opts)
       {:error, reason} -> {:error, reason}
     end
   end
@@ -29,21 +45,68 @@ defmodule Exgit.Index do
   @spec entries(t()) :: [Entry.t()]
   def entries(%__MODULE__{entries: entries}), do: entries
 
-  @spec parse(binary()) :: {:ok, t()} | {:error, term()}
-  def parse(<<@signature, version::32, count::32, rest::binary>>) when version in [2, 3] do
-    case parse_entries(rest, count, []) do
-      {:ok, entries, _rest} ->
-        {:ok, %__MODULE__{version: version, entries: Enum.reverse(entries)}}
+  @spec parse(binary(), keyword()) :: {:ok, t()} | {:error, term()}
+  def parse(data, opts \\ [])
 
-      {:error, _} = err ->
-        err
+  def parse(data, _opts) when not is_binary(data), do: {:error, :invalid_index}
+
+  def parse(data, opts) do
+    max_bytes = Keyword.get(opts, :max_bytes, @default_max_bytes)
+
+    cond do
+      byte_size(data) > max_bytes ->
+        {:error, {:index_too_large, byte_size(data), max_bytes}}
+
+      true ->
+        do_parse(data, opts)
     end
   end
 
-  def parse(<<@signature, version::32, _::binary>>),
+  defp do_parse(<<@signature, version::32, count::32, rest::binary>> = data, opts)
+       when version in [2, 3] do
+    max_entries = Keyword.get(opts, :max_entries, @default_max_entries)
+    # Checksum verification requires the full 20-byte trailer; silently
+    # skip on inputs too small to carry one (typical in unit tests that
+    # exercise parser branches on header-only bytes). A real on-disk
+    # index is always >= 32 bytes.
+    verify? =
+      Keyword.get(opts, :verify_checksum, true) and byte_size(data) >= 32
+
+    cond do
+      count > max_entries ->
+        {:error, {:too_many_entries, count, max_entries}}
+
+      verify? and not valid_checksum?(data) ->
+        {:error, :checksum_mismatch}
+
+      true ->
+        case parse_entries(rest, count, []) do
+          {:ok, entries, _rest} ->
+            {:ok, %__MODULE__{version: version, entries: Enum.reverse(entries)}}
+
+          {:error, _} = err ->
+            err
+        end
+    end
+  end
+
+  defp do_parse(<<@signature, version::32, _::binary>>, _opts),
     do: {:error, {:unsupported_version, version}}
 
-  def parse(_), do: {:error, :invalid_index}
+  defp do_parse(_, _opts), do: {:error, :invalid_index}
+
+  # The trailing SHA-1 is computed over every byte up to (but not
+  # including) the checksum itself. Validates against bit-rot and
+  # most tampering. Does not defend against an attacker who
+  # recomputes the SHA — but the file is caller-controlled, not
+  # remote-controlled.
+  defp valid_checksum?(data) when byte_size(data) >= 20 do
+    content_size = byte_size(data) - 20
+    <<content::binary-size(content_size), checksum::binary-size(20)>> = data
+    :crypto.hash(:sha, content) == checksum
+  end
+
+  defp valid_checksum?(_), do: false
 
   defp parse_entries(rest, 0, acc), do: {:ok, acc, rest}
 

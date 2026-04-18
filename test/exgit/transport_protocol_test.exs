@@ -30,7 +30,7 @@ defmodule Exgit.TransportProtocolTest do
 
       def ls_refs(%Exgit.TransportProtocolTest.FakeTransport{agent: a}, opts) do
         Agent.update(a, &[{:ls_refs, opts} | &1])
-        {:ok, []}
+        {:ok, [], %{}}
       end
 
       def fetch(%Exgit.TransportProtocolTest.FakeTransport{agent: a}, wants, opts) do
@@ -49,7 +49,7 @@ defmodule Exgit.TransportProtocolTest do
     t = FakeTransport.new()
 
     assert {:ok, _caps} = Exgit.Transport.capabilities(t)
-    assert {:ok, []} = Exgit.Transport.ls_refs(t, prefix: ["refs/heads/"])
+    assert {:ok, [], %{}} = Exgit.Transport.ls_refs(t, prefix: ["refs/heads/"])
     assert {:ok, _, _} = Exgit.Transport.fetch(t, [:crypto.strong_rand_bytes(20)], [])
     assert {:ok, _} = Exgit.Transport.push(t, [{"refs/heads/main", nil, nil}], <<>>, [])
 

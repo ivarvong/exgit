@@ -49,16 +49,27 @@ defmodule Exgit.Object.Tag do
     case :binary.match(bytes, "\n\n") do
       {pos, 2} ->
         <<raw_headers::binary-size(pos), "\n\n", message::binary>> = bytes
-        headers = parse_headers(raw_headers)
 
-        {:ok,
-         %__MODULE__{
-           object: Map.fetch!(headers, :object),
-           type: Map.fetch!(headers, :type),
-           tag: Map.fetch!(headers, :tag),
-           tagger: Map.get(headers, :tagger),
-           message: message
-         }}
+        case parse_headers(raw_headers) do
+          {:ok, headers} ->
+            with {:ok, object} <- Map.fetch(headers, :object),
+                 {:ok, type} <- Map.fetch(headers, :type),
+                 {:ok, tag} <- Map.fetch(headers, :tag) do
+              {:ok,
+               %__MODULE__{
+                 object: object,
+                 type: type,
+                 tag: tag,
+                 tagger: Map.get(headers, :tagger),
+                 message: message
+               }}
+            else
+              :error -> {:error, :missing_header}
+            end
+
+          {:error, _} = err ->
+            err
+        end
 
       :nomatch ->
         {:error, :missing_message_separator}
@@ -67,16 +78,31 @@ defmodule Exgit.Object.Tag do
     e -> {:error, {:decode_failed, e}}
   end
 
+  # Parse headers into a map. If any `object` header has non-hex content,
+  # return an error — a hostile remote could otherwise DoS downstream
+  # accessors. We never `raise` on the wire bytes.
   defp parse_headers(raw) do
     raw
     |> String.split("\n")
-    |> Enum.reduce(%{}, fn line, acc ->
+    |> Enum.reduce_while({:ok, %{}}, fn line, {:ok, acc} ->
       case String.split(line, " ", parts: 2) do
-        ["object", hex] -> Map.put(acc, :object, Hex.decode!(hex))
-        ["type", val] -> Map.put(acc, :type, val)
-        ["tag", val] -> Map.put(acc, :tag, val)
-        ["tagger", val] -> Map.put(acc, :tagger, val)
-        _ -> acc
+        ["object", hex] ->
+          case Hex.decode(hex) do
+            {:ok, bin} -> {:cont, {:ok, Map.put(acc, :object, bin)}}
+            :error -> {:halt, {:error, {:invalid_hex_header, "object", hex}}}
+          end
+
+        ["type", val] ->
+          {:cont, {:ok, Map.put(acc, :type, val)}}
+
+        ["tag", val] ->
+          {:cont, {:ok, Map.put(acc, :tag, val)}}
+
+        ["tagger", val] ->
+          {:cont, {:ok, Map.put(acc, :tagger, val)}}
+
+        _ ->
+          {:cont, {:ok, acc}}
       end
     end)
   end

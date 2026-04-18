@@ -17,11 +17,23 @@ defmodule Exgit.ObjectStore.Disk do
 
     case File.read(path) do
       {:ok, compressed} ->
-        raw = :zlib.uncompress(compressed)
+        # :zlib.uncompress/1 RAISES on invalid zlib (corrupt file,
+        # bit-rot, hostile writer with FS access). The loose-object
+        # read path promises tagged errors all the way to the caller
+        # — SECURITY.md's threat model explicitly names this boundary
+        # ("SHA verification on read detects bit-rot and tampering"),
+        # but SHA verification only runs AFTER decompression. Wrap
+        # the raise so corrupt blobs surface as {:error, :zlib_error}
+        # instead of crashing the caller.
+        case safe_uncompress(compressed) do
+          {:ok, raw} ->
+            with :ok <- verify_sha(raw, sha),
+                 {:ok, obj} <- parse_loose_object(raw) do
+              {:ok, obj}
+            end
 
-        with :ok <- verify_sha(raw, sha),
-             {:ok, obj} <- parse_loose_object(raw) do
-          {:ok, obj}
+          {:error, _} = err ->
+            err
         end
 
       {:error, :enoent} ->
@@ -30,6 +42,14 @@ defmodule Exgit.ObjectStore.Disk do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp safe_uncompress(compressed) do
+    {:ok, :zlib.uncompress(compressed)}
+  rescue
+    _ -> {:error, :zlib_error}
+  catch
+    _, _ -> {:error, :zlib_error}
   end
 
   # Git objects are content-addressed: the on-disk (uncompressed) bytes
@@ -262,7 +282,7 @@ defmodule Exgit.ObjectStore.Disk do
       {:ok, fd} ->
         try do
           with {:ok, header} <- pread_header(fd),
-               {:ok, body} <- pread_tail(fd, offset) do
+               {:ok, body} <- pread_tail(fd, pack_path, offset) do
             # Splice: synthesize a tiny "pack" = header + (offset gap) + body
             # so parse_at(slice, offset=12) sees the object directly.
             # We re-map: parse_at expects the full pack with proper offset.
@@ -294,15 +314,56 @@ defmodule Exgit.ObjectStore.Disk do
     end
   end
 
-  defp pread_tail(fd, offset) do
-    # Read the object header + enough bytes for the compressed body.
-    # We don't know the exact length, so we read a generous chunk. For
-    # most objects a 128KB tail is enough; for huge blobs we re-read.
-    case :file.pread(fd, offset, 131_072) do
-      {:ok, body} when byte_size(body) > 0 -> {:ok, body}
-      {:ok, <<>>} -> {:error, :empty_pread}
-      :eof -> {:error, :pack_truncated_at_offset}
-      {:error, _} = err -> err
+  # Read the pack tail starting at `offset`. Returns the full tail
+  # from `offset` to EOF minus the 20-byte pack checksum trailer.
+  # Previously capped at 128 KiB with a comment saying "for huge
+  # blobs we re-read" — but there was no re-read path, so objects
+  # larger than ~128 KiB silently returned truncated bodies.
+  #
+  # Current implementation:
+  #   * size-probe the file
+  #   * cap the read at `file_size - offset - 20` (no trailer bytes)
+  #   * cap absolute size at `:max_pread_bytes` (default 512 MiB)
+  #     to avoid mmap-style giant allocations from a 10 GiB pack
+  #     when the caller only asked for one object
+  #
+  # The caller already has `Pack.Reader.zlib_inflate_tracked/2`'s
+  # own upper-bound slicing, so reading the full tail is wasted work
+  # for small objects — but the work is O(bytes read), and the
+  # previous 128 KiB cap was an O(1) cliff: objects above the cap
+  # failed silently. Size-probing makes the behavior correct and
+  # predictable.
+  @max_pread_bytes 512 * 1024 * 1024
+
+  defp pread_tail(fd, pack_path, offset) do
+    # Size-probe via the path, not the fd (reading `file_info` from
+    # an fd returns the OTP `file_info` record which is shape-
+    # sensitive; going through the path is portable). The fd is
+    # still used for the actual pread.
+    case File.stat(pack_path) do
+      {:ok, %File.Stat{size: file_size}} ->
+        # Subtract 20-byte pack checksum trailer so we don't feed it
+        # as "object content."
+        available = max(file_size - offset - 20, 0)
+
+        cond do
+          available <= 0 ->
+            {:error, :pack_truncated_at_offset}
+
+          available > @max_pread_bytes ->
+            {:error, {:object_at_offset_too_large, available, @max_pread_bytes}}
+
+          true ->
+            case :file.pread(fd, offset, available) do
+              {:ok, body} when byte_size(body) > 0 -> {:ok, body}
+              {:ok, <<>>} -> {:error, :empty_pread}
+              :eof -> {:error, :pack_truncated_at_offset}
+              {:error, _} = err -> err
+            end
+        end
+
+      {:error, _} = err ->
+        err
     end
   end
 

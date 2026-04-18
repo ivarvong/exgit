@@ -138,7 +138,7 @@ defmodule Exgit.RoundtripSmoketest do
       File.rm_rf!(bare)
     end
 
-    test "lazy_clone + read_path roundtrip: random file, random path" do
+    test "lazy clone + read_path roundtrip: random file, random path" do
       tree = random_tree(n_files: 50, max_depth: 4, max_size: 2048)
 
       {_commit_sha_hex, work_dir} = git_commit_tree!(tree)
@@ -150,7 +150,7 @@ defmodule Exgit.RoundtripSmoketest do
       RealGit.git!(work_dir, ["push", "origin", "HEAD:refs/heads/main"])
 
       t = Transport.File.new(bare)
-      {:ok, repo} = Exgit.lazy_clone(t)
+      {:ok, repo} = Exgit.clone(t, lazy: true)
 
       # Pick 5 random paths and verify each reads back correctly.
       sample = Enum.take_random(Map.to_list(tree), 5)

@@ -16,48 +16,91 @@ defmodule Exgit.Transport.File do
       [:exgit, :transport, :ls_refs],
       %{transport: :file, path: t.path},
       fn ->
-        {:ok, refs} = result = do_ls_refs(t, opts)
-        {:span, result, %{ref_count: length(refs)}}
+        {:ok, refs, meta} = result = do_ls_refs(t, opts)
+
+        {:span, result, %{ref_count: length(refs), has_head: Map.has_key?(meta, :head)}}
       end
     )
   end
 
+  # Returns `{:ok, refs, meta}` — the same 3-tuple shape as
+  # `Transport.HTTP.ls_refs/2`. `meta.head` is the HEAD symref
+  # target when HEAD resolves to another ref; `meta.peeled` is left
+  # absent (the file transport doesn't currently peel annotated
+  # tags). The shape is part of the `Exgit.Transport` protocol
+  # contract.
   defp do_ls_refs(%__MODULE__{path: path}, opts) do
     ref_store = RefStore.Disk.new(path)
     prefixes = Keyword.get(opts, :prefix, ["refs/"]) |> List.wrap()
 
+    # Whether to include a `{"HEAD", sha}` entry in the refs list.
+    # Matches git protocol v2 behavior: HEAD appears in the list only
+    # when the caller explicitly asks for it via an empty prefix or
+    # `"HEAD"`.
+    include_head_entry? = Enum.any?(prefixes, &(&1 == "" or &1 == "HEAD"))
+
     refs =
       prefixes
+      |> Enum.reject(&(&1 == "HEAD"))
       |> Enum.flat_map(&RefStore.Disk.list_refs(ref_store, &1))
       |> Enum.uniq_by(&elem(&1, 0))
+      |> Enum.map(fn {ref, value} -> resolve_ref(ref_store, ref, value) end)
 
-    head =
-      if Enum.any?(prefixes, &(&1 == "" or &1 == "HEAD")) do
-        case RefStore.Disk.resolve_ref(ref_store, "HEAD") do
-          {:ok, sha} -> [{"HEAD", sha}]
-          _ -> []
-        end
-      else
-        []
+    # HEAD's symref target is ALWAYS surfaced in `meta.head` when
+    # available — cheap to compute, and callers that care about the
+    # default branch shouldn't have to also ask for HEAD in the
+    # prefix list. This mirrors how `Transport.HTTP.ls_refs/2`
+    # unconditionally emits symref info.
+    {head_entry, head_target} = read_head(ref_store)
+
+    all_entries =
+      if include_head_entry?, do: [head_entry | refs], else: refs
+
+    all_entries =
+      all_entries
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(fn {ref, _sha} -> keep_ref?(ref, path) end)
+
+    meta =
+      case head_target do
+        nil -> %{}
+        target -> %{head: target}
       end
 
-    entries =
-      (head ++ Enum.map(refs, fn {ref, value} -> resolve_ref(ref_store, ref, value) end))
-      |> Enum.filter(fn {ref, _sha} ->
-        if Exgit.RefName.valid?(ref) do
-          true
-        else
-          :telemetry.execute(
-            [:exgit, :security, :ref_rejected],
-            %{count: 1},
-            %{source: path, ref: ref}
-          )
+    {:ok, all_entries, meta}
+  end
 
-          false
+  # Read HEAD from the disk ref store. Returns `{head_entry,
+  # head_target}` where `head_entry` is the `{"HEAD", sha}` pair to
+  # include in the refs list, and `head_target` is the symbolic
+  # target (e.g. `"refs/heads/main"`) to lift into `meta.head`.
+  defp read_head(ref_store) do
+    with {:ok, {:symbolic, target}} <- RefStore.Disk.read_ref(ref_store, "HEAD"),
+         {:ok, sha} <- RefStore.Disk.resolve_ref(ref_store, "HEAD") do
+      {{"HEAD", sha}, target}
+    else
+      # Detached HEAD or packed-only HEAD — no symref target, but
+      # we still want to surface the resolved sha.
+      _ ->
+        case RefStore.Disk.resolve_ref(ref_store, "HEAD") do
+          {:ok, sha} -> {{"HEAD", sha}, nil}
+          _ -> {nil, nil}
         end
-      end)
+    end
+  end
 
-    {:ok, entries}
+  defp keep_ref?(ref, path) do
+    if Exgit.RefName.valid?(ref) do
+      true
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: path, ref: ref}
+      )
+
+      false
+    end
   end
 
   def fetch(%__MODULE__{} = t, wants, opts \\ []) do

@@ -180,7 +180,7 @@ defmodule Exgit.TelemetryTest do
         alias Exgit.TelemetryTest.FakeT
 
         def capabilities(_), do: {:ok, %{version: 2}}
-        def ls_refs(_, _), do: {:ok, []}
+        def ls_refs(_, _), do: {:ok, [], %{}}
         def push(_, _, _, _), do: {:error, :unsupported}
 
         def fetch(%FakeT{store: store}, wants, _opts) do

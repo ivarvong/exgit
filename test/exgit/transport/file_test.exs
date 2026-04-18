@@ -43,8 +43,11 @@ defmodule Exgit.Transport.FileTest do
       commit_sha = seed_repo(path)
       transport = FileTransport.new(path)
 
-      assert {:ok, refs} = FileTransport.ls_refs(transport)
+      assert {:ok, refs, meta} = FileTransport.ls_refs(transport)
       assert {"refs/heads/main", ^commit_sha} = List.keyfind(refs, "refs/heads/main", 0)
+      # The file transport reports HEAD's symref target when HEAD
+      # resolves symbolically to another ref.
+      assert meta.head == "refs/heads/main"
     end
   end
 
@@ -71,7 +74,7 @@ defmodule Exgit.Transport.FileTest do
       tree = Tree.new([{"100644", "pushed.txt", blob_sha}])
       {:ok, tree_sha} = ObjectStore.Disk.put_object(store, tree)
 
-      {:ok, [{_, main_sha}]} =
+      {:ok, [{_, main_sha}], _meta} =
         FileTransport.ls_refs(transport, prefix: "refs/heads/")
 
       commit =

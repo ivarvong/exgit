@@ -1,4 +1,45 @@
 defmodule Exgit.Config do
+  @moduledoc """
+  Parser and emitter for git-style INI configuration files.
+
+  `parse/1` accepts arbitrary input — caller- or filesystem-supplied
+  text — and returns a tagged `{:ok, _} | {:error, _}` result. It
+  never raises on untrusted input.
+
+  ## Threat model
+
+  `.git/config` is treated as **caller-controlled** input, not
+  remote-controlled. Exgit does not fetch or persist config received
+  over the wire, and it does not **act on** any config value:
+
+    * no `core.sshCommand` / `core.fsmonitor` / `core.hookspath` —
+      there is no code path that executes a command out of config
+    * no `http.proxy` — Req's proxy comes from env or the explicit
+      transport opts, not from config
+    * no `insteadOf` / `pushInsteadOf` URL rewriting
+    * no `include` / `includeIf` expansion — config files are read
+      as-is; `[include] path=...` entries are parsed but ignored
+    * no `~/` or `${VAR}` path expansion — paths in config values
+      are treated as opaque strings
+
+  This keeps the blast radius of a hostile `.git/config` to "data
+  the caller reads back out of `repo.config` and uses themselves."
+  A consumer who reads e.g. `Config.get(config, "core", "sshCommand")`
+  and hands it to `System.cmd/2` is outside exgit's trust boundary.
+
+  **If submodule support is added**, `.gitmodules` URLs become a
+  remote-controlled surface and will need separate validation —
+  refusing `file://`, `ssh://user@host/…;command`, and any URL
+  containing shell-metacharacters. Not currently present.
+  """
+
+  # Pre-compiled at module load. Previously inline `~r/.../` sigils
+  # were re-parsed on every `parse_section_header/1` call (four
+  # times per section line), which showed up on any config-heavy
+  # workflow.
+  @section_header_subsection ~r/^\[(\w[\w.-]*)\s+"(.*)"\]$/
+  @section_header_plain ~r/^\[(\w[\w.-]*)\]$/
+
   @enforce_keys [:sections]
   defstruct [:sections]
 
@@ -10,10 +51,11 @@ defmodule Exgit.Config do
 
   @spec get(t(), String.t(), String.t() | nil, String.t()) :: String.t() | nil
   def get(%__MODULE__{sections: sections}, section, subsection \\ nil, key) do
+    section_lower = String.downcase(section)
     key_lower = String.downcase(key)
 
     Enum.find_value(sections, fn
-      {{^section, ^subsection}, entries} ->
+      {{^section_lower, ^subsection}, entries} ->
         Enum.find_value(entries, fn
           {k, v} -> if String.downcase(k) == key_lower, do: v
         end)
@@ -25,10 +67,11 @@ defmodule Exgit.Config do
 
   @spec get_all(t(), String.t(), String.t() | nil, String.t()) :: [String.t()]
   def get_all(%__MODULE__{sections: sections}, section, subsection \\ nil, key) do
+    section_lower = String.downcase(section)
     key_lower = String.downcase(key)
 
     Enum.flat_map(sections, fn
-      {{^section, ^subsection}, entries} ->
+      {{^section_lower, ^subsection}, entries} ->
         for {k, v} <- entries, String.downcase(k) == key_lower, do: v
 
       _ ->
@@ -45,7 +88,13 @@ defmodule Exgit.Config do
   """
   @spec add(t(), String.t(), String.t() | nil, String.t(), String.t()) :: t()
   def add(%__MODULE__{sections: sections} = config, section, subsection \\ nil, key, value) do
-    sec_key = {section, subsection}
+    # Git treats section names case-insensitively. Store the
+    # downcased form so that `add("CORE", ...)` and
+    # `add("core", ...)` address the same section, and so that
+    # parse/encode roundtrip is a fixpoint regardless of casing
+    # in the caller's input. Subsection names are case-sensitive
+    # per git's rules.
+    sec_key = {String.downcase(section), subsection}
 
     case Enum.find_index(sections, fn {sk, _} -> sk == sec_key end) do
       nil ->
@@ -60,7 +109,7 @@ defmodule Exgit.Config do
 
   @spec set(t(), String.t(), String.t() | nil, String.t(), String.t()) :: t()
   def set(%__MODULE__{sections: sections} = config, section, subsection \\ nil, key, value) do
-    sec_key = {section, subsection}
+    sec_key = {String.downcase(section), subsection}
     key_lower = String.downcase(key)
 
     case Enum.find_index(sections, fn {sk, _} -> sk == sec_key end) do
@@ -137,8 +186,15 @@ defmodule Exgit.Config do
         end
 
       sec_key != nil ->
-        {:ok, key, value} = parse_key_value(trimmed)
-        parse_lines(rest, sec_key, [{key, value} | entries], acc)
+        # parse_key_value always returns {:ok, _, _} today, but use a
+        # `case` rather than an unconditional pattern match so a
+        # future branch that returns {:error, _} cannot crash the
+        # parser — the moduledoc explicitly promises this function
+        # never raises on untrusted input.
+        case parse_key_value(trimmed) do
+          {:ok, key, value} -> parse_lines(rest, sec_key, [{key, value} | entries], acc)
+          {:error, _} = err -> err
+        end
 
       true ->
         {:error, {:unexpected_line, trimmed}}
@@ -150,13 +206,13 @@ defmodule Exgit.Config do
 
     cond do
       # [section "subsection"]
-      Regex.match?(~r/^\[(\w[\w.-]*)\s+"(.*)"\]$/, line) ->
-        [_, section, subsection] = Regex.run(~r/^\[(\w[\w.-]*)\s+"(.*)"\]$/, line)
+      Regex.match?(@section_header_subsection, line) ->
+        [_, section, subsection] = Regex.run(@section_header_subsection, line)
         {:ok, {String.downcase(section), unescape_subsection(subsection)}}
 
       # [section]
-      Regex.match?(~r/^\[(\w[\w.-]*)\]$/, line) ->
-        [_, section] = Regex.run(~r/^\[(\w[\w.-]*)\]$/, line)
+      Regex.match?(@section_header_plain, line) ->
+        [_, section] = Regex.run(@section_header_plain, line)
         {:ok, {String.downcase(section), nil}}
 
       true ->
