@@ -91,7 +91,6 @@ jobs:
         env:
           MIX_ENV: dev
         run: mix credo --strict
-        continue-on-error: true
 
       - name: Cache Dialyzer PLTs
         if: matrix.primary
@@ -113,7 +112,6 @@ jobs:
         env:
           MIX_ENV: dev
         run: mix dialyzer --format github
-        continue-on-error: true
 
       - name: Run test suite (default tiers)
         run: mix test --warnings-as-errors
