@@ -29,3 +29,5 @@ ex_git-*.tar
 .env
 .env.*
 !.env.example
+priv/plts/*.plt
+priv/plts/*.plt.hash

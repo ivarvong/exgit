@@ -184,6 +184,7 @@ defmodule Exgit.FS do
   """
   @spec walk(Repository.t(), ref()) :: Enumerable.t()
   def walk(%Repository{} = repo, reference) do
+    :ok = require_non_promisor!(repo, :walk)
     start_time = System.monotonic_time()
 
     :telemetry.execute(
@@ -253,6 +254,7 @@ defmodule Exgit.FS do
   """
   @spec grep(Repository.t(), ref(), String.t() | Regex.t(), keyword()) :: Enumerable.t()
   def grep(%Repository{} = repo, reference, pattern, opts \\ []) do
+    :ok = require_non_promisor!(repo, :grep)
     regex = compile_grep_pattern(pattern, opts)
     path_glob = Keyword.get(opts, :path, "**")
     path_regex = compile_glob(path_glob)
@@ -516,6 +518,31 @@ defmodule Exgit.FS do
     |> String.trim_trailing("/")
     |> String.split("/", trim: true)
   end
+
+  # Streaming FS operations use pure `ObjectStore.get/2` and don't
+  # grow a Promisor cache. Running them on a freshly-lazy-cloned repo
+  # whose cache is empty would silently return empty results — a UX
+  # footgun. We raise with a clear message pointing at `FS.prefetch/3`
+  # (to populate) or `Repository.materialize/2` (to unwrap).
+  #
+  # A Promisor whose cache is non-empty is fine: `prefetch/3` just
+  # returned and every reachable object is now resident.
+  defp require_non_promisor!(%Repository{object_store: %Exgit.ObjectStore.Promisor{} = p}, op) do
+    %Exgit.ObjectStore.Memory{objects: objs} = p.cache
+
+    if map_size(objs) == 0 do
+      raise ArgumentError,
+            "Exgit.FS.#{op}/* was called on an un-prefetched Promisor repo. " <>
+              "Call `Exgit.FS.prefetch(repo, ref, blobs: true)` first to populate " <>
+              "the cache, or `Exgit.Repository.materialize(repo, ref)` to convert " <>
+              "the Promisor into a plain in-memory store. Streaming ops use pure " <>
+              "reads; silent empty results would be worse than this error."
+    end
+
+    :ok
+  end
+
+  defp require_non_promisor!(_repo, _op), do: :ok
 
   defp compile_grep_pattern(%Regex{} = r, _opts), do: r
 

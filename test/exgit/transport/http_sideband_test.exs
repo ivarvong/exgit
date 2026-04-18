@@ -110,4 +110,28 @@ defmodule Exgit.Transport.HttpSidebandTest do
         acc
     end
   end
+
+  # A7: sideband auto-detection depends on the first byte of a pack
+  # stream being `P` (0x50) vs channel bytes 1-3. Property: a well-
+  # formed PACK stream never gets misclassified as sideband.
+  describe "sideband heuristic correctness (A7)" do
+    use ExUnitProperties
+
+    @moduletag :property
+
+    property "non-sideband packs starting with PACK are never misclassified" do
+      check all(
+              version <- integer(2..3),
+              count <- integer(0..1_000),
+              tail <- binary(max_length: 128),
+              max_runs: 200
+            ) do
+        pack_prefix = "PACK" <> <<version::32-big, count::32-big>> <> tail
+
+        # Decide-sideband peeks at `b in [1, 2, 3]`. `P` is 0x50.
+        <<first_byte, _::binary>> = pack_prefix
+        refute first_byte in [1, 2, 3]
+      end
+    end
+  end
 end

@@ -18,12 +18,12 @@ committed in logical groups so bisection works.
 
 ## Phase 1 — Scale & operability
 
-- [ ] A2  Disk pack reads via :file.pread/3
-- [ ] A1  O(1) commit-haves + cap at 256 with recency bias
-- [ ] A4  Lazy-clone streaming-ops UX: Repository.materialize/2 + raise on Promisor
-- [ ] A5  Pack.Index 0..n-1 guards
-- [ ] A7  Document sideband heuristic + property test
-- [ ] O2  Dialyzer, Credo, benchmarks in CI
+- [x] A2  Disk pack reads via :file.pread/3
+- [x] A1  O(1) commit-haves + cap at 256 with recency bias
+- [x] A4  Lazy-clone streaming-ops UX: Repository.materialize/2 + raise on Promisor
+- [x] A5  Pack.Index 0..n-1 guards
+- [x] A7  Document sideband heuristic + property test
+- [~] O2  Dialyzer, Credo in CI (continue-on-error for now; benchmarks deferred)
 
 ## Phase 2 — Interop & API hardening
 

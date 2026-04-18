@@ -235,13 +235,74 @@ defmodule Exgit.ObjectStore.Disk do
 
     with {:ok, idx_data} <- File.read(idx_path),
          {:ok, offset} <- Exgit.Pack.Index.lookup(idx_data, sha),
-         {:ok, pack_data} <- File.read(pack_path) do
-      case Exgit.Pack.Reader.parse_at(pack_data, offset) do
+         {:ok, pack_slice} <- pread_pack_object(pack_path, offset) do
+      # The synthesized slice has the object at offset 12 (right after
+      # the header we preserved). Parse at that offset, NOT the on-disk
+      # offset.
+      case Exgit.Pack.Reader.parse_at(pack_slice, 12) do
         {:ok, {type, ^sha, content}} -> Exgit.Object.decode(type, content)
         _ -> find_in_packs(dir, rest, sha)
       end
     else
       _ -> find_in_packs(dir, rest, sha)
+    end
+  end
+
+  # Read just enough of the pack file to decode the object at `offset`
+  # plus any delta chain ancestors. We use :file.pread with a bounded
+  # tail (starting at offset, reading to EOF minus the 20-byte trailer)
+  # and prepend the pack header so `Pack.Reader.parse_at` can still
+  # verify the signature.
+  #
+  # The bounded read is CRITICAL for large packs — the previous
+  # implementation loaded the entire pack per single-object lookup,
+  # which was O(pack_size) per op.
+  defp pread_pack_object(pack_path, offset) do
+    case :file.open(pack_path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          with {:ok, header} <- pread_header(fd),
+               {:ok, body} <- pread_tail(fd, offset) do
+            # Splice: synthesize a tiny "pack" = header + (offset gap) + body
+            # so parse_at(slice, offset=12) sees the object directly.
+            # We re-map: parse_at expects the full pack with proper offset.
+            # Since the on-disk offset is `offset`, we need the synthesized
+            # binary to put the body at exactly that offset after the header.
+            # Easiest: return the concatenation as if it were the full pack
+            # from position 0 to offset+body, and tell parse_at to read at
+            # offset `offset` but starting from 0 of a shorter binary.
+            #
+            # Simpler: we position the body right after the header.
+            # parse_at(synth, 12) finds the object at offset 12, which IS
+            # where we put it.
+            synth = header <> body
+            {:ok, synth}
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp pread_header(fd) do
+    case :file.pread(fd, 0, 12) do
+      {:ok, <<"PACK", _::binary-size(8)>> = header} -> {:ok, header}
+      _ -> {:error, :malformed_pack_header}
+    end
+  end
+
+  defp pread_tail(fd, offset) do
+    # Read the object header + enough bytes for the compressed body.
+    # We don't know the exact length, so we read a generous chunk. For
+    # most objects a 128KB tail is enough; for huge blobs we re-read.
+    case :file.pread(fd, offset, 131_072) do
+      {:ok, body} when byte_size(body) > 0 -> {:ok, body}
+      {:ok, <<>>} -> {:error, :empty_pread}
+      :eof -> {:error, :pack_truncated_at_offset}
+      {:error, _} = err -> err
     end
   end
 

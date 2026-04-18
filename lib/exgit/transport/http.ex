@@ -400,6 +400,17 @@ defmodule Exgit.Transport.HTTP do
     {:server_error, msg} -> {:error, {:server_error, msg}}
   end
 
+  # Auto-detect whether the response is sideband-framed by peeking at
+  # the first data pkt-line's first byte.
+  #
+  # The protocol guarantee this relies on: a non-sideband pack stream
+  # begins with the bytes "PACK" (0x50 0x41 0x43 0x4B). Git protocol
+  # sideband channels are 1, 2, 3 — distinct from any pack-stream
+  # leading byte. So `first_byte in [1, 2, 3]` is a reliable indicator
+  # of sideband framing without a separate capability handshake.
+  #
+  # See Documentation/gitprotocol-common.txt in git.git and
+  # https://git-scm.com/docs/protocol-v2#_packfile_stream.
   defp decide_sideband(pack_packets, opts) do
     case Keyword.get(opts, :sideband) do
       nil ->

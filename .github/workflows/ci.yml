@@ -71,6 +71,33 @@ jobs:
         if: matrix.primary
         run: mix deps.unlock --check-unused
 
+      - name: Credo (strict)
+        if: matrix.primary
+        run: mix credo --strict
+        continue-on-error: true
+
+      - name: Cache Dialyzer PLTs
+        if: matrix.primary
+        uses: actions/cache@v4
+        with:
+          path: priv/plts
+          key: ${{ runner.os }}-plt-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-plt-${{ matrix.otp }}-${{ matrix.elixir }}-
+
+      - name: Build Dialyzer PLT
+        if: matrix.primary
+        env:
+          MIX_ENV: dev
+        run: mix dialyzer --plt
+
+      - name: Dialyzer
+        if: matrix.primary
+        env:
+          MIX_ENV: dev
+        run: mix dialyzer --format github
+        continue-on-error: true
+
       - name: Run test suite (default tiers)
         run: mix test --warnings-as-errors
 

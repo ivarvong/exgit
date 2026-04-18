@@ -57,7 +57,7 @@ defmodule Exgit.Pack.Index do
       {:error, :index_checksum_mismatch}
     else
       entries =
-        for i <- 0..(total_objects - 1) do
+        for i <- safe_range(total_objects) do
           sha = binary_part(shas, i * 20, 20)
           crc = :binary.decode_unsigned(binary_part(crcs, i * 4, 4))
           raw_offset = :binary.decode_unsigned(binary_part(offsets, i * 4, 4))
@@ -202,9 +202,16 @@ defmodule Exgit.Pack.Index do
     {IO.iodata_to_binary(Enum.reverse(regular)), IO.iodata_to_binary(Enum.reverse(large))}
   end
 
+  # A descending range (e.g. `0..-1`) is a valid Elixir term but will
+  # emit deprecation warnings in 1.19+ without an explicit step. For
+  # empty packs / indexes (total == 0), we want an EMPTY range, not
+  # a reverse iteration. Guard explicitly.
+  defp safe_range(0), do: []
+  defp safe_range(n) when n > 0, do: 0..(n - 1)
+
   defp extract_large_offsets(offsets, total, rest) do
     has_large =
-      Enum.any?(0..(total - 1), fn i ->
+      Enum.any?(safe_range(total), fn i ->
         raw = :binary.decode_unsigned(binary_part(offsets, i * 4, 4))
         Bitwise.band(raw, 0x80000000) != 0
       end)
@@ -212,7 +219,7 @@ defmodule Exgit.Pack.Index do
     if has_large do
       # Count large offsets needed
       large_count =
-        Enum.count(0..(total - 1), fn i ->
+        Enum.count(safe_range(total), fn i ->
           raw = :binary.decode_unsigned(binary_part(offsets, i * 4, 4))
           Bitwise.band(raw, 0x80000000) != 0
         end)

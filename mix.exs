@@ -14,6 +14,11 @@ defmodule Exgit.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env()),
+      dialyzer: dialyzer(),
+      preferred_cli_env: [
+        dialyzer: :dev,
+        "bench.run": :test
+      ],
       # Don't consolidate protocols in test so test-only implementations
       # (e.g. fake transports) load without a clean rebuild.
       consolidate_protocols: Mix.env() != :test,
@@ -73,7 +78,18 @@ defmodule Exgit.MixProject do
       {:opentelemetry, "~> 1.5", only: [:dev, :test]},
       {:opentelemetry_api, "~> 1.4", only: [:dev, :test]},
       {:opentelemetry_telemetry, "~> 1.1", only: [:dev, :test]},
-      {:opentelemetry_exporter, "~> 1.8", only: [:dev, :test]}
+      {:opentelemetry_exporter, "~> 1.8", only: [:dev, :test]},
+      # Dev-only static analysis. Not runtime deps.
+      {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
+      {:credo, "~> 1.7", only: [:dev], runtime: false}
+    ]
+  end
+
+  defp dialyzer do
+    [
+      plt_core_path: "priv/plts/core",
+      plt_local_path: "priv/plts/project",
+      flags: [:unmatched_returns, :error_handling, :extra_return, :missing_return]
     ]
   end
 end

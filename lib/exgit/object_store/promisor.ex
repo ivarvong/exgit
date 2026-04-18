@@ -31,12 +31,22 @@ defmodule Exgit.ObjectStore.Promisor do
   alias Exgit.{ObjectStore, Pack, Transport}
 
   @enforce_keys [:cache, :transport]
-  defstruct cache: nil, transport: nil, default_fetch_opts: []
+  defstruct cache: nil,
+            transport: nil,
+            default_fetch_opts: [],
+            # Incrementally-maintained set of commit SHAs currently in
+            # the cache. Avoids O(N) full-map scans on every fetch miss.
+            commit_shas: %{},
+            # How many of the most-recent commits we ship as `have`
+            # lines on a subsequent fetch. 256 matches git's cap.
+            haves_cap: 256
 
   @type t :: %__MODULE__{
           cache: ObjectStore.Memory.t(),
           transport: term(),
-          default_fetch_opts: keyword()
+          default_fetch_opts: keyword(),
+          commit_shas: %{optional(binary()) => non_neg_integer()},
+          haves_cap: pos_integer()
         }
 
   @doc """
@@ -98,7 +108,7 @@ defmodule Exgit.ObjectStore.Promisor do
   @spec put(t(), Exgit.Object.t()) :: {:ok, binary(), t()}
   def put(%__MODULE__{cache: cache} = p, object) do
     {:ok, sha, cache} = ObjectStore.Memory.put_object(cache, object)
-    {:ok, sha, %{p | cache: cache}}
+    {:ok, sha, %{p | cache: cache} |> track_commit(object, sha)}
   end
 
   @doc "True if `sha` is in the local cache. Does NOT trigger a fetch."
@@ -111,7 +121,28 @@ defmodule Exgit.ObjectStore.Promisor do
   @spec import_objects(t(), [{atom(), binary(), binary()}]) :: {:ok, t()}
   def import_objects(%__MODULE__{cache: cache} = p, raw_objects) do
     {:ok, cache} = ObjectStore.Memory.import_objects(cache, raw_objects)
-    {:ok, %{p | cache: cache}}
+    new_commits = for {:commit, sha, _} <- raw_objects, do: sha
+    {:ok, %{p | cache: cache} |> track_commits(new_commits)}
+  end
+
+  # Incrementally record that a commit SHA is in the cache. Values in
+  # `commit_shas` are a recency counter (higher = more recent) so we
+  # can ship the most-recent N as haves.
+  defp track_commit(%__MODULE__{} = p, %Exgit.Object.Commit{}, sha) do
+    track_commits(p, [sha])
+  end
+
+  defp track_commit(%__MODULE__{} = p, _not_a_commit, _sha), do: p
+
+  defp track_commits(%__MODULE__{commit_shas: shas} = p, commit_list) do
+    base = map_size(shas)
+
+    updated =
+      commit_list
+      |> Enum.with_index(base)
+      |> Enum.reduce(shas, fn {sha, idx}, acc -> Map.put(acc, sha, idx) end)
+
+    %{p | commit_shas: updated}
   end
 
   @doc """
@@ -145,17 +176,24 @@ defmodule Exgit.ObjectStore.Promisor do
     end
   end
 
-  # Collect the SHAs of every commit currently in the cache. These
-  # become `have` lines on the next fetch so the server knows not to
-  # resend them.
-  defp collect_commit_haves(%ObjectStore.Memory{objects: objects}) do
-    for {sha, {:commit, _}} <- objects, do: sha
+  # Pull the most recent N commit SHAs from the incrementally-maintained
+  # `commit_shas` set. O(K log K) where K is the total commit count;
+  # the cap keeps the result small regardless.
+  #
+  # Git itself sends up to 256 haves, biased toward recent commits. We
+  # mirror that — the sort lets a large, long-running Promisor still
+  # prefer the commits a server is likeliest to already have.
+  defp collect_commit_haves(%__MODULE__{commit_shas: shas, haves_cap: cap}) do
+    shas
+    |> Enum.sort_by(fn {_sha, recency} -> -recency end)
+    |> Enum.take(cap)
+    |> Enum.map(fn {sha, _} -> sha end)
   end
 
   # --- Internal ---
 
   defp fetch_and_cache(
-         %__MODULE__{transport: transport, cache: cache, default_fetch_opts: opts},
+         %__MODULE__{transport: transport, cache: cache, default_fetch_opts: opts} = p,
          sha
        ) do
     Exgit.Telemetry.span(
@@ -164,11 +202,17 @@ defmodule Exgit.ObjectStore.Promisor do
       fn ->
         # Tell the server what we already have so it sends only the
         # missing object(s). Without haves, a `want <blob_sha>` fetch
-        # often pulls the entire ancestry. We extract commits from our
-        # local cache as haves — covering the "we already pulled trees
-        # and commits; just send me the blob" case.
-        haves = collect_commit_haves(cache)
+        # often pulls the entire ancestry. We use the incrementally-
+        # maintained commit set capped at `haves_cap` (256 by default)
+        # so this is O(K log K) per miss, not O(N) over the whole map.
+        haves = collect_commit_haves(p)
         effective_opts = Keyword.put(opts, :haves, haves)
+
+        :telemetry.execute(
+          [:exgit, :object_store, :haves_sent],
+          %{count: length(haves)},
+          %{sha: sha}
+        )
 
         case Transport.fetch(transport, [sha], effective_opts) do
           {:ok, pack_bytes, _summary} when byte_size(pack_bytes) > 0 ->
