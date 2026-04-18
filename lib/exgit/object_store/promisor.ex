@@ -45,13 +45,27 @@ defmodule Exgit.ObjectStore.Promisor do
 
   ## Memory
 
-  The cache is bounded by default at 64 MiB. When the cap is
-  exceeded, the oldest commits (and their associated cached
-  trees/blobs reached only via those commits) are evicted in FIFO
-  order. Pass `max_cache_bytes: :infinity` to opt into unbounded
-  growth — recommended only for tests and short-lived scripts,
-  since a long-running agent against a large monorepo can
-  accumulate GB of state.
+  The cache is **unbounded by default**. Pass `:max_cache_bytes`
+  explicitly to enable FIFO-by-commit eviction bounded at a byte
+  count of your choosing.
+
+  The unbounded default is a deliberate choice: partial-clone and
+  full-clone workflows typically prefetch 100-500 MB of tree and
+  blob data up front, then do many reads against that working set.
+  A small cap (e.g. 64 MiB) trips during prefetch on any
+  real-world repo, and because eviction only evicts COMMITS (not
+  blobs or trees — git's access patterns don't cleanly map to LRU
+  at the blob level), triggering the evictor mid-stream can drop
+  state the caller is actively using. For long-running daemons or
+  memory-constrained deployments, size the cap to your actual
+  envelope — e.g. `max_cache_bytes: 2 * 1024 * 1024 * 1024` for a
+  2 GiB budget.
+
+  When a cap IS set and the cache approaches it, the eviction loop
+  drops the oldest commits (and their associated pointer into the
+  commit queue) in FIFO order. Tree and blob objects are NOT
+  evicted individually; they remain until either (a) the process
+  dies or (b) a higher-level operation discards the whole repo.
 
   ## Server negotiation (`haves`)
 
@@ -94,7 +108,19 @@ defmodule Exgit.ObjectStore.Promisor do
 
   alias Exgit.{ObjectStore, Pack, Transport}
 
-  @default_max_cache_bytes 64 * 1024 * 1024
+  # Default to `:infinity` — no eviction. The Promisor is used
+  # extensively in agent workflows where we prefetch 100-500 MB of
+  # tree + blob data up front and then do many reads against that
+  # working set. A 64 MiB default (the library's previous setting)
+  # trips on every real-world repo larger than pyex, and because
+  # eviction only drops COMMITS (not blobs or trees), triggering
+  # the evictor during a streaming walk can drop the commit you
+  # just fetched — breaking the walk entirely.
+  #
+  # Callers who need a bound (long-running daemon, memory-
+  # constrained deployment) should pass `:max_cache_bytes`
+  # explicitly based on their envelope. Most callers do not.
+  @default_max_cache_bytes :infinity
 
   @enforce_keys [:cache, :transport]
   defstruct cache: nil,
@@ -148,10 +174,11 @@ defmodule Exgit.ObjectStore.Promisor do
       `Transport.fetch/3` call the Promisor makes. Used by `lazy_clone`
       to propagate things like the partial-clone filter spec onto
       subsequent on-demand fetches.
-    * `:max_cache_bytes` — cap on total cached object bytes. Default
-      is `64 * 1024 * 1024` (64 MiB). Pass `:infinity` to disable
-      the cap; this is safe for tests and short scripts but risks
-      OOM on long-running agent loops against large repos.
+    * `:max_cache_bytes` — cap on total cached object bytes.
+      Default `:infinity` (no cap). Set to an integer byte count
+      for long-running daemons / memory-constrained deployments
+      that need a bound. See "Memory" in the moduledoc for sizing
+      guidance.
     * `:on_overfull` — policy when the eviction loop can't reduce
       `cache_bytes` below `max_cache_bytes` (commit queue empty;
       only raw blobs/trees left in the cache). One of:
@@ -270,7 +297,9 @@ defmodule Exgit.ObjectStore.Promisor do
           {:ok, binary(), t()} | {:error, :cache_overfull, t()}
   def put(%__MODULE__{cache: cache} = p, object) do
     {:ok, sha, cache} = ObjectStore.Memory.put_object(cache, object)
-    obj_bytes = object |> Exgit.Object.encode() |> IO.iodata_to_binary() |> byte_size()
+    # Track COMPRESSED bytes (what the Memory store actually stores).
+    # See `fetch_and_cache/2` for the accounting rationale.
+    obj_bytes = compressed_size(cache, sha)
 
     new_p =
       %{p | cache: cache, cache_bytes: p.cache_bytes + obj_bytes}
@@ -301,7 +330,8 @@ defmodule Exgit.ObjectStore.Promisor do
   def import_objects(%__MODULE__{cache: cache} = p, raw_objects) do
     {:ok, cache} = ObjectStore.Memory.import_objects(cache, raw_objects)
     new_commits = for {:commit, sha, _} <- raw_objects, do: sha
-    new_bytes = Enum.sum(for {_t, _s, c} <- raw_objects, do: byte_size(c))
+    # Track COMPRESSED bytes (see comment in `fetch_and_cache/2`).
+    new_bytes = sum_compressed_bytes(cache, raw_objects)
 
     {:ok,
      %{p | cache: cache, cache_bytes: p.cache_bytes + new_bytes}
@@ -349,7 +379,8 @@ defmodule Exgit.ObjectStore.Promisor do
           {:ok, parsed} ->
             {:ok, new_cache} = ObjectStore.Memory.import_objects(cache, parsed)
             new_commits = for {:commit, sha, _} <- parsed, do: sha
-            new_bytes = Enum.sum(for {_t, _s, c} <- parsed, do: byte_size(c))
+            # Track COMPRESSED bytes (see `fetch_and_cache/2`).
+            new_bytes = sum_compressed_bytes(new_cache, parsed)
 
             {:ok,
              %{p | cache: new_cache, cache_bytes: p.cache_bytes + new_bytes}
@@ -370,6 +401,27 @@ defmodule Exgit.ObjectStore.Promisor do
   end
 
   # --- Internal ---
+
+  # Compute the compressed-byte size of a just-inserted SHA in the
+  # Memory cache. Used for `cache_bytes` accounting so
+  # `:max_cache_bytes` bounds actual memory use, not decompressed
+  # content size (which over-counts 3-10×).
+  defp compressed_size(cache, sha) do
+    case cache.objects do
+      %{^sha => {_type, compressed}} -> byte_size(compressed)
+      _ -> 0
+    end
+  end
+
+  # Sum compressed sizes of a batch of just-imported objects. The
+  # `raw_objects` list contains {type, sha, decompressed_content}
+  # tuples from the pack reader; we look each one up in the new
+  # cache to get its compressed-bytes contribution.
+  defp sum_compressed_bytes(cache, raw_objects) do
+    Enum.reduce(raw_objects, 0, fn {_t, sha, _c}, acc ->
+      acc + compressed_size(cache, sha)
+    end)
+  end
 
   defp fetch_and_cache(
          %__MODULE__{transport: transport, cache: cache, default_fetch_opts: opts} = p,
@@ -415,7 +467,13 @@ defmodule Exgit.ObjectStore.Promisor do
                 {:ok, new_cache} = ObjectStore.Memory.import_objects(cache, parsed)
 
                 new_commits = for {:commit, c_sha, _} <- parsed, do: c_sha
-                new_bytes = Enum.sum(for {_t, _s, c} <- parsed, do: byte_size(c))
+                # Track COMPRESSED byte count — that's what the
+                # Memory store actually stores, and what
+                # `:max_cache_bytes` is supposed to bound. An
+                # earlier version summed decompressed sizes, which
+                # over-counts by a factor of 3-10x and trips the
+                # evictor prematurely.
+                new_bytes = sum_compressed_bytes(new_cache, parsed)
 
                 new_promisor =
                   %{p | cache: new_cache, cache_bytes: p.cache_bytes + new_bytes}

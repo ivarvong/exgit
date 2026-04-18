@@ -26,7 +26,7 @@ defmodule PackBench do
         Blob.new(body)
       end
 
-    {pack, _} = :timer.tc(fn -> Writer.build(objects) end)
+    {_elapsed, pack} = :timer.tc(fn -> Writer.build(objects) end)
     pack
   end
 

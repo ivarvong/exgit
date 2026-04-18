@@ -73,12 +73,16 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
   end
 
   describe ":max_cache_bytes default" do
-    test "defaults to 64 MiB (not unbounded)" do
+    test "defaults to :infinity (unbounded)" do
+      # See the Promisor moduledoc for the rationale. Short version:
+      # a small default cap trips during normal prefetch of any
+      # real-world repo and can drop in-flight state. Callers who
+      # want a bound set one based on their actual memory envelope.
       p = Promisor.new(%Stub{})
-      assert p.max_cache_bytes == 64 * 1024 * 1024
+      assert p.max_cache_bytes == :infinity
     end
 
-    test ":infinity disables the cap" do
+    test ":infinity is the explicit opt-out" do
       p = Promisor.new(%Stub{}, max_cache_bytes: :infinity)
       assert p.max_cache_bytes == :infinity
 
@@ -95,6 +99,14 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
   end
 
   describe ":on_overfull policy" do
+    # These tests put a BLOB with a tiny cache cap. Blobs aren't
+    # tracked in the commit queue, so the evictor can't reduce
+    # cache_bytes below the cap — which is exactly the "overfull"
+    # condition the policy targets. Using commits here would make
+    # the evictor successfully drop them (leaving cache_bytes at
+    # 0), which doesn't exercise the policy.
+    alias Exgit.Object.Blob
+
     test "default :log emits telemetry and the put succeeds" do
       test_pid = self()
 
@@ -107,15 +119,11 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
         nil
       )
 
-      # cap=1 forces the eviction loop to drain all commits on every
-      # put, then fire the overfull-policy path because there's
-      # nothing left to evict but cache_bytes is still > 1.
+      # cap=1 byte + a blob of several bytes → overfull, nothing in
+      # the commit queue to evict → policy fires.
       p = Promisor.new(%Stub{}, max_cache_bytes: 1)
 
-      # Put succeeds (:log policy never errors).
-      assert {:ok, _sha, _p} = Promisor.put(p, make_commit("first\n"))
-
-      # Telemetry fired.
+      assert {:ok, _sha, _p} = Promisor.put(p, Blob.new("hello\n"))
       assert_received {:overfull, %{bytes: _, cap: 1}, %{policy: :log}}
 
       :telemetry.detach("overfull-log-test")
@@ -125,7 +133,7 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
       p = Promisor.new(%Stub{}, max_cache_bytes: 1, on_overfull: :error)
 
       assert {:error, :cache_overfull, %Promisor{} = p2} =
-               Promisor.put(p, make_commit("first\n"))
+               Promisor.put(p, Blob.new("hello\n"))
 
       # Promisor is threaded back so callers can inspect / recover.
       assert p2.cache_bytes > 1
@@ -136,7 +144,7 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
       callback = fn promisor -> send(test_pid, {:callback_fired, promisor.cache_bytes}) end
 
       p = Promisor.new(%Stub{}, max_cache_bytes: 1, on_overfull: {:callback, callback})
-      {:ok, _sha, _p} = Promisor.put(p, make_commit("first\n"))
+      {:ok, _sha, _p} = Promisor.put(p, Blob.new("hello\n"))
 
       assert_received {:callback_fired, bytes}
       assert bytes > 1

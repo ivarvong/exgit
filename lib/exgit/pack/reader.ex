@@ -229,9 +229,22 @@ defmodule Exgit.Pack.Reader do
   # parse. A hostile pack can fit inside `:max_pack_bytes` (2 GiB
   # default) but expand to many times that via lots of small
   # OFS_DELTA chains; without this cap, `resolved` + `by_sha` grow
-  # unbounded. 500 MiB is enough for any legitimate pack we've seen
-  # in the wild; callers with unusual needs override.
-  @default_max_resolved_bytes 500 * 1024 * 1024
+  # unbounded.
+  #
+  # We set the default to match `:max_pack_bytes` (2 GiB). An
+  # earlier 500 MiB default was "enough for any legitimate pack we'd
+  # seen" — until we tried anomalyco/opencode, whose tree-heavy
+  # partial-clone pack legitimately resolves to ~524 MB. Real
+  # monorepos can and do exceed 500 MB of resolved state; the cap
+  # needs to be a ceiling on hostile inputs, not a floor on
+  # real-world workloads.
+  #
+  # A hostile pack that compresses to 2 GiB AND expands past 2 GiB
+  # would still be caught by this cap, but they'd need >2 GiB of
+  # outgoing bandwidth and a pathological delta chain to do it.
+  # Callers with a tighter envelope (embedded, sandbox) should
+  # override.
+  @default_max_resolved_bytes 2 * 1024 * 1024 * 1024
 
   defp parse_objects(pack, offset, count, store, opts) do
     max_obj_bytes = Keyword.get(opts, :max_object_bytes, 100 * 1024 * 1024)

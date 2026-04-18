@@ -52,6 +52,12 @@ defmodule Exgit.PartialCloneIntegrationTest do
   # exercise the same codepath.
   @fixture_repo "https://github.com/ivarvong/pyex"
 
+  # Medium fixture. `cloudflare/agents` is a real production repo
+  # (1.4k files, ~4 MB pack over the wire). Used for the "walks
+  # should not re-fetch" regression — that bug only surfaces at a
+  # scale where a per-walk network round-trip is obviously wrong.
+  @medium_repo "https://github.com/cloudflare/agents"
+
   describe "clone(filter: {:blob, :none}) → FS.read_path" do
     test "reads a file after a partial clone" do
       assert {:ok, repo} = Exgit.clone(@fixture_repo, filter: {:blob, :none})
@@ -110,6 +116,57 @@ defmodule Exgit.PartialCloneIntegrationTest do
     end
   end
 
+  describe "walk performance (regression: no network on warm walks)" do
+    test "consecutive walks on the same repo don't re-fetch the commit" do
+      # This regression landed because `FS.walk` discarded the grown
+      # repo from `resolve_tree`, so every walk triggered a fresh
+      # commit fetch. On cloudflare/agents this took ~7.5s per walk
+      # instead of ~2ms.
+      #
+      # Fix: `FS.walk` threads the updated repo through the
+      # stream's state tuple, so the commit stays cached across
+      # iterations AND across successive walk calls (as long as
+      # the caller holds onto the same repo).
+
+      handler_id = "walk-fetches-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:exgit, :transport, :fetch, :stop],
+        fn _, _, _, _ -> send(test_pid, :transport_fetch) end,
+        nil
+      )
+
+      try do
+        # Use lazy + prefetch(blobs: true) to flip the repo to
+        # :eager (which FS.walk requires). cloudflare/agents is
+        # ~1.4k files — big enough that a per-walk commit fetch
+        # would be obviously slow in both timing and telemetry.
+        {:ok, repo} = Exgit.clone(@medium_repo, lazy: true)
+        {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
+
+        # First walk: may trigger one commit fetch if HEAD's
+        # commit wasn't caught by the prefetch.
+        files_1 = Exgit.FS.walk(repo, "HEAD") |> Enum.to_list()
+        assert length(files_1) > 1000
+
+        # Drain all telemetry events from the clone + first walk.
+        drain_messages()
+
+        # Subsequent walks must NOT trigger transport.fetch.
+        for _ <- 1..3 do
+          files = Exgit.FS.walk(repo, "HEAD") |> Enum.to_list()
+          assert length(files) == length(files_1)
+        end
+
+        refute_received :transport_fetch
+      after
+        :telemetry.detach(handler_id)
+      end
+    end
+  end
+
   describe "haves telemetry" do
     test "on-demand fetches emit haves_sent with count: 0" do
       handler_id = "haves-integration-test-#{System.unique_integer([:positive])}"
@@ -135,6 +192,17 @@ defmodule Exgit.PartialCloneIntegrationTest do
       after
         :telemetry.detach(handler_id)
       end
+    end
+  end
+
+  # Drain any queued test-mailbox messages without asserting on
+  # their contents. Used between stages of a test to create a clean
+  # baseline for later `refute_received` checks.
+  defp drain_messages do
+    receive do
+      _ -> drain_messages()
+    after
+      0 -> :ok
     end
   end
 

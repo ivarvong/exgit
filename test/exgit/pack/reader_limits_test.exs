@@ -33,4 +33,19 @@ defmodule Exgit.Pack.ReaderLimitsTest do
     assert {:ok, parsed} = Reader.parse(pack)
     assert length(parsed) == 10
   end
+
+  # History lesson: we once defaulted to 500 MiB, figuring "any
+  # legitimate pack fits." Then anomalyco/opencode's partial-clone
+  # pack resolved to ~524 MB and tripped the cap. The new default
+  # is 2 GiB (matches :max_pack_bytes). This test asserts that a
+  # synthetic 600 MB payload parses under the default.
+  #
+  # Tagged `:slow` because building a 600 MB pack takes seconds.
+  @tag :slow
+  test "default cap admits a 600 MiB legitimate pack (regression)" do
+    big_blob = Blob.new(:binary.copy("x", 600 * 1024 * 1024))
+    pack = Writer.build([big_blob])
+
+    assert {:ok, [_]} = Reader.parse(pack)
+  end
 end
