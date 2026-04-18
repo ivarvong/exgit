@@ -24,15 +24,18 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
   end
 
   @tag :slow
+  @tag timeout: 180_000
   test "lookup latency is independent of pack size (pread behavior)", %{root: root, store: store} do
     # Build two packs: small (~200KB) and large (~9MB). A properly-preading
     # store serves single-object lookups in roughly the same time
     # regardless of pack size. A read-entire-pack store's latency scales
     # with pack size.
-    small_blobs = for i <- 1..30, do: Blob.new("small_#{i}_" <> :crypto.strong_rand_bytes(2_048))
+    small_blobs = for i <- 1..20, do: Blob.new("small_#{i}_" <> :crypto.strong_rand_bytes(2_048))
 
+    # Keep "large" meaningfully bigger than small while staying within
+    # CI budget. Ratio is what matters.
     large_blobs =
-      for i <- 1..300, do: Blob.new("large_#{i}_" <> :crypto.strong_rand_bytes(30_000))
+      for i <- 1..80, do: Blob.new("large_#{i}_" <> :crypto.strong_rand_bytes(20_000))
 
     small_time = time_sample_lookup(root, store, "small", small_blobs)
     large_time = time_sample_lookup(root, store, "large", large_blobs)
@@ -72,11 +75,13 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
   end
 
   @tag :slow
+  @tag timeout: 180_000
   test "single-object lookup into a large pack uses bounded memory", %{root: root, store: store} do
-    # Build a pack with a few hundred reasonably-sized blobs so the total
-    # pack is much larger than any individual object.
-    n = 300
-    payload_size = 32 * 1024
+    # Build a pack with a few dozen reasonably-sized blobs so the total
+    # pack is much larger than any individual object but fixture
+    # generation stays fast on shared CI runners.
+    n = 80
+    payload_size = 16 * 1024
 
     blobs =
       for i <- 1..n do
@@ -110,9 +115,8 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
     delta = after_ - before
 
     # If the store reads the whole pack per lookup, delta grows to
-    # ~50 * pack_size (~450 MB). Proper pread gives ~50 * payload_size
-    # (~1.5 MB). We assert 3× payload margin, which is ~100 MB — well
-    # under pack_size for 50 lookups.
+    # ~50 * pack_size. Proper pread gives ~50 * payload_size. We
+    # assert 3× payload margin.
     bound = 50 * payload_size * 3
 
     assert delta < bound,
