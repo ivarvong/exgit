@@ -69,6 +69,10 @@ jobs:
 
       - name: Check for unused dependencies
         if: matrix.primary
+        # Check against all envs so dev-only deps (credo, dialyxir)
+        # don't show up as "unused" in the test env.
+        env:
+          MIX_ENV: dev
         run: mix deps.unlock --check-unused
 
       - name: Credo (strict)
