@@ -49,9 +49,22 @@ defmodule Exgit.Telemetry do
     * `[:exgit, :object_store, :haves_sent]` — standalone
       (non-span) event; measurements: `%{count}`; metadata: `%{sha}`
     * `[:exgit, :object_store, :cache_overfull]` — standalone;
-      measurements: `%{bytes, cap}`; metadata: `%{}`. Fired when
-      a Promisor's eviction loop can't reduce `cache_bytes` below
+      measurements: `%{bytes, cap}`; metadata: `%{policy}` where
+      `policy` is `:log | :error | :callback`. Fired when a
+      Promisor's eviction loop can't reduce `cache_bytes` below
       `max_cache_bytes` (commit queue empty, only blobs/trees left).
+    * `[:exgit, :object_store, :shared_promisor, :resolve]` — span;
+      metadata: `%{sha, hit?, partial?}`. `hit?: true` means the
+      object was served from cache (promisor unchanged);
+      `partial?: true` means the fetch returned a pack but the
+      requested SHA wasn't in it (sibling objects were still
+      cached).
+    * `[:exgit, :object_store, :shared_promisor, :put]` — span;
+      metadata: `%{sha, overfull: boolean}`.
+    * `[:exgit, :object_store, :shared_promisor, :get]` — span;
+      metadata: `%{sha, hit?}`.
+    * `[:exgit, :object_store, :shared_promisor, :has?]` — span;
+      metadata: `%{sha, present?}`.
 
   ### Ref store
 

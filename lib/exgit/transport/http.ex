@@ -36,12 +36,41 @@ defmodule Exgit.Transport.HTTP do
     :url,
     :auth,
     user_agent: "exgit/0.1.0 git/2.45.0",
-    # Timeouts (milliseconds). :infinity disables. Defaults chosen so a
-    # pathological server can't hang an agent loop indefinitely.
+    # Connect timeout (milliseconds). Time to establish the TCP /
+    # TLS connection. :infinity disables.
     connect_timeout: 10_000,
-    receive_timeout: 60_000,
+    # Receive timeout (milliseconds). Maximum time to wait for
+    # the server's response BODY. `:infinity` disables — recommended
+    # when cloning large packs over slow links. With
+    # `:max_pack_bytes` on the reader side we have a memory bound;
+    # the timeout's only job is to avoid hanging forever on a dead
+    # connection, so the default of 5 minutes balances "fail fast
+    # on a truly-dead link" against "don't false-timeout on a 500 MB
+    # pack over a residential uplink."
+    #
+    # Typical bandwidth math:
+    #   10 Mbps (~1.25 MB/s): 375 MB in 5 minutes
+    #   100 Mbps             : ~4 GB in 5 minutes
+    # Override via `receive_timeout: :infinity` for cold bulk fetches.
+    receive_timeout: 300_000,
     # TLS options applied to https URLs via Req's :connect_options.
     verify_tls: true,
+    # Optional list of transport options passed to Req's
+    # `:connect_options`. Use for custom CA bundles (mandatory for
+    # internal GHE / Gerrit with a private CA), client-certificate
+    # mTLS, custom SNI, or any other :ssl option. Merged with the
+    # library's TLS defaults; caller values win.
+    #
+    # Example (custom CA + mTLS):
+    #
+    #     Transport.HTTP.new("https://gerrit.internal/repo",
+    #       connect_options: [
+    #         cacertfile: "/etc/ssl/certs/internal_ca.pem",
+    #         certfile: "/etc/ssl/certs/client.pem",
+    #         keyfile: "/etc/ssl/private/client.key"
+    #       ]
+    #     )
+    connect_options: [],
     # Redirect policy. `false` (default) refuses all redirects so
     # host-bound credentials cannot leak to an attacker-controlled
     # redirect target. `:same_origin` allows redirects only when the
@@ -80,6 +109,7 @@ defmodule Exgit.Transport.HTTP do
       connect_timeout: Keyword.get(opts, :connect_timeout, defaults.connect_timeout),
       receive_timeout: Keyword.get(opts, :receive_timeout, defaults.receive_timeout),
       verify_tls: Keyword.get(opts, :verify_tls, defaults.verify_tls),
+      connect_options: Keyword.get(opts, :connect_options, defaults.connect_options),
       redirect: Keyword.get(opts, :redirect, defaults.redirect)
     )
   end
@@ -706,30 +736,60 @@ defmodule Exgit.Transport.HTTP do
   # TLS / transport options. Req's `connect_options` are forwarded to
   # Finch/Mint. For HTTPS we enforce peer verification; callers can opt
   # out via `verify_tls: false` when (e.g.) testing against self-signed
-  # local servers.
+  # local servers. Caller-supplied `:connect_options` (e.g. custom CA
+  # bundle, client cert for mTLS) are merged LAST so they override the
+  # library's defaults.
   defp connect_options(url, t) do
     base = [timeout: t.connect_timeout]
 
-    case URI.parse(url) do
-      %URI{scheme: "https"} ->
-        if t.verify_tls do
-          base ++
-            [
-              transport_opts: [
-                verify: :verify_peer,
-                cacerts: :public_key.cacerts_get(),
-                depth: 3,
-                customize_hostname_check: [
-                  match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+    scheme_opts =
+      case URI.parse(url) do
+        %URI{scheme: "https"} ->
+          if t.verify_tls do
+            base ++
+              [
+                transport_opts: [
+                  verify: :verify_peer,
+                  cacerts: :public_key.cacerts_get(),
+                  depth: 3,
+                  customize_hostname_check: [
+                    match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+                  ]
                 ]
               ]
-            ]
-        else
-          base ++ [transport_opts: [verify: :verify_none]]
-        end
+          else
+            base ++ [transport_opts: [verify: :verify_none]]
+          end
 
-      _ ->
-        base
+        _ ->
+          base
+      end
+
+    merge_connect_options(scheme_opts, t.connect_options)
+  end
+
+  # Merge caller-supplied connect_options on top of the library's
+  # defaults. For `:transport_opts` (a nested keyword list) we do a
+  # deep merge so caller can override e.g. `:cacertfile` without
+  # losing `:customize_hostname_check`. Top-level keys are
+  # shallow-merged with caller winning.
+  defp merge_connect_options(base, []), do: base
+
+  defp merge_connect_options(base, caller) do
+    # Extract + merge the nested `:transport_opts` separately.
+    base_transport = Keyword.get(base, :transport_opts, [])
+    caller_transport = Keyword.get(caller, :transport_opts, [])
+    merged_transport = Keyword.merge(base_transport, caller_transport)
+
+    base_rest = Keyword.delete(base, :transport_opts)
+    caller_rest = Keyword.delete(caller, :transport_opts)
+
+    merged_rest = Keyword.merge(base_rest, caller_rest)
+
+    if merged_transport == [] do
+      merged_rest
+    else
+      Keyword.put(merged_rest, :transport_opts, merged_transport)
     end
   end
 

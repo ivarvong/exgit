@@ -99,12 +99,18 @@ defmodule Exgit.PromisorStatelessTest do
       assert p1 == p2
     end
 
-    test "returns {:error, :not_found} when remote doesn't have the object" do
+    test "returns {:error, :not_found, promisor} when remote doesn't have the object" do
+      # The cache-growing API threads the promisor back even on the
+      # fetch-but-not-found path so sibling objects that came back
+      # in the same pack aren't discarded. See `Promisor.resolve/2`
+      # docstring for the error-shape contract.
       {origin, _sha, _blob} = origin_with_blob()
       p = Promisor.new(FakeT.new(origin))
 
       missing = :binary.copy(<<0xCC>>, 20)
-      assert {:error, _} = Promisor.resolve(p, missing)
+
+      assert {:error, :not_found, %Promisor{}} =
+               Promisor.resolve(p, missing)
     end
   end
 

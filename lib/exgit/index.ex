@@ -2,6 +2,19 @@ defmodule Exgit.Index do
   @moduledoc """
   Parser for git's on-disk index format (`.git/index`).
 
+  > #### Experimental {: .warning}
+  >
+  > The index module is **read-only** and exists for forensic
+  > inspection / staging-area debugging — not for writing back
+  > staged changes. The API, error shapes, and bounds are subject
+  > to change in any 0.x release. If you're building on this, pin
+  > a specific version and monitor the CHANGELOG.
+  >
+  > Exgit does not currently support committing FROM a populated
+  > index; callers that want a commit workflow build trees
+  > directly via `Exgit.Object.Tree.new/1` and commit via
+  > `Exgit.Object.Commit.new/1`.
+
   Supports index versions **2 and 3**. Version 4 (name-prefix compression)
   is explicitly rejected rather than silently misparsed — see
   [gitformat-index(5)](https://git-scm.com/docs/gitformat-index).
@@ -34,6 +47,12 @@ defmodule Exgit.Index do
   @default_max_entries 1_000_000
   @default_max_bytes 512 * 1024 * 1024
 
+  @doc """
+  Read and parse `<path>/.git/index` (or any index file path).
+
+  See the moduledoc for options and caveats.
+  """
+  @doc experimental: true
   @spec read(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def read(path, opts \\ []) do
     case File.read(path) do
@@ -42,9 +61,15 @@ defmodule Exgit.Index do
     end
   end
 
+  @doc "Return the list of entries in a parsed index."
+  @doc experimental: true
   @spec entries(t()) :: [Entry.t()]
   def entries(%__MODULE__{entries: entries}), do: entries
 
+  @doc """
+  Parse index bytes. See moduledoc for the option set and bounds.
+  """
+  @doc experimental: true
   @spec parse(binary(), keyword()) :: {:ok, t()} | {:error, term()}
   def parse(data, opts \\ [])
 

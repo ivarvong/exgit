@@ -120,8 +120,31 @@ jobs:
         # `git` ships on ubuntu-24.04 runners, so :real_git tests run.
         run: mix test --warnings-as-errors --include slow --include real_git
 
-      - name: Run integration tests (live network)
-        # Only on pushes to main so flaky network doesn't block PRs.
-        if: matrix.primary && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Run integration tests (live network, unauthenticated)
+        # Runs on EVERY push and PR — the integration suite covers
+        # the library's core advertised workflows (partial-clone
+        # read-path, lazy-clone read-path) against an owned public
+        # fixture (`ivarvong/pyex`). These are the tests the
+        # reviewer-filed bug would have caught if they'd been in
+        # the default CI tier. GitHub's reliability is high enough
+        # that transient failures are rare; if one does happen, a
+        # re-run button costs less than shipping a broken read
+        # path to adopters.
+        #
+        # Only runs on the primary matrix entry — quality gates
+        # (and live-network tiers) are primary-only.
+        if: matrix.primary
         run: mix test --warnings-as-errors --only integration
+
+      - name: Run authenticated integration tests (live network, secrets)
+        # Push-to-main only — these need PATs that aren't available
+        # on fork-based PR runs. Scoped tightly: only the tests
+        # tagged `:github_private` / `:github_private_write`, which
+        # exercise paths that require an authenticated PAT (push,
+        # private-repo clone).
+        if: matrix.primary && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_PRIVATE_REPO: ${{ secrets.GITHUB_PRIVATE_REPO }}
+          GITHUB_PRIVATE_TOKEN: ${{ secrets.GITHUB_PRIVATE_TOKEN }}
+        run: mix test --warnings-as-errors --only github_private
         continue-on-error: true

@@ -448,8 +448,21 @@ defmodule Exgit.FS do
   # can chain via `with`.
   defp fetch_object(%Repository{object_store: %Promisor{} = p} = repo, sha) do
     case Promisor.resolve(p, sha) do
-      {:ok, obj, p2} -> {:ok, obj, %{repo | object_store: p2}}
-      {:error, _} = err -> err
+      {:ok, obj, p2} ->
+        {:ok, obj, %{repo | object_store: p2}}
+
+      {:error, reason, p2} ->
+        # Fetch-but-not-found or cache-overfull: the Promisor
+        # grew its cache even though this specific lookup
+        # didn't find the target. Discard the grown repo — FS
+        # callers use the 2-tuple error shape, and a caller who
+        # needs the sibling-object cache can call
+        # `Promisor.resolve/2` directly.
+        _ = p2
+        {:error, reason}
+
+      {:error, _} = err ->
+        err
     end
   end
 

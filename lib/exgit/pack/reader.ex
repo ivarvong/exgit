@@ -406,59 +406,54 @@ defmodule Exgit.Pack.Reader do
   end
 
   # ------------------------------------------------------------------
-  # One-pass zlib inflate with tracked consumption.
+  # Zlib inflate with tracked consumption.
   # ------------------------------------------------------------------
   #
   # Packs store zlib streams back-to-back with no explicit
   # compressed-length prefix. We must determine the exact number of
   # input bytes consumed so the next object starts at the right offset.
   #
-  # ## Why this is subtle
+  # ## The Adler32 trailer probe (fast path)
+  #
+  # A zlib stream (RFC 1950) ends with a 4-byte big-endian Adler32
+  # checksum of the UNCOMPRESSED content. After `safe_full_inflate`
+  # recovers the content, we compute `:erlang.adler32(content)` and
+  # locate its 4-byte big-endian encoding in the input with one
+  # linear byte scan. The stream ends at `match_position + 4`.
+  #
+  # False-positive rate (the checksum bytes happening to appear
+  # BEFORE the real end of the stream inside the deflate body) is
+  # ~1/2^32 per compared position — essentially never in practice.
+  # We still verify with ONE `safeInflate + inflateEnd` probe on a
+  # fresh stream to catch that corner case, at which point we fall
+  # back to the binary-search path.
+  #
+  # **Cost per object in the common case: 1 full inflate +
+  # 1 verification probe = 2 zlib-port round trips.**
+  #
+  # This replaces a previous O(log N) binary search that opened a
+  # fresh zlib stream and re-fed the entire candidate prefix at
+  # every probe. For a 100 KB compressed blob, the search alone did
+  # ~17 full-prefix feeds; now it does one.
+  #
+  # ## Fallback path (`scan_tail_by_bisect/2`)
+  #
+  # When the Adler32 probe doesn't find a unique verifiable match,
+  # we fall back to a binary search that opens a fresh stream per
+  # probe and uses `inflateEnd` to detect complete-stream status.
+  # Correct but slower — intended only for pathological inputs
+  # where the Adler32 bytes recur inside the deflate body.
+  #
+  # ## Why we can't just use `:zlib.safeInflate`'s own tagging
   #
   # `:zlib.safeInflate/2`'s return tag (`:continue` vs `:finished`)
   # does NOT reliably distinguish "stream incomplete" from "stream
-  # complete." Empirically, feeding a 2-byte prefix of a 19-byte zlib
-  # stream returns `{:finished, []}` — same tag as feeding the full
-  # 19 bytes. The only reliable signal for stream completion is
-  # `:zlib.inflateEnd/1`, which **raises** `data_error` when the
-  # input did not include a proper end-of-stream marker + adler32.
-  #
-  # ## Algorithm (true one-pass)
-  #
-  # We feed the input in two halves:
-  #
-  #   1. **Bulk body** — feed `upper - @tail_window` bytes in one
-  #      `safeInflate` call and drain all output. After this the
-  #      stream is guaranteed past the body of the zlib stream for
-  #      any object whose compressed size is within `upper`.
-  #      Accumulate output.
-  #
-  #   2. **Tail scan** — feed the remaining bytes **one at a time**,
-  #      trying `inflateEnd` on a *cloned* state after each byte. The
-  #      first byte-count at which `inflateEnd` succeeds is the exact
-  #      zlib-stream length.
-  #
-  # Cloning the zlib state in Erlang is not directly supported, so
-  # we use a different trick: after each byte fed during the tail
-  # scan, we snapshot the decompressed-size state. When we see
-  # `expected_size` bytes of output AND the stream has consumed the
-  # final deflate block's end-marker, `safeInflate` transitions
-  # permanently to `:finished`, and a final empty drain call
-  # confirms it. We detect that transition by checking
-  # `inflateEnd` on a FRESH stream re-fed with bytes 0..k — but
-  # ONLY for k ∈ the tail window, capped at `@tail_window`.
-  #
-  # Total work: one `safeInflate` pass over the bulk, plus at most
-  # `@tail_window` re-runs over the whole prefix. In practice the
-  # tail window is tiny (a zlib stream ends within a few bytes of
-  # the adler32 trailer), so we cap scan attempts at 64 bytes —
-  # which is enough for any real stream end — and fall back to a
-  # one-shot inflateEnd on the full slice if we overshoot.
-  #
-  # For the common case (expected_size ≈ 1..1MB, tail within 32
-  # bytes of the full `upper`), this is O(object_size) bytes of
-  # work, bounded port round-trips, and never calls
-  # `:zlib.uncompress/1` on hostile input.
+  # complete." Empirically, feeding a 2-byte prefix of a 19-byte
+  # zlib stream returns `{:finished, []}` — same tag as feeding
+  # the full 19 bytes. The only reliable completion signal is
+  # `:zlib.inflateEnd/1`, which raises `data_error` when the input
+  # did not include a proper end-of-stream marker + Adler32. That's
+  # what both the Adler-probe verifier and the bisect fallback use.
 
   @zlib_min 8
 
@@ -490,13 +485,83 @@ defmodule Exgit.Pack.Reader do
     # size matches what the pack header declared.
     case safe_full_inflate(data, expected_size) do
       {:ok, content} ->
-        case scan_tail_for_boundary(data, expected_size) do
+        case locate_stream_end(data, content) do
           {:ok, n} -> {:ok, content, n}
           {:error, _} = err -> err
         end
 
       {:error, _} = err ->
         err
+    end
+  end
+
+  # Locate the end of the zlib stream in `data` given the known
+  # decompressed `content`. Tries the fast Adler32 probe first; on
+  # ambiguous input (rare), falls back to the monotone binary
+  # search. Returns the 1-based end-offset in `data` (== the
+  # compressed stream length).
+  defp locate_stream_end(data, content) do
+    case adler_probe(data, content) do
+      {:ok, _} = ok -> ok
+      :ambiguous -> bisect_boundary(data)
+    end
+  end
+
+  # Fast path: search the input for the 4-byte big-endian Adler32
+  # checksum of `content`. The zlib stream ends 4 bytes after the
+  # match position. We verify the first match found to close the
+  # tiny window where the checksum bytes coincidentally appear
+  # inside the deflate body.
+  defp adler_probe(data, content) do
+    adler = :erlang.adler32(content)
+    trailer = <<adler::32>>
+
+    case :binary.matches(data, trailer) do
+      [] ->
+        # Adler bytes not found — data may have been truncated
+        # before the trailer, or it's not a well-formed stream.
+        # Let the bisect surface the actual error.
+        :ambiguous
+
+      matches ->
+        verify_adler_matches(data, matches)
+    end
+  end
+
+  # Try each Adler match position in order; the first one that
+  # verifies as a complete zlib stream wins. This handles the
+  # ~1/2^32-per-position false-positive rate.
+  defp verify_adler_matches(_data, []), do: :ambiguous
+
+  defp verify_adler_matches(data, [{pos, 4} | rest]) do
+    candidate_len = pos + 4
+
+    if candidate_len <= byte_size(data) and prefix_complete?(data, candidate_len) do
+      {:ok, candidate_len}
+    else
+      verify_adler_matches(data, rest)
+    end
+  end
+
+  # Fallback: monotone binary search over prefix lengths. Used
+  # when the Adler32 fast-path produced no verifiable match.
+  # Correct but slower — O(log N) fresh zlib streams per object.
+  defp bisect_boundary(data) do
+    lo = @zlib_min
+    hi = byte_size(data)
+
+    cond do
+      hi < lo ->
+        {:error, :zlib_bounds_invalid}
+
+      not prefix_complete?(data, hi) ->
+        # Shouldn't happen — safe_full_inflate already confirmed
+        # the full slice decompresses. Defensive: return an error
+        # rather than loop.
+        {:error, :zlib_no_boundary}
+
+      true ->
+        {:ok, bisect_complete(data, lo, hi)}
     end
   end
 
@@ -573,32 +638,6 @@ defmodule Exgit.Pack.Reader do
     _ -> {:error, :zlib_error}
   catch
     _, _ -> {:error, :zlib_error}
-  end
-
-  # Phase 2: binary-search the smallest prefix length that forms a
-  # complete zlib stream. Completeness is monotone non-decreasing:
-  # once we find an `n` where `prefix_complete?(data, n)` is true,
-  # all larger prefixes up through the slice cap are also "complete"
-  # (zlib ignores trailing input when the stream already ended). So
-  # a standard lower-bound bisect is correct and O(log(upper_bound))
-  # probes.
-  defp scan_tail_for_boundary(data, _expected_size) do
-    lo = @zlib_min
-    hi = byte_size(data)
-
-    cond do
-      hi < lo ->
-        {:error, :zlib_bounds_invalid}
-
-      not prefix_complete?(data, hi) ->
-        # Shouldn't happen — safe_full_inflate already confirmed the
-        # full slice decompresses to `expected_size`. Defensive:
-        # return an error rather than loop.
-        {:error, :zlib_no_boundary}
-
-      true ->
-        {:ok, bisect_complete(data, lo, hi)}
-    end
   end
 
   defp bisect_complete(_data, lo, hi) when lo >= hi, do: lo

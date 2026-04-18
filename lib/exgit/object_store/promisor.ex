@@ -23,9 +23,13 @@ defmodule Exgit.ObjectStore.Promisor do
   forward "wins" — the other fetch's cache growth is discarded.
   This is a CACHE RACE, not a correctness race: both results are
   valid, but the merged cache is strictly smaller than if the calls
-  had been serialized. For an agent workflow that reads one file at
-  a time this is fine; for concurrent bulk reads, wrap the Promisor
-  in a process (e.g. an `Agent` holding the struct).
+  had been serialized.
+
+  For workloads that do **concurrent bulk reads** against the same
+  repo (e.g. a grep agent spawning N tasks), use
+  `Exgit.ObjectStore.SharedPromisor` — a GenServer wrapper that
+  serializes cache access across processes and eliminates the
+  cache race entirely.
 
   ## Integration
 
@@ -41,17 +45,56 @@ defmodule Exgit.ObjectStore.Promisor do
 
   ## Memory
 
-  The cache is unbounded by default. For long-running agent loops
-  accumulating thousands of blob reads against a large repository,
-  pass `:max_cache_bytes` to enable LRU eviction — the Promisor will
-  drop the least-recently-inserted commits when the cache crosses
-  the bound. Blobs and trees are NOT evicted on their own (git
-  object access patterns don't cleanly map to LRU at the blob
-  level), but commit eviction cascades via the haves-negotiation
-  state.
+  The cache is bounded by default at 64 MiB. When the cap is
+  exceeded, the oldest commits (and their associated cached
+  trees/blobs reached only via those commits) are evicted in FIFO
+  order. Pass `max_cache_bytes: :infinity` to opt into unbounded
+  growth — recommended only for tests and short-lived scripts,
+  since a long-running agent against a large monorepo can
+  accumulate GB of state.
+
+  ## Server negotiation (`haves`)
+
+  On-demand fetches (`resolve/2` → `fetch_and_cache/2`) deliberately
+  send **no `haves`** to the server. This is counter-intuitive —
+  every bulk git fetch DOES send haves to avoid redundant transfer —
+  but on-demand fetches have different semantics:
+
+    * Bulk fetch (`Exgit.fetch/3`): "I'm at commit X, catch me up to
+      ref Y." Haves save bandwidth by excluding objects reachable
+      from X.
+
+    * On-demand fetch (Promisor): "Ship me exactly this blob,
+      please." Haves actively break this. A smart server (GitHub,
+      anything running modern `git-upload-pack`) treats haves as a
+      reachability closure — "the client has commit X, therefore
+      they have everything reachable from X" — and returns an
+      empty pack. The blob is "reachable" from any cached commit
+      that points at its containing tree, so every partial-clone
+      read after the first would fail.
+
+  See `test/exgit/security/haves_empty_pack_test.exs` for an
+  offline regression against this.
+
+  ## Overfull behavior
+
+  When the evictor runs out of commits to drop but `cache_bytes`
+  is still above the cap, the cache is technically over-full.
+  The `:on_overfull` option selects the policy:
+
+    * `:log` (default) — emit `[:exgit, :object_store, :cache_overfull]`
+      telemetry and keep going. Matches the previous behavior.
+    * `:error` — next `put`/`resolve` returns
+      `{:error, :cache_overfull, promisor}`. Force a fail-fast loop
+      to surface misconfigured caps quickly.
+    * `{:callback, fun}` — `fun.(promisor)` is invoked; its return
+      value is discarded. Use for custom metrics, alerting, or
+      graceful shutdown.
   """
 
   alias Exgit.{ObjectStore, Pack, Transport}
+
+  @default_max_cache_bytes 64 * 1024 * 1024
 
   @enforce_keys [:cache, :transport]
   defstruct cache: nil,
@@ -74,8 +117,14 @@ defmodule Exgit.ObjectStore.Promisor do
             # maintained; used to drive LRU eviction when
             # `max_cache_bytes` is set.
             cache_bytes: 0,
-            # Optional cap on cached object bytes. `nil` = unbounded.
-            max_cache_bytes: nil
+            # Cap on cached object bytes. Integer byte count or
+            # `:infinity` for unbounded.
+            max_cache_bytes: @default_max_cache_bytes,
+            # Policy when cache is over cap and no commits are
+            # available for eviction. `:log | :error | {:callback, f}`.
+            on_overfull: :log
+
+  @type overfull_policy :: :log | :error | {:callback, (t() -> any())}
 
   @type t :: %__MODULE__{
           cache: ObjectStore.Memory.t(),
@@ -85,7 +134,8 @@ defmodule Exgit.ObjectStore.Promisor do
           commit_counter: non_neg_integer(),
           haves_cap: pos_integer(),
           cache_bytes: non_neg_integer(),
-          max_cache_bytes: non_neg_integer() | nil
+          max_cache_bytes: non_neg_integer() | :infinity,
+          on_overfull: overfull_policy()
         }
 
   @doc """
@@ -98,12 +148,20 @@ defmodule Exgit.ObjectStore.Promisor do
       `Transport.fetch/3` call the Promisor makes. Used by `lazy_clone`
       to propagate things like the partial-clone filter spec onto
       subsequent on-demand fetches.
-    * `:max_cache_bytes` — cap on total cached object bytes. When
-      the cap is exceeded, the oldest commits (and their associated
-      cached trees/blobs reached only via those commits) are
-      evicted in FIFO order. `nil` (default) means unbounded — the
-      cache grows until the process dies. Recommended for
-      long-running agent loops: `64 * 1024 * 1024` (64 MiB).
+    * `:max_cache_bytes` — cap on total cached object bytes. Default
+      is `64 * 1024 * 1024` (64 MiB). Pass `:infinity` to disable
+      the cap; this is safe for tests and short scripts but risks
+      OOM on long-running agent loops against large repos.
+    * `:on_overfull` — policy when the eviction loop can't reduce
+      `cache_bytes` below `max_cache_bytes` (commit queue empty;
+      only raw blobs/trees left in the cache). One of:
+        - `:log` (default) — emit
+          `[:exgit, :object_store, :cache_overfull]` telemetry
+          and keep accepting new objects.
+        - `:error` — fail subsequent `put`/`resolve` with
+          `{:error, :cache_overfull, promisor}`.
+        - `{:callback, fun}` — invoke `fun.(promisor)`. Return
+          value is ignored; raise for hard-fail.
   """
   @spec new(transport :: term(), keyword()) :: t()
   def new(transport, opts \\ []) do
@@ -120,7 +178,8 @@ defmodule Exgit.ObjectStore.Promisor do
       transport: transport,
       default_fetch_opts: Keyword.get(opts, :default_fetch_opts, []),
       commit_queue: :gb_trees.empty(),
-      max_cache_bytes: Keyword.get(opts, :max_cache_bytes)
+      max_cache_bytes: Keyword.get(opts, :max_cache_bytes, @default_max_cache_bytes),
+      on_overfull: Keyword.get(opts, :on_overfull, :log)
     }
   end
 
@@ -141,77 +200,95 @@ defmodule Exgit.ObjectStore.Promisor do
   `{:ok, obj, new_promisor}` — the returned struct carries the grown
   cache.
 
-  ## Fetch-but-not-found edge case
+  ## Error shape
 
-  If the server returns a pack that doesn't contain the specific
-  SHA the client asked for (rare, but some partial-clone servers do
-  this intentionally when the requested object is itself deferred),
-  `resolve/2` returns `{:error, :not_found}`. The **grown cache is
-  discarded** — callers who want to keep the side-effect of the
-  fetch should call `resolve_with_fetch/2` instead, which threads
-  the promisor forward even on error.
+  Errors come in two flavors:
+
+    * `{:error, reason}` — transport-level failure, no cache change.
+      Returned when the fetch itself failed (connection error, HTTP
+      non-2xx, malformed pack).
+    * `{:error, reason, promisor}` — the fetch succeeded and the
+      cache grew, but the specific SHA requested wasn't in the
+      returned pack (rare; happens when a partial-clone server
+      defers the requested object itself). Callers should thread
+      the returned promisor forward to avoid refetching the sibling
+      objects that WERE returned.
+
+  Pattern-match on both shapes:
+
+      case Promisor.resolve(p, sha) do
+        {:ok, obj, p2} -> ...
+        {:error, _, p2} -> ...      # grown cache, but sha missing
+        {:error, _} -> ...          # fetch failed entirely
+      end
   """
-  @spec resolve(t(), binary()) :: {:ok, Exgit.Object.t(), t()} | {:error, term()}
+  @spec resolve(t(), binary()) ::
+          {:ok, Exgit.Object.t(), t()} | {:error, term()} | {:error, term(), t()}
   def resolve(%__MODULE__{cache: cache} = p, sha) do
     case ObjectStore.Memory.get_object(cache, sha) do
       {:ok, obj} ->
         {:ok, obj, p}
 
       {:error, :not_found} ->
-        case fetch_and_cache(p, sha) do
-          {:ok, new_cache, new_promisor} ->
-            case ObjectStore.Memory.get_object(new_cache, sha) do
-              {:ok, obj} -> {:ok, obj, new_promisor}
-              {:error, _} = err -> err
-            end
+        resolve_miss(p, sha)
+    end
+  end
 
-          {:error, _} = err ->
-            err
-        end
+  defp resolve_miss(p, sha) do
+    case fetch_and_cache(p, sha) do
+      {:ok, new_cache, new_promisor} ->
+        enforce_overfull(new_promisor, fn ->
+          case ObjectStore.Memory.get_object(new_cache, sha) do
+            {:ok, obj} ->
+              {:ok, obj, new_promisor}
+
+            {:error, _} ->
+              # Fetch-but-not-found: thread the promisor so the
+              # caller keeps the cache side-effect for the sibling
+              # objects that DID come back in the pack.
+              {:error, :not_found, new_promisor}
+          end
+        end)
+
+      {:error, _} = err ->
+        # Transport-level failure — nothing was cached. Return the
+        # 2-tuple error shape.
+        err
     end
   end
 
   @doc """
-  Like `resolve/2`, but threads the grown promisor back even when
-  the requested SHA isn't found in the returned pack. Returns
-  `{:error, reason, promisor}` on the fetch-but-not-found path so
-  the caller can keep the cache side-effect.
+  Return a new Promisor with `object` inserted into its cache.
 
-  Use this when the cost of refetching cached sibling objects
-  exceeds the cost of an extra tuple-shape branch in the caller.
+  When `:on_overfull` is `:error` and the post-insert cache exceeds
+  `:max_cache_bytes` with no commits left to evict, returns
+  `{:error, :cache_overfull, promisor}` instead — the promisor is
+  still threaded back so the caller can inspect `cache_bytes` /
+  decide what to do.
   """
-  @spec resolve_with_fetch(t(), binary()) ::
-          {:ok, Exgit.Object.t(), t()} | {:error, term()} | {:error, term(), t()}
-  def resolve_with_fetch(%__MODULE__{cache: cache} = p, sha) do
-    case ObjectStore.Memory.get_object(cache, sha) do
-      {:ok, obj} ->
-        {:ok, obj, p}
-
-      {:error, :not_found} ->
-        case fetch_and_cache(p, sha) do
-          {:ok, new_cache, new_promisor} ->
-            case ObjectStore.Memory.get_object(new_cache, sha) do
-              {:ok, obj} -> {:ok, obj, new_promisor}
-              {:error, _} -> {:error, :not_found, new_promisor}
-            end
-
-          {:error, _} = err ->
-            err
-        end
-    end
-  end
-
-  @doc "Return a new Promisor with `object` inserted into its cache."
-  @spec put(t(), Exgit.Object.t()) :: {:ok, binary(), t()}
+  @spec put(t(), Exgit.Object.t()) ::
+          {:ok, binary(), t()} | {:error, :cache_overfull, t()}
   def put(%__MODULE__{cache: cache} = p, object) do
     {:ok, sha, cache} = ObjectStore.Memory.put_object(cache, object)
     obj_bytes = object |> Exgit.Object.encode() |> IO.iodata_to_binary() |> byte_size()
 
-    {:ok, sha,
-     %{p | cache: cache, cache_bytes: p.cache_bytes + obj_bytes}
-     |> track_commit(object, sha)
-     |> maybe_evict()}
+    new_p =
+      %{p | cache: cache, cache_bytes: p.cache_bytes + obj_bytes}
+      |> track_commit(object, sha)
+      |> maybe_evict()
+
+    enforce_overfull(new_p, fn -> {:ok, sha, new_p} end)
   end
+
+  # When the promisor is configured with `:on_overfull => :error`
+  # and the cache is still over cap after eviction, return
+  # `{:error, :cache_overfull, promisor}`. All other policies
+  # forward the success thunk's result.
+  defp enforce_overfull(%__MODULE__{on_overfull: :error} = p, success_fun) do
+    if over_cap?(p), do: {:error, :cache_overfull, p}, else: success_fun.()
+  end
+
+  defp enforce_overfull(_p, success_fun), do: success_fun.()
 
   @doc "True if `sha` is in the local cache. Does NOT trigger a fetch."
   @spec has_object?(t(), binary()) :: boolean()
@@ -292,29 +369,6 @@ defmodule Exgit.ObjectStore.Promisor do
     end
   end
 
-  # Pull the most recent N commit SHAs from the gb_tree-ordered
-  # `commit_queue`. O(N log K) where N = haves_cap (256) and K is
-  # the total commit count. The prior implementation sorted all K
-  # entries on every miss — O(K log K), bad at K=100k.
-  defp collect_commit_haves(%__MODULE__{commit_queue: nil}), do: []
-
-  defp collect_commit_haves(%__MODULE__{commit_queue: q, haves_cap: cap}) do
-    take_largest(q, cap, [])
-  end
-
-  defp take_largest(_q, 0, acc), do: Enum.reverse(acc)
-
-  defp take_largest(q, n, acc) do
-    case :gb_trees.size(q) do
-      0 ->
-        Enum.reverse(acc)
-
-      _ ->
-        {_key, sha, q2} = :gb_trees.take_largest(q)
-        take_largest(q2, n - 1, [sha | acc])
-    end
-  end
-
   # --- Internal ---
 
   defp fetch_and_cache(
@@ -325,16 +379,33 @@ defmodule Exgit.ObjectStore.Promisor do
       [:exgit, :object_store, :fetch_and_cache],
       %{sha: sha},
       fn ->
-        # Tell the server what we already have so it sends only the
-        # missing object(s). Without haves, a `want <blob_sha>` fetch
-        # often pulls the entire ancestry.
-        haves = collect_commit_haves(p)
-        effective_opts = Keyword.put(opts, :haves, haves)
+        # NO haves on on-demand fetches. This is a `want <sha>` for
+        # a specific object the caller has determined is missing
+        # from the local cache. Sending haves here is actively
+        # harmful in the partial-clone case:
+        #
+        # After `clone(url, filter: {:blob, :none})` the local cache
+        # contains the commit that references the blob. If we then
+        # try to fetch that blob on-demand, a smart server (GitHub,
+        # anything running `git upload-pack` with reachability
+        # awareness) reasons: "the client has commit X, therefore
+        # they have everything reachable from X, therefore they
+        # already have this blob — nothing to send." Result: an
+        # empty 32-byte pack, and the read_path call fails with
+        # {:error, :not_found}.
+        #
+        # Haves are a bulk-fetch optimization (saving redundant
+        # transfer when we're catching up to a new tip). For
+        # single-object on-demand fetches the request IS the
+        # optimization — the caller already knows what's missing.
+        # Leaving haves empty costs us at most O(1) extra server
+        # work and correctness is unambiguous.
+        effective_opts = Keyword.put(opts, :haves, [])
 
         :telemetry.execute(
           [:exgit, :object_store, :haves_sent],
-          %{count: length(haves)},
-          %{sha: sha}
+          %{count: 0},
+          %{sha: sha, context: :on_demand_fetch}
         )
 
         case Transport.fetch(transport, [sha], effective_opts) do
@@ -379,7 +450,7 @@ defmodule Exgit.ObjectStore.Promisor do
   # addresses them by SHA directly. True aggressive reclamation
   # (walk tree-reachability and evict unreachable blobs) would be a
   # v0.3 item.
-  defp maybe_evict(%__MODULE__{max_cache_bytes: nil} = p), do: p
+  defp maybe_evict(%__MODULE__{max_cache_bytes: :infinity} = p), do: p
 
   defp maybe_evict(%__MODULE__{cache_bytes: bytes, max_cache_bytes: cap} = p)
        when bytes <= cap,
@@ -390,14 +461,8 @@ defmodule Exgit.ObjectStore.Promisor do
       0 ->
         # Nothing to evict. Cache exceeds cap but only because of
         # raw blob/tree entries we can't reclaim without a full
-        # reachability scan. Stop trying to evict.
-        :telemetry.execute(
-          [:exgit, :object_store, :cache_overfull],
-          %{bytes: p.cache_bytes, cap: p.max_cache_bytes},
-          %{}
-        )
-
-        p
+        # reachability scan. Apply the configured overfull policy.
+        apply_overfull_policy(p)
 
       _ ->
         {_key, sha, q2} = :gb_trees.take_smallest(q)
@@ -428,6 +493,51 @@ defmodule Exgit.ObjectStore.Promisor do
         |> maybe_evict()
     end
   end
+
+  # Called when the eviction loop is exhausted but `cache_bytes`
+  # remains above `max_cache_bytes`. Runs the configured
+  # `:on_overfull` policy and returns the (unchanged) promisor so
+  # the pipeline keeps flowing.
+  #
+  # The `:error` policy doesn't actually raise or return an error
+  # from this function — maybe_evict/1 is called during put, and
+  # the error is surfaced by the public `put/2` / `resolve/2`
+  # wrappers which test `over_cap?/1` after the fact.
+  defp apply_overfull_policy(%__MODULE__{} = p) do
+    :telemetry.execute(
+      [:exgit, :object_store, :cache_overfull],
+      %{bytes: p.cache_bytes, cap: p.max_cache_bytes},
+      %{policy: overfull_policy_name(p.on_overfull)}
+    )
+
+    case p.on_overfull do
+      :log ->
+        :ok
+
+      :error ->
+        # Error policy is surfaced at the public API layer via
+        # over_cap?/1, not from this helper. Telemetry fires so
+        # operators see it.
+        :ok
+
+      {:callback, fun} when is_function(fun, 1) ->
+        _ = fun.(p)
+        :ok
+    end
+
+    p
+  end
+
+  @doc false
+  @spec over_cap?(t()) :: boolean()
+  def over_cap?(%__MODULE__{max_cache_bytes: :infinity}), do: false
+
+  def over_cap?(%__MODULE__{cache_bytes: bytes, max_cache_bytes: cap}),
+    do: bytes > cap
+
+  defp overfull_policy_name(:log), do: :log
+  defp overfull_policy_name(:error), do: :error
+  defp overfull_policy_name({:callback, _}), do: :callback
 end
 
 defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Promisor do
@@ -449,12 +559,18 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Promisor do
     )
   end
 
+  # The protocol's `put/2` spec is `{:ok, sha, store}` only, so we
+  # can't surface `{:error, :cache_overfull, _}` through this path.
+  # Callers that opt in to `:on_overfull => :error` must use
+  # `Promisor.put/2` directly; the protocol call always uses the
+  # equivalent of `:on_overfull => :log` to preserve the spec.
   def put(store, object) do
     Telemetry.span(
       [:exgit, :object_store, :put],
       %{store: :promisor},
       fn ->
-        {:ok, sha, _} = result = Promisor.put(store, object)
+        relaxed = %{store | on_overfull: :log}
+        {:ok, sha, _} = result = Promisor.put(relaxed, object)
         {:span, result, %{sha: sha}}
       end
     )
