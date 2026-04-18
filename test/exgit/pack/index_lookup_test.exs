@@ -53,7 +53,11 @@ defmodule Exgit.Pack.IndexLookupTest do
       # lookup — the time ratio stays near 1.0. For a linear scan
       # (O(N)), doubling N doubles the work. We compare N=8k vs N=32k
       # (4× size), so linear would give ~4.0 ratio; log-N gives ~1.15.
-      # A cutoff at 2.0 catches linear on any hardware.
+      #
+      # Cutoff at 3.0 (midway between log-N and linear). Catches any
+      # linear regression while tolerating GitHub runner jitter on
+      # microsecond-scale timings — we observed ratios of 2.29 on
+      # otherwise-clean runs due to noisy-neighbor scheduling.
 
       # Warmup — pay JIT + cache costs before the measured run.
       _ = time_lookups(2_000, 500)
@@ -67,7 +71,7 @@ defmodule Exgit.Pack.IndexLookupTest do
 
       ratio = t_large / max(t_small, 1)
 
-      assert ratio < 2.0,
+      assert ratio < 3.0,
              "ratio=#{Float.round(ratio, 2)} " <>
                "(#{samples} lookups: #{t_small}us @ N=#{small_n}, " <>
                "#{t_large}us @ N=#{large_n}) — looks linear, not logarithmic"
