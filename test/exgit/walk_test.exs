@@ -1,8 +1,8 @@
 defmodule Exgit.WalkTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.{Walk, Repository, ObjectStore.Memory}
   alias Exgit.Object.Commit
+  alias Exgit.{ObjectStore.Memory, Repository, Walk}
 
   defp make_repo, do: Repository.new(Memory.new(), Exgit.RefStore.Memory.new())
 

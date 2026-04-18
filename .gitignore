@@ -29,5 +29,7 @@ ex_git-*.tar
 .env
 .env.*
 !.env.example
-priv/plts/*.plt
-priv/plts/*.plt.hash
+# Dialyzer PLT cache. CI rebuilds these from scratch via
+# mix dialyzer --plt; never commit them.
+priv/plts/
+

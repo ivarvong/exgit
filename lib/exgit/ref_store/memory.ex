@@ -1,4 +1,19 @@
 defmodule Exgit.RefStore.Memory do
+  @moduledoc """
+  In-memory implementation of the `Exgit.RefStore` protocol.
+
+  Used by `Exgit.clone/2` when no `:path` option is given (the
+  default), and by `clone(url, lazy: true)` regardless of whether a
+  path is set (lazy+disk isn't yet supported).
+
+  All operations are pure over a struct value; there is no shared
+  ETS table or process. Two holders of the same struct see the
+  same refs.
+  """
+
+  # See `Exgit.Walk` for the MapSet-opacity rationale.
+  @dialyzer :no_opaque
+
   defstruct refs: %{}
 
   @type ref_value :: binary() | {:symbolic, String.t()}
@@ -19,6 +34,8 @@ defmodule Exgit.RefStore.Memory do
           {:ok, binary()} | {:error, :not_found | :too_deep | :cycle}
   def resolve_ref(store, ref), do: do_resolve(store, ref, MapSet.new(), 10)
 
+  @spec do_resolve(t(), String.t(), MapSet.t(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, term()}
   defp do_resolve(%__MODULE__{} = store, ref, seen, depth) do
     cond do
       MapSet.member?(seen, ref) ->

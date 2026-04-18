@@ -1,7 +1,26 @@
 defmodule Exgit.PktLine do
+  @moduledoc """
+  Git's [pkt-line](https://git-scm.com/docs/gitformat-pack)
+  framing.
+
+  Each pkt-line is 4 ASCII hex bytes of length (including the
+  length header itself) followed by the payload, with three
+  sentinels:
+
+    * `0000` — flush
+    * `0001` — delim (protocol v2)
+    * `0002` — response-end
+
+  `encode/1` emits the framed bytes for a data payload;
+  `decode_stream/1` parses a concatenated pkt-line stream into a
+  list of `{:data, bin} | :flush | :delim | :response_end` tokens.
+  Decoders never raise on truncated input; see
+  `Exgit.PropertiesTest` for the roundtrip property.
+  """
+
   @type packet :: {:data, binary()} | :flush | :delim | :response_end
 
-  @spec encode(iodata()) :: iodata()
+  @spec encode(iodata()) :: iolist()
   def encode(data) do
     payload = IO.iodata_to_binary(data)
     len = byte_size(payload) + 4

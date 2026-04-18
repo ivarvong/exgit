@@ -1,4 +1,15 @@
 defmodule Exgit.Walk do
+  # Silence Dialyzer false positives on MapSet opacity.
+  # MapSet in OTP 24+ has a union internal representation (`:sets` or
+  # `%{} keyed`) that Dialyzer sometimes surfaces as two distinct
+  # types, even when our code path only ever passes a proper
+  # MapSet.t(). See https://github.com/erlang/otp/issues/5824 for
+  # the upstream discussion. Our recursive merge-base and ancestor
+  # helpers pass a `MapSet` as the seen-set; they're correctly typed
+  # via @spec, but Dialyzer emits `call_without_opaque` at every
+  # `MapSet.put/2`/`member?/2`/`to_list/1` call site.
+  @dialyzer :no_opaque
+
   @moduledoc """
   Commit graph traversal — `ancestors/3` and `merge_base/2`.
 
@@ -96,10 +107,15 @@ defmodule Exgit.Walk do
   def merge_base_all(_repo, [sha]), do: {:ok, [sha]}
 
   def merge_base_all(repo, [a, b]) do
-    case find_merge_base_raw(repo, a, b) do
-      {:ok, []} -> {:error, :none}
-      {:ok, list} -> {:ok, list}
-      error -> error
+    # `find_merge_base_raw/3` is total — always returns `{:ok, list}`
+    # (the frontier BFS drains the queue and collects candidates; no
+    # branch produces an error). A `[]` result means no common
+    # ancestor and is surfaced as `{:error, :none}`.
+    {:ok, list} = find_merge_base_raw(repo, a, b)
+
+    case list do
+      [] -> {:error, :none}
+      _ -> {:ok, list}
     end
   end
 
@@ -255,10 +271,12 @@ defmodule Exgit.Walk do
   @flag_stale 4
 
   defp find_merge_base(repo, sha_a, sha_b) do
-    case find_merge_base_raw(repo, sha_a, sha_b) do
-      {:ok, []} -> {:error, :none}
-      {:ok, candidates} -> {:ok, pick_best_candidate(repo, candidates)}
-      error -> error
+    # `find_merge_base_raw/3` is total (see merge_base_all/2 comment).
+    {:ok, candidates} = find_merge_base_raw(repo, sha_a, sha_b)
+
+    case candidates do
+      [] -> {:error, :none}
+      _ -> {:ok, pick_best_candidate(repo, candidates)}
     end
   end
 
@@ -276,15 +294,20 @@ defmodule Exgit.Walk do
       enqueue_seed(:gb_sets.empty(), repo, sha_a, flags)
       |> enqueue_seed_second(repo, sha_a, sha_b, flags)
 
+    # `candidates` is kept as a separate argument (rather than a key
+    # in `state`) so Dialyzer can track its `MapSet.t()` opacity
+    # without the type degenerating to a plain map through
+    # `state.candidates` access. The rest of the traversal state
+    # stays in a plain map because those fields don't need opaque
+    # handling.
     state = %{
       queue: queue,
       flags: flags,
-      candidates: MapSet.new(),
       in_queue: in_queue_count,
       stale_in_queue: stale_in_queue
     }
 
-    mb_loop(repo, state)
+    mb_loop(repo, state, MapSet.new())
   end
 
   # When the frontier BFS produces multiple candidate LCAs (classic
@@ -354,9 +377,10 @@ defmodule Exgit.Walk do
     end
   end
 
-  defp mb_loop(repo, %{queue: queue} = state) do
+  @spec mb_loop(repo(), map(), MapSet.t()) :: {:ok, [binary()]}
+  defp mb_loop(repo, %{queue: queue} = state, candidates) do
     if :gb_sets.is_empty(queue) do
-      {:ok, MapSet.to_list(state.candidates)}
+      {:ok, MapSet.to_list(candidates)}
     else
       {{_ts, sha, commit}, queue} = :gb_sets.take_smallest(queue)
 
@@ -371,9 +395,9 @@ defmodule Exgit.Walk do
 
       {candidates, propagate_flag} =
         if both and not was_stale do
-          {MapSet.put(state.candidates, sha), @flag_stale}
+          {MapSet.put(candidates, sha), @flag_stale}
         else
-          {state.candidates, 0}
+          {candidates, 0}
         end
 
       # Early termination in O(1): if every remaining entry is stale,
@@ -406,13 +430,16 @@ defmodule Exgit.Walk do
             end
           )
 
-        mb_loop(repo, %{
-          queue: queue,
-          flags: flags,
-          candidates: candidates,
-          in_queue: in_queue,
-          stale_in_queue: stale_in_queue
-        })
+        mb_loop(
+          repo,
+          %{
+            queue: queue,
+            flags: flags,
+            in_queue: in_queue,
+            stale_in_queue: stale_in_queue
+          },
+          candidates
+        )
       end
     end
   end

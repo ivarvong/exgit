@@ -1,8 +1,8 @@
 defmodule Exgit.Transport.HttpNegotiationTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Transport.HTTP
   alias Exgit.PktLine
+  alias Exgit.Transport.HTTP
 
   describe "fetch negotiation (P0.19)" do
     test "fetch sends 'have <sha>' lines when haves are supplied" do

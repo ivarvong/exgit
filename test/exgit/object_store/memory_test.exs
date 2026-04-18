@@ -1,8 +1,8 @@
 defmodule Exgit.ObjectStore.MemoryTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.ObjectStore.Memory
   alias Exgit.Object.Blob
+  alias Exgit.ObjectStore.Memory
 
   test "put and get" do
     store = Memory.new()

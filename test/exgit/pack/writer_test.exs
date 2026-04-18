@@ -1,8 +1,8 @@
 defmodule Exgit.Pack.WriterTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Pack.{Writer, Reader}
-  alias Exgit.Object.{Blob, Tree, Commit}
+  alias Exgit.Object.{Blob, Commit, Tree}
+  alias Exgit.Pack.{Reader, Writer}
 
   describe "build/1" do
     test "produces a valid packfile header" do

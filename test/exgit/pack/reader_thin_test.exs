@@ -1,9 +1,9 @@
 defmodule Exgit.Pack.ReaderThinTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Pack.Reader
   alias Exgit.Object.Blob
   alias Exgit.ObjectStore
+  alias Exgit.Pack.Reader
   alias Exgit.Test.PackBuilder
 
   describe "thin pack resolution via object store (P0.9)" do

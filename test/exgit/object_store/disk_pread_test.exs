@@ -161,11 +161,9 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
   defp find_zlib_length(data, n) when n > byte_size(data), do: byte_size(data)
 
   defp find_zlib_length(data, n) do
-    try do
-      :zlib.uncompress(binary_part(data, 0, n))
-      n
-    rescue
-      _ -> find_zlib_length(data, n + 1)
-    end
+    :zlib.uncompress(binary_part(data, 0, n))
+    n
+  rescue
+    _ -> find_zlib_length(data, n + 1)
   end
 end

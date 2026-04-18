@@ -1,4 +1,8 @@
 defmodule Exgit.Object.Blob do
+  @moduledoc """
+  Git blob object — a raw byte buffer.
+  """
+
   @enforce_keys [:data]
   defstruct [:data]
 

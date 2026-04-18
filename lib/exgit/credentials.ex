@@ -37,9 +37,13 @@ defmodule Exgit.Credentials do
   No regex, no substring matching, no glob.
   """
 
-  @type auth :: Exgit.Transport.HTTP.auth()
+  @type auth :: Exgit.Transport.HTTP.auth_value()
 
   @type host_cred :: %__MODULE__{host_pattern: String.t() | :any, auth: auth()}
+
+  # The canonical public type. `host_cred` remains as a historical
+  # alias and is kept as a synonym.
+  @type t :: host_cred()
 
   defstruct [:host_pattern, :auth]
 

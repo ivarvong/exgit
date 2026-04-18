@@ -1,4 +1,16 @@
 defmodule Exgit.Pack.Index do
+  @moduledoc """
+  Pack-index (`.idx`) writer and reader for git pack-index v2.
+
+  `write/2` produces a v2-format index (magic `\\xff\\x74\\x4f\\x63`,
+  version 2) from a list of `{sha, crc32, offset}` entries and
+  verifies clean with `git verify-pack`. `read/1` parses a v2
+  index and returns a struct for O(log N) SHA lookups.
+
+  v1 indexes (pre-2008 git) are not supported; v2 has been git's
+  default since git 1.6.
+  """
+
   @v2_magic <<255, 116, 79, 99>>
   @v2_version <<0, 0, 0, 2>>
 
@@ -81,9 +93,8 @@ defmodule Exgit.Pack.Index do
 
   @spec lookup(binary(), binary()) :: {:ok, non_neg_integer()} | :error
   def lookup(index_data, sha) when byte_size(sha) == 20 do
-    with {:ok, view} <- view(index_data) do
-      lookup_in_view(view, sha)
-    else
+    case view(index_data) do
+      {:ok, view} -> lookup_in_view(view, sha)
       _ -> :error
     end
   end

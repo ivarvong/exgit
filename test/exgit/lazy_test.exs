@@ -1,8 +1,8 @@
 defmodule Exgit.LazyTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.{FS, ObjectStore, RefStore}
+  alias Exgit.Object.{Blob, Commit, Tree}
 
   @moduledoc """
   Lazy-mode tests.
@@ -159,7 +159,7 @@ defmodule Exgit.LazyTest do
 
       # At least one fetch happened.
       calls = FakeTransport.fetch_calls(t)
-      assert length(calls) >= 1
+      assert calls != []
 
       # The commit SHA was among the first batch (to resolve HEAD's tree).
       assert Enum.any?(List.flatten(calls), &(&1 == shas.commit))

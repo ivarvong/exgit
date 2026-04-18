@@ -1,4 +1,16 @@
 defmodule Exgit.Object do
+  @moduledoc """
+  Umbrella type + dispatch for git's four object kinds: `Blob`,
+  `Tree`, `Commit`, `Tag`. Each has its own struct in
+  `Exgit.Object.*`; this module is the common entry point for
+  decode/encode/sha/type across all of them.
+
+  Decoding (`decode/2`) is tagged: pass the type atom plus raw
+  object bytes, receive back `{:ok, struct}` or `{:error, _}`.
+  Decoders never raise on untrusted input — see
+  `Exgit.Security.DecoderFuzzTest` for the regression corpus.
+  """
+
   @type t ::
           Exgit.Object.Blob.t()
           | Exgit.Object.Tree.t()
@@ -38,7 +50,7 @@ defmodule Exgit.Object do
   def type_string(%Exgit.Object.Tag{}), do: "tag"
 
   @doc false
-  @spec header(String.t(), iodata()) :: iodata()
+  @spec header(String.t(), iodata()) :: iolist()
   def header(type_str, content) do
     size = IO.iodata_length(content)
     [type_str, ?\s, Integer.to_string(size), 0]

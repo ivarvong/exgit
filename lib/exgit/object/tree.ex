@@ -100,7 +100,7 @@ defmodule Exgit.Object.Tree do
     end
   end
 
-  @spec encode(t()) :: iodata()
+  @spec encode(t()) :: iolist()
   def encode(%__MODULE__{entries: entries}) do
     Enum.map(entries, fn {mode, name, sha} ->
       [mode, ?\s, name, 0, sha]

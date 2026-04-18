@@ -32,23 +32,28 @@ defmodule Exgit.RefName do
   @doc "Return true iff `name` is a safe git ref name."
   @spec valid?(term()) :: boolean()
   def valid?(name) when is_binary(name) do
-    cond do
-      name == "" -> false
-      name == "@" -> false
-      String.starts_with?(name, "/") -> false
-      String.ends_with?(name, "/") -> false
-      String.ends_with?(name, ".") -> false
-      String.contains?(name, "..") -> false
-      String.contains?(name, "@{") -> false
-      String.contains?(name, "//") -> false
-      has_forbidden_byte?(name) -> false
-      not valid_components?(name) -> false
-      single_component?(name) and name not in @well_known_singletons -> false
-      true -> true
-    end
+    passes_structural_checks?(name) and
+      not has_forbidden_byte?(name) and
+      valid_components?(name) and
+      (not single_component?(name) or name in @well_known_singletons)
   end
 
   def valid?(_), do: false
+
+  # Cheap byte-level / structural checks — no iteration over the
+  # name's characters, just substring tests. Split out of `valid?/1`
+  # so the top-level function stays under Credo's complexity bound.
+  defp passes_structural_checks?(""), do: false
+  defp passes_structural_checks?("@"), do: false
+
+  defp passes_structural_checks?(name) do
+    not String.starts_with?(name, "/") and
+      not String.ends_with?(name, "/") and
+      not String.ends_with?(name, ".") and
+      not String.contains?(name, "..") and
+      not String.contains?(name, "@{") and
+      not String.contains?(name, "//")
+  end
 
   # --- Internal ---
 

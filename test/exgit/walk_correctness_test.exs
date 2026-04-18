@@ -1,8 +1,8 @@
 defmodule Exgit.WalkCorrectnessTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Walk
   alias Exgit.Test.CommitGraph
+  alias Exgit.Walk
 
   describe "topo order (P0.14)" do
     test "Kahn invariant: no commit appears before any of its descendants" do

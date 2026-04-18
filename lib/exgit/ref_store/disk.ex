@@ -1,4 +1,9 @@
 defmodule Exgit.RefStore.Disk do
+  # Silence Dialyzer false positives on MapSet opacity in the
+  # `do_resolve/4` cycle-detection set. See Exgit.Walk for the
+  # upstream context.
+  @dialyzer :no_opaque
+
   @moduledoc """
   Filesystem-backed ref store.
 
@@ -50,6 +55,8 @@ defmodule Exgit.RefStore.Disk do
           {:ok, binary()} | {:error, :not_found | :too_deep | :cycle | :invalid_ref_name}
   def resolve_ref(store, ref), do: do_resolve(store, ref, MapSet.new(), 10)
 
+  @spec do_resolve(t(), String.t(), MapSet.t(), non_neg_integer()) ::
+          {:ok, binary()} | {:error, term()}
   defp do_resolve(%__MODULE__{} = store, ref, seen, depth) do
     cond do
       MapSet.member?(seen, ref) ->
@@ -150,9 +157,8 @@ defmodule Exgit.RefStore.Disk do
     case :file.open(lock_path, [:write, :raw, :binary]) do
       {:ok, io} ->
         try do
-          with :ok <- :file.write(io, content),
-               :ok <- :file.sync(io) do
-            :ok
+          with :ok <- :file.write(io, content) do
+            :file.sync(io)
           end
         after
           _ = :file.close(io)
@@ -370,37 +376,42 @@ defmodule Exgit.RefStore.Disk do
     case File.ls(dir) do
       {:ok, entries} ->
         Enum.flat_map(entries, fn entry ->
-          full_path = Path.join(dir, entry)
-          ref_name = prefix <> entry
-
-          cond do
-            # Refuse to follow a symlink during the recursive walk —
-            # a symlink in a ref directory pointing to e.g. `/` would
-            # otherwise make `File.ls/1` enumerate the whole
-            # filesystem. `File.lstat` returns the symlink itself,
-            # not the target.
-            symlink?(full_path) ->
-              []
-
-            File.dir?(full_path) ->
-              list_loose_refs(root, ref_name <> "/", depth + 1)
-
-            true ->
-              case File.read(full_path) do
-                {:ok, content} ->
-                  case parse_ref_content(String.trim_trailing(content, "\n")) do
-                    {:ok, value} -> [{ref_name, value}]
-                    {:error, _} -> []
-                  end
-
-                _ ->
-                  []
-              end
-          end
+          classify_loose_ref_entry(root, dir, prefix, entry, depth)
         end)
 
       {:error, _} ->
         []
+    end
+  end
+
+  # Classify a directory entry under `<root>/<prefix>` into either:
+  #   [] — skipped (symlink, or unreadable)
+  #   [{ref_name, ref_value}] — a resolved ref pointer
+  #   recursive: list_loose_refs under the sub-prefix
+  #
+  # Extracted from `list_loose_refs/3` so the cond/case scaffolding
+  # doesn't exceed Credo's nesting-depth bound.
+  defp classify_loose_ref_entry(root, dir, prefix, entry, depth) do
+    full_path = Path.join(dir, entry)
+    ref_name = prefix <> entry
+
+    cond do
+      # Refuse to follow a symlink during the recursive walk — a
+      # symlink in a ref directory pointing to e.g. `/` would
+      # otherwise make `File.ls/1` enumerate the whole filesystem.
+      # `File.lstat` returns the symlink itself, not the target.
+      symlink?(full_path) -> []
+      File.dir?(full_path) -> list_loose_refs(root, ref_name <> "/", depth + 1)
+      true -> read_loose_ref_file(full_path, ref_name)
+    end
+  end
+
+  defp read_loose_ref_file(full_path, ref_name) do
+    with {:ok, content} <- File.read(full_path),
+         {:ok, value} <- parse_ref_content(String.trim_trailing(content, "\n")) do
+      [{ref_name, value}]
+    else
+      _ -> []
     end
   end
 
@@ -439,19 +450,21 @@ defmodule Exgit.RefStore.Disk do
 
   defp fold_packed_refs([], _prefix, acc), do: Enum.reverse(acc)
 
+  # Peeled-target lines (`^<sha>`) belong to the preceding ref. Not
+  # consumed by current callers but preserved for a future
+  # fetch-negotiator that wants tag-target haves. Handled as a
+  # standalone clause so Dialyzer's type inference over the mixed
+  # `parse_packed_line` return shape doesn't flag the
+  # `{:peeled, _}` branch as unreachable.
+  defp fold_packed_refs(["^" <> _ | rest], prefix, acc),
+    do: fold_packed_refs(rest, prefix, acc)
+
   defp fold_packed_refs([line | rest], prefix, acc) do
     case parse_packed_line(line) do
       {ref, sha} when is_binary(sha) ->
         if String.starts_with?(ref, prefix),
           do: fold_packed_refs(rest, prefix, [{ref, sha} | acc]),
           else: fold_packed_refs(rest, prefix, acc)
-
-      {:peeled, _peeled_sha} ->
-        # Peeled-target line — attach to the previous ref if we kept
-        # it; otherwise drop. Not consumed by current callers but
-        # preserved for a future fetch-negotiator that wants
-        # tag-target haves.
-        fold_packed_refs(rest, prefix, acc)
 
       _ ->
         fold_packed_refs(rest, prefix, acc)

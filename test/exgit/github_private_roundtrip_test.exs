@@ -107,11 +107,9 @@ defmodule Exgit.GithubPrivateRoundtripTest do
   # Best-effort branch deletion on the remote. Ignores failures so
   # cleanup can't mask the actual test error.
   defp cleanup_branch(ref) do
-    try do
-      Exgit.push(empty_repo(), transport(), refspecs: [{:delete, ref}])
-    rescue
-      _ -> :ok
-    end
+    Exgit.push(empty_repo(), transport(), refspecs: [{:delete, ref}])
+  rescue
+    _ -> :ok
   end
 
   defp empty_repo do

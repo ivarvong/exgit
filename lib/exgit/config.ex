@@ -148,7 +148,7 @@ defmodule Exgit.Config do
     parse_lines(lines, nil, [], [])
   end
 
-  @spec encode(t()) :: iodata()
+  @spec encode(t()) :: iolist()
   def encode(%__MODULE__{sections: sections}) do
     Enum.map(sections, fn {sec_key, entries} ->
       [encode_section_header(sec_key), ?\n | encode_entries(entries)]

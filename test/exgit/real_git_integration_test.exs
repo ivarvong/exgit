@@ -9,8 +9,8 @@ defmodule Exgit.RealGitIntegrationTest do
 
   @moduletag :real_git
 
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.Test.RealGit
-  alias Exgit.Object.{Blob, Tree, Commit}
 
   setup do
     repo = RealGit.init_bare!(RealGit.tmp_dir!())

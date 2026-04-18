@@ -1,7 +1,7 @@
 defmodule Exgit.PromisorStatelessTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Object.{Blob, Tree, Commit}
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.ObjectStore
   alias Exgit.ObjectStore.Promisor
 

@@ -1,7 +1,7 @@
 defmodule Exgit.DiffTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.{Diff, Repository, ObjectStore.Memory}
+  alias Exgit.{Diff, ObjectStore.Memory, Repository}
   alias Exgit.Object.{Blob, Tree}
 
   defp make_repo, do: Repository.new(Memory.new(), Exgit.RefStore.Memory.new())

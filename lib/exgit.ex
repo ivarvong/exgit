@@ -1,5 +1,25 @@
 defmodule Exgit do
-  alias Exgit.{Repository, Config, ObjectStore, RefStore, Pack, Transport}
+  @moduledoc """
+  Pure-Elixir git client — clone, fetch, push, plus a path-oriented
+  filesystem API for reading blobs by path.
+
+  No `git` binary, no libgit2, no shelling out.
+
+  ## Top-level entry points
+
+    * `init/1` — create an empty repo (memory or on-disk).
+    * `open/2` — open an existing on-disk repo.
+    * `clone/2` — full, lazy (`lazy: true`), or partial
+      (`filter: {:blob, :none}`) clone.
+    * `fetch/3` — fetch updates into an existing repo.
+    * `push/3` — push objects + ref updates to a remote.
+
+  See individual function docs for options and semantics. See also
+  `Exgit.FS`, `Exgit.Walk`, `Exgit.Diff`, `Exgit.Repository`, and
+  the `Exgit.Transport` protocol.
+  """
+
+  alias Exgit.{Config, ObjectStore, Pack, RefStore, Repository, Transport}
 
   @spec init(keyword()) :: {:ok, Repository.t()} | {:error, term()}
   def init(opts \\ []) do
@@ -119,16 +139,15 @@ defmodule Exgit do
   defp clone_full(source, opts) do
     transport = to_transport(source, opts)
 
+    # Asking for `HEAD` as a ref-prefix pulls the server's HEAD line
+    # into the ls-refs output, complete with a symref-target attribute —
+    # so we pick the server's actual default branch instead of guessing
+    # from the advertised refs.
     with {:ok, repo} <- init(opts),
-         # Asking for `HEAD` as a ref-prefix pulls the server's HEAD
-         # line into the ls-refs output, complete with a symref-target
-         # attribute — so we pick the server's actual default branch
-         # instead of guessing from the advertised refs.
          {:ok, refs, meta} <-
            safe_ls_refs(transport, prefix: ["HEAD", "refs/heads/", "refs/tags/"]),
-         {:ok, repo} <- fetch_into(repo, transport, refs, opts),
-         {:ok, repo} <- set_head_to_default(repo, refs, meta) do
-      {:ok, repo}
+         {:ok, repo} <- fetch_into(repo, transport, refs, opts) do
+      set_head_to_default(repo, refs, meta)
     end
   end
 
@@ -169,9 +188,8 @@ defmodule Exgit do
 
       repo = Repository.new(promisor, ref_store, mode: :lazy)
 
-      with {:ok, repo} <- set_head_to_default(repo, refs, meta),
-           {:ok, repo} <- maybe_eager_prefetch(repo, refs, meta, filter_spec) do
-        {:ok, repo}
+      with {:ok, repo} <- set_head_to_default(repo, refs, meta) do
+        maybe_eager_prefetch(repo, refs, meta, filter_spec)
       end
     end
   end
@@ -325,65 +343,63 @@ defmodule Exgit do
     transport = to_transport(dest, opts)
     refspecs = Keyword.get(opts, :refspecs, ["refs/heads/main"])
 
-    # When looking up remote refs we only care about the ref NAMES
-    # (not the delete markers).
-    ref_names =
-      for rs <- refspecs do
-        case rs do
-          {:delete, name} -> name
-          name when is_binary(name) -> name
-        end
-      end
-
-    remote_refs =
-      case safe_ls_refs(transport, prefix: ref_names) do
-        {:ok, refs, _meta} -> Map.new(refs)
-        _ -> %{}
-      end
-
-    {updates, objects} =
-      Enum.reduce(refspecs, {[], []}, fn refspec, {upd, objs} ->
-        case plan_push(refspec, repo, remote_refs) do
-          {:update, ref_name, old_sha, new_sha, sha_for_objects} ->
-            new_objs =
-              if sha_for_objects,
-                do: collect_push_objects(repo.object_store, sha_for_objects, remote_refs),
-                else: []
-
-            {[{ref_name, old_sha, new_sha} | upd], objs ++ new_objs}
-
-          :skip ->
-            {upd, objs}
-        end
-      end)
+    ref_names = Enum.map(refspecs, &refspec_ref_name/1)
+    remote_refs = load_remote_refs_for_push(transport, ref_names)
+    {updates, objects} = plan_push_updates(refspecs, repo, remote_refs)
 
     if updates == [] do
       {:ok, %{ref_results: []}}
     else
-      # A receive-pack request body ends with the pkt-line flush
-      # followed by the pack bytes. An empty-objects list is legal
-      # for:
-      #
-      #   (a) pure ref-delete pushes — no new objects needed
-      #   (b) pure ref-move pushes where every commit referenced is
-      #       already present on the remote (e.g. fast-forward to a
-      #       commit the remote learned about via another branch)
-      #
-      # Most git servers accept an empty body after the flush in
-      # case (a), but some reject a completely-missing PACK header
-      # in case (b). Emit an empty PACK (header + 0 objects + SHA
-      # trailer) when we have updates that aren't all deletes — this
-      # is the shape `git send-pack` produces for the same case and
-      # is accepted by every modern server we've tested.
-      pack =
-        cond do
-          objects != [] -> Pack.Writer.build(objects)
-          all_deletes?(updates) -> <<>>
-          true -> Pack.Writer.build([])
-        end
-
+      pack = build_push_pack(updates, objects)
       Transport.push(transport, Enum.reverse(updates), pack, [])
     end
+  end
+
+  defp refspec_ref_name({:delete, name}), do: name
+  defp refspec_ref_name(name) when is_binary(name), do: name
+
+  defp load_remote_refs_for_push(transport, ref_names) do
+    case safe_ls_refs(transport, prefix: ref_names) do
+      {:ok, refs, _meta} -> Map.new(refs)
+      _ -> %{}
+    end
+  end
+
+  defp plan_push_updates(refspecs, repo, remote_refs) do
+    Enum.reduce(refspecs, {[], []}, fn refspec, {upd, objs} ->
+      case plan_push(refspec, repo, remote_refs) do
+        {:update, ref_name, old_sha, new_sha, sha_for_objects} ->
+          new_objs =
+            if sha_for_objects,
+              do: collect_push_objects(repo.object_store, sha_for_objects, remote_refs),
+              else: []
+
+          {[{ref_name, old_sha, new_sha} | upd], objs ++ new_objs}
+
+        :skip ->
+          {upd, objs}
+      end
+    end)
+  end
+
+  # A receive-pack request body ends with the pkt-line flush followed
+  # by the pack bytes. An empty-objects list is legal for:
+  #
+  #   (a) pure ref-delete pushes — no new objects needed
+  #   (b) pure ref-move pushes where every commit referenced is
+  #       already present on the remote (e.g. fast-forward to a
+  #       commit the remote learned about via another branch)
+  #
+  # Most git servers accept an empty body after the flush in case
+  # (a), but some reject a completely-missing PACK header in case
+  # (b). Emit an empty PACK (header + 0 objects + SHA trailer) when
+  # we have updates that aren't all deletes — this is the shape
+  # `git send-pack` produces for the same case and is accepted by
+  # every modern server we've tested.
+  defp build_push_pack(_updates, [_ | _] = objects), do: Pack.Writer.build(objects)
+
+  defp build_push_pack(updates, []) do
+    if all_deletes?(updates), do: <<>>, else: Pack.Writer.build([])
   end
 
   defp all_deletes?(updates), do: Enum.all?(updates, fn {_ref, _old, new} -> new == nil end)
@@ -458,9 +474,8 @@ defmodule Exgit do
     else
       case Transport.fetch(transport, wants, opts) do
         {:ok, pack_data, _summary} when byte_size(pack_data) > 0 ->
-          with {:ok, repo} <- unpack_into(repo, pack_data),
-               {:ok, repo} <- update_remote_refs(repo, refs, remote_name) do
-            {:ok, repo}
+          with {:ok, repo} <- unpack_into(repo, pack_data) do
+            update_remote_refs(repo, refs, remote_name)
           end
 
         {:ok, _, _} ->

@@ -1,8 +1,8 @@
 defmodule Exgit.Transport.HttpTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Transport.HTTP
   alias Exgit.PktLine
+  alias Exgit.Transport.HTTP
 
   describe "parse_capabilities/1 atom safety (P0.1)" do
     test "does not leak the atom table when the server advertises unknown capabilities" do

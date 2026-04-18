@@ -1,4 +1,15 @@
 defmodule Exgit.Object.Tag do
+  @moduledoc """
+  Git annotated tag object.
+
+  `decode/1` validates the `object` header as a 40-char hex string
+  and stores it as the raw 20-byte binary. Accessors on a decoded
+  tag are infallible — a hostile remote cannot DoS a walk/diff by
+  shipping a tag with non-hex header bytes. See
+  `test/exgit/security/tag_malformed_hex_test.exs` for the
+  regression.
+  """
+
   alias Exgit.Object.Hex
 
   @enforce_keys [:object, :type, :tag, :message]
@@ -23,7 +34,7 @@ defmodule Exgit.Object.Tag do
     }
   end
 
-  @spec encode(t()) :: iodata()
+  @spec encode(t()) :: iolist()
   def encode(%__MODULE__{} = t) do
     [
       "object ",

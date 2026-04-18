@@ -1,8 +1,8 @@
 defmodule Exgit.Pack.ReaderTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Pack.{Writer, Reader}
   alias Exgit.Object.Blob
+  alias Exgit.Pack.{Reader, Writer}
 
   describe "parse/1 with base objects" do
     test "parses a single blob" do
@@ -59,7 +59,7 @@ defmodule Exgit.Pack.ReaderTest do
       if pack_file do
         pack_data = File.read!(Path.join(pack_dir, pack_file))
         assert {:ok, objects} = Reader.parse(pack_data)
-        assert length(objects) > 0
+        assert objects != []
 
         # Verify every parsed object matches git cat-file
         for {type, sha, _content} <- objects do

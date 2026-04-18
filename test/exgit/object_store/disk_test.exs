@@ -1,8 +1,8 @@
 defmodule Exgit.ObjectStore.DiskTest do
   use ExUnit.Case, async: true
 
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.ObjectStore.Disk
-  alias Exgit.Object.{Blob, Tree, Commit}
 
   setup do
     path = Path.join(System.tmp_dir!(), "exgit_disk_test_#{System.unique_integer([:positive])}")

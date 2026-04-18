@@ -430,15 +430,13 @@ defmodule Exgit.FS do
   end
 
   defp insert_blob_into_empty(repo, [dir | rest], mode, blob_sha) do
-    case insert_blob_into_empty(repo, rest, mode, blob_sha) do
-      {:ok, child_sha, repo} ->
-        tree = Tree.new([{"40000", dir, child_sha}])
-        {:ok, sha, store} = ObjectStore.put(repo.object_store, tree)
-        {:ok, sha, %{repo | object_store: store}}
-
-      err ->
-        err
-    end
+    # Recursive base cases (see above) are total — they pattern-match
+    # `{:ok, sha, store} = ObjectStore.put(...)` unconditionally, so
+    # this branch always receives `{:ok, _, _}`.
+    {:ok, child_sha, repo} = insert_blob_into_empty(repo, rest, mode, blob_sha)
+    tree = Tree.new([{"40000", dir, child_sha}])
+    {:ok, sha, store} = ObjectStore.put(repo.object_store, tree)
+    {:ok, sha, %{repo | object_store: store}}
   end
 
   # ----------------------------------------------------------------------
@@ -496,6 +494,10 @@ defmodule Exgit.FS do
   # string-ref branch rejected trees with :ref_points_to_tree_not_commit,
   # which was inconsistent with the raw-SHA branch.
   defp resolve_tree_as_refname(repo, reference) do
+    # `RefStore.resolve/2` and `fetch_object/2` both return either
+    # `{:ok, ...}` or `{:error, _}`, so the `with` else-block only
+    # needs to catch the error shape. Dialyzer rejects a fallback
+    # `_ -> ...` clause here as dead code.
     with {:ok, sha} <- RefStore.resolve(repo.ref_store, reference),
          {:ok, obj, repo} <- fetch_object(repo, sha) do
       case obj do
@@ -503,9 +505,6 @@ defmodule Exgit.FS do
         %Tree{} -> {:ok, sha, repo}
         _ -> {:error, :not_a_commit_or_tree}
       end
-    else
-      {:error, _} = err -> err
-      _ -> {:error, :unresolvable_reference}
     end
   end
 
@@ -534,20 +533,24 @@ defmodule Exgit.FS do
   defp walk_path(repo, sha, []), do: {:ok, {"40000", sha}, repo}
 
   defp walk_path(repo, sha, [name | rest]) do
-    with {:ok, %Tree{entries: entries}, repo} <- fetch_object(repo, sha) do
-      case Enum.find(entries, fn {_m, n, _} -> n == name end) do
-        {mode, ^name, entry_sha} ->
-          case rest do
-            [] -> {:ok, {mode, entry_sha}, repo}
-            _ -> walk_path(repo, entry_sha, rest)
-          end
+    case fetch_object(repo, sha) do
+      {:ok, %Tree{entries: entries}, repo} ->
+        case Enum.find(entries, fn {_m, n, _} -> n == name end) do
+          {mode, ^name, entry_sha} when rest == [] ->
+            {:ok, {mode, entry_sha}, repo}
 
-        nil ->
-          {:error, :not_found}
-      end
-    else
-      {:error, _} = err -> err
-      _ -> {:error, :not_found}
+          {_mode, ^name, entry_sha} ->
+            walk_path(repo, entry_sha, rest)
+
+          nil ->
+            {:error, :not_found}
+        end
+
+      {:error, _} = err ->
+        err
+
+      _ ->
+        {:error, :not_found}
     end
   end
 
@@ -673,13 +676,12 @@ defmodule Exgit.FS do
   defp compile_glob_chars([?{ | rest], acc) do
     case take_brace_group(rest) do
       {:ok, alternatives, after_brace} ->
+        # Each alternative is itself a glob — recurse so `{*.a,*.b}`
+        # works the same as the equivalent split-up patterns.
         alt_regex =
-          alternatives
-          # Each alternative is itself a glob — recurse so `{*.a,*.b}`
-          # works the same as the equivalent split-up patterns.
-          |> Enum.map(&compile_glob_chars(&1, []))
-          |> Enum.map(&IO.iodata_to_binary/1)
-          |> Enum.join("|")
+          Enum.map_join(alternatives, "|", fn alt ->
+            alt |> compile_glob_chars([]) |> IO.iodata_to_binary()
+          end)
 
         compile_glob_chars(after_brace, ["(?:" <> alt_regex <> ")" | acc])
 

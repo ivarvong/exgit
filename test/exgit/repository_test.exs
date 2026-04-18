@@ -1,8 +1,8 @@
 defmodule Exgit.RepositoryTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.{Repository, ObjectStore, RefStore}
-  alias Exgit.Object.{Blob, Tree, Commit}
+  alias Exgit.Object.{Blob, Commit, Tree}
+  alias Exgit.{ObjectStore, RefStore, Repository}
 
   describe "in-memory repository" do
     test "creates and queries objects entirely in memory" do

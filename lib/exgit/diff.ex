@@ -1,4 +1,10 @@
 defmodule Exgit.Diff do
+  # Silence Dialyzer false positives on MapSet opacity — see the
+  # equivalent comment in `Exgit.Walk`. The `Ctx.seen` field is
+  # declared as `MapSet.t()` but Dialyzer sometimes surfaces the
+  # internal :sets/map union at call sites.
+  @dialyzer :no_opaque
+
   @moduledoc """
   Compare two git trees and return a list of changes.
 
@@ -44,6 +50,23 @@ defmodule Exgit.Diff do
   @type change ::
           %{required(:op) => atom(), required(:path) => String.t(), optional(atom()) => term()}
 
+  # Internal traversal context. Broken out as its own struct (rather
+  # than a plain map) so Dialyzer retains opacity on the `seen`
+  # MapSet.t() field across recursive helpers.
+  defmodule Ctx do
+    @moduledoc false
+    @enforce_keys [:prefix, :depth, :max_depth, :seen]
+    defstruct [:prefix, :depth, :max_depth, :seen, max_changes: nil]
+
+    @type t :: %__MODULE__{
+            prefix: String.t(),
+            depth: non_neg_integer(),
+            max_depth: pos_integer(),
+            max_changes: pos_integer() | nil,
+            seen: MapSet.t()
+          }
+  end
+
   @spec trees(term(), binary() | nil, binary() | nil, keyword()) ::
           {:ok, [change()]} | {:error, term()}
   def trees(repo, tree_a_sha, tree_b_sha, opts \\ [])
@@ -79,7 +102,7 @@ defmodule Exgit.Diff do
   # --- Context ---
 
   defp context(opts) do
-    %{
+    %Ctx{
       prefix: Keyword.get(opts, :prefix, ""),
       depth: 0,
       max_depth: Keyword.get(opts, :max_depth, @default_max_depth),
@@ -88,7 +111,7 @@ defmodule Exgit.Diff do
     }
   end
 
-  defp descend(ctx, path, sub_sha) do
+  defp descend(%Ctx{} = ctx, path, sub_sha) do
     cond do
       ctx.depth >= ctx.max_depth ->
         {:error, {:max_depth_exceeded, ctx.max_depth}}
@@ -100,7 +123,13 @@ defmodule Exgit.Diff do
         {:error, {:tree_cycle, Base.encode16(sub_sha, case: :lower)}}
 
       true ->
-        {:ok, %{ctx | prefix: path, depth: ctx.depth + 1, seen: MapSet.put(ctx.seen, sub_sha)}}
+        {:ok,
+         %Ctx{
+           ctx
+           | prefix: path,
+             depth: ctx.depth + 1,
+             seen: MapSet.put(ctx.seen, sub_sha)
+         }}
     end
   end
 
@@ -268,25 +297,20 @@ defmodule Exgit.Diff do
   # sides. We pick a single descend call per recursion, using the
   # lexicographically-smaller SHA as the `seen` token — it doesn't
   # matter which, so long as we guard against self-cycles.
-  defp descend_and_diff(repo, sha_a, sha_b, path, ctx, acc) do
+  defp descend_and_diff(repo, sha_a, sha_b, path, %Ctx{} = ctx, acc) do
+    # All clauses in the `with` return `{:ok, _} | {:error, _}`, so
+    # the `else` block only needs to catch the error shape. Pin the
+    # `%Ctx{}` struct on every `sub_ctx` binding so Elixir 1.19's
+    # type checker retains field shape across the chain.
     with {:ok, ta} <- get_tree(repo, sha_a),
          {:ok, tb} <- get_tree(repo, sha_b),
-         {:ok, sub_ctx} <- descend(ctx, path, sha_a),
-         {:ok, sub_ctx} <- descend(%{sub_ctx | depth: ctx.depth + 1}, path, sha_b) do
-      case diff_entries(repo, ta.entries, tb.entries, %{sub_ctx | prefix: path}) do
+         {:ok, %Ctx{} = sub_ctx} <- descend(ctx, path, sha_a),
+         {:ok, %Ctx{} = sub_ctx} <-
+           descend(%Ctx{sub_ctx | depth: ctx.depth + 1}, path, sha_b) do
+      case diff_entries(repo, ta.entries, tb.entries, %Ctx{sub_ctx | prefix: path}) do
         {:ok, children} -> {:ok, Enum.reverse(children) ++ acc}
         {:error, _} = err -> err
       end
-    else
-      # Either tree missing or depth/cycle guard tripped.
-      {:error, _} = err ->
-        err
-
-      _ ->
-        # Defensive: if get_tree returned a non-ok tuple without an
-        # error reason, surface as a `modified` entry so we don't
-        # loop or silently skip.
-        {:ok, [modified_change(path, "40000", sha_a, "40000", sha_b) | acc]}
     end
   end
 

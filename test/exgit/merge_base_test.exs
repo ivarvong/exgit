@@ -1,8 +1,8 @@
 defmodule Exgit.MergeBaseTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Walk
   alias Exgit.Test.CommitGraph
+  alias Exgit.Walk
 
   describe "merge_base correctness (P0.15)" do
     test "simple fork-and-merge: returns the fork point" do

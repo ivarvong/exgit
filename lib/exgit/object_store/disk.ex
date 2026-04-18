@@ -1,4 +1,21 @@
 defmodule Exgit.ObjectStore.Disk do
+  @moduledoc """
+  On-disk git object store — reads and writes objects from
+  `<root>/objects/` in git's standard layout: loose objects under
+  `aa/bbbb...` and packed objects via `pack-*.{pack,idx}`.
+
+  Loose-object reads wrap `:zlib.uncompress/1` in `try/rescue` so
+  corrupt or bit-rotted files return `{:error, :zlib_error}`
+  rather than crashing the caller. Pack lookups use `:file.pread/3`
+  with the idx offset so single-object latency is independent of
+  pack size.
+
+  Content-addressed SHA verification runs on every loose-object
+  read — see `verify_sha/2`. Pack reads rely on the pack's own
+  content-addressed lookup via idx; the SHA is verified implicitly
+  at inflate time.
+  """
+
   @enforce_keys [:root]
   defstruct [:root]
 
@@ -27,9 +44,8 @@ defmodule Exgit.ObjectStore.Disk do
         # instead of crashing the caller.
         case safe_uncompress(compressed) do
           {:ok, raw} ->
-            with :ok <- verify_sha(raw, sha),
-                 {:ok, obj} <- parse_loose_object(raw) do
-              {:ok, obj}
+            with :ok <- verify_sha(raw, sha) do
+              parse_loose_object(raw)
             end
 
           {:error, _} = err ->
@@ -94,9 +110,8 @@ defmodule Exgit.ObjectStore.Disk do
     case :file.open(tmp, [:write, :raw, :binary]) do
       {:ok, io} ->
         result =
-          with :ok <- :file.write(io, content),
-               :ok <- :file.sync(io) do
-            :ok
+          with :ok <- :file.write(io, content) do
+            :file.sync(io)
           end
 
         _ = :file.close(io)
@@ -149,23 +164,24 @@ defmodule Exgit.ObjectStore.Disk do
       {:ok, prefixes} ->
         prefixes
         |> Enum.filter(&(byte_size(&1) == 2 and hex?(&1)))
-        |> Enum.flat_map(fn prefix ->
-          case File.ls(Path.join(objects_dir, prefix)) do
-            {:ok, files} ->
-              Enum.flat_map(files, fn rest ->
-                case Base.decode16(prefix <> rest, case: :lower) do
-                  {:ok, sha} -> [sha]
-                  :error -> []
-                end
-              end)
-
-            {:error, _} ->
-              []
-          end
-        end)
+        |> Enum.flat_map(&list_objects_under_prefix(objects_dir, &1))
 
       {:error, _} ->
         []
+    end
+  end
+
+  defp list_objects_under_prefix(objects_dir, prefix) do
+    case File.ls(Path.join(objects_dir, prefix)) do
+      {:ok, files} -> Enum.flat_map(files, &decode_loose_sha(prefix, &1))
+      {:error, _} -> []
+    end
+  end
+
+  defp decode_loose_sha(prefix, rest) do
+    case Base.decode16(prefix <> rest, case: :lower) do
+      {:ok, sha} -> [sha]
+      :error -> []
     end
   end
 

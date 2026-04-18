@@ -1,8 +1,8 @@
 defmodule Exgit.Pack.IndexTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Pack.{Index, Writer, Reader}
   alias Exgit.Object.Blob
+  alias Exgit.Pack.{Index, Reader, Writer}
 
   describe "write/2 and read/1" do
     test "round-trips entries" do
@@ -33,8 +33,8 @@ defmodule Exgit.Pack.IndexTest do
       pack_checksum = :crypto.hash(:sha, "pack")
 
       entries = [
-        {sha1, 12345, 100},
-        {sha2, 67890, 200}
+        {sha1, 12_345, 100},
+        {sha2, 67_890, 200}
       ]
 
       idx = Index.write(entries, pack_checksum)

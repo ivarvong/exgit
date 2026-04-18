@@ -125,24 +125,22 @@ defmodule Exgit.Security.PackFuzzTest do
   # Helpers
 
   defp no_raise(fun) do
-    try do
-      case fun.() do
-        {:ok, _} -> true
-        {:ok, _, _} -> true
-        {:error, _} -> true
-        result when is_tuple(result) -> true
-        result when is_list(result) -> true
-        result when is_binary(result) -> true
-        result when is_atom(result) -> true
-        _other -> true
-      end
-    rescue
-      e ->
-        flunk("decoder raised: #{inspect(e)}\n" <> Exception.format_stacktrace())
-    catch
-      kind, value ->
-        flunk("decoder threw #{kind}: #{inspect(value)}")
+    case fun.() do
+      {:ok, _} -> true
+      {:ok, _, _} -> true
+      {:error, _} -> true
+      result when is_tuple(result) -> true
+      result when is_list(result) -> true
+      result when is_binary(result) -> true
+      result when is_atom(result) -> true
+      _other -> true
     end
+  rescue
+    e ->
+      flunk("decoder raised: #{inspect(e)}\n" <> Exception.format_stacktrace())
+  catch
+    kind, value ->
+      flunk("decoder threw #{kind}: #{inspect(value)}")
   end
 
   # git-style varint size encoding (little-endian continuation).

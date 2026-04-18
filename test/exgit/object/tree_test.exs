@@ -1,8 +1,8 @@
 defmodule Exgit.Object.TreeTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Object.Tree
   alias Exgit.Object.Blob
+  alias Exgit.Object.Tree
   import Exgit.Test.GitHelper
 
   describe "new/1" do

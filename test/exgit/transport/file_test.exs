@@ -1,9 +1,9 @@
 defmodule Exgit.Transport.FileTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Transport.File, as: FileTransport
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.{ObjectStore, RefStore}
-  alias Exgit.Object.{Blob, Tree, Commit}
+  alias Exgit.Transport.File, as: FileTransport
 
   setup do
     path =

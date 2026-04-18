@@ -1,9 +1,8 @@
 defmodule Exgit.FsTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.FS
-  alias Exgit.Object.{Blob, Tree, Commit}
-  alias Exgit.{ObjectStore, RefStore}
+  alias Exgit.{FS, ObjectStore, RefStore}
+  alias Exgit.Object.{Blob, Commit, Tree}
 
   # Build a tiny repo with a recognizable tree:
   #   /README.md     (file)

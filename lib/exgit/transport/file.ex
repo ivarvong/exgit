@@ -1,5 +1,21 @@
 defmodule Exgit.Transport.File do
-  alias Exgit.{ObjectStore, RefStore, Pack}
+  @moduledoc """
+  `Exgit.Transport` implementation that reads from and writes to a
+  local on-disk git repository (bare or non-bare) without going
+  over the network.
+
+  Used by tests, by local roundtrip workflows, and as a reference
+  implementation of the transport protocol. `fetch/3` walks the
+  disk object store to collect reachable objects and assembles a
+  pack; `push/4` unpacks the received pack into disk and applies
+  ref updates with CAS semantics.
+  """
+
+  # See `Exgit.Walk` for the MapSet-opacity rationale. The
+  # `collect_reachable/3` traversal uses a MapSet seen-set.
+  @dialyzer :no_opaque
+
+  alias Exgit.{ObjectStore, Pack, RefStore}
 
   @enforce_keys [:path]
   defstruct [:path]
@@ -146,18 +162,11 @@ defmodule Exgit.Transport.File do
     object_store = ObjectStore.Disk.new(path)
     ref_store = RefStore.Disk.new(path)
 
-    if byte_size(pack_bytes) > 0 do
-      case Pack.Reader.parse(pack_bytes) do
-        {:ok, parsed_objects} ->
-          for {type, _sha, content} <- parsed_objects do
-            {:ok, obj} = Exgit.Object.decode(type, content)
-            ObjectStore.Disk.put_object(object_store, obj)
-          end
-
-        {:error, reason} ->
-          {:error, {:unpack_failed, reason}}
-      end
-    end
+    # Unpack pack bytes into the object store as a side-effect. The
+    # `_ =` binding makes the discarded result explicit for
+    # Dialyzer's `:unmatched_returns` flag — previously the `if`'s
+    # `nil | [any]` return was silently dropped.
+    _ = maybe_unpack(object_store, pack_bytes)
 
     results =
       Enum.map(updates, fn {ref, old_sha, new_sha} ->
@@ -187,6 +196,24 @@ defmodule Exgit.Transport.File do
 
   # --- Internal ---
 
+  # Decode + import every object from `pack_bytes` into the disk
+  # store. Returns `:ok` on success, `{:error, reason}` on a malformed
+  # pack. `<<>>` pack is a valid no-op (pure-delete push).
+  defp maybe_unpack(_store, <<>>), do: :ok
+
+  defp maybe_unpack(store, pack_bytes) do
+    case Pack.Reader.parse(pack_bytes) do
+      {:ok, parsed_objects} ->
+        Enum.each(parsed_objects, fn {type, _sha, content} ->
+          {:ok, obj} = Exgit.Object.decode(type, content)
+          ObjectStore.Disk.put_object(store, obj)
+        end)
+
+      {:error, reason} ->
+        {:error, {:unpack_failed, reason}}
+    end
+  end
+
   defp resolve_ref(ref_store, ref, {:symbolic, target}) do
     case RefStore.Disk.resolve_ref(ref_store, target) do
       {:ok, sha} -> {ref, sha}
@@ -196,6 +223,7 @@ defmodule Exgit.Transport.File do
 
   defp resolve_ref(_ref_store, ref, sha) when is_binary(sha), do: {ref, sha}
 
+  @spec collect_reachable(ObjectStore.Disk.t(), [binary()], MapSet.t()) :: [Exgit.Object.t()]
   defp collect_reachable(store, shas, seen) do
     shas
     |> Enum.reject(&MapSet.member?(seen, &1))

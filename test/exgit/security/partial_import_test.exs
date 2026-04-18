@@ -43,6 +43,6 @@ defmodule Exgit.Security.PartialImportTest do
     raw = [good_raw, bad_raw]
 
     assert {:error, {:partial_import, failures}} = ObjectStore.import_objects(store, raw)
-    assert is_list(failures) and length(failures) >= 1
+    assert is_list(failures) and failures != []
   end
 end

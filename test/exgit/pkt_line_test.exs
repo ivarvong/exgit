@@ -66,7 +66,7 @@ defmodule Exgit.PktLineTest do
     property "encode then decode preserves payload" do
       check all(
               payloads <-
-                list_of(binary(min_length: 1, max_length: 65000), min_length: 1, max_length: 20)
+                list_of(binary(min_length: 1, max_length: 65_000), min_length: 1, max_length: 20)
             ) do
         encoded =
           payloads

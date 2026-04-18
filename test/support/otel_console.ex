@@ -120,8 +120,7 @@ defmodule Exgit.Test.OtelConsole do
     meta_parts =
       metadata
       |> Map.drop([:telemetry_span_context])
-      |> Enum.map(fn {k, v} -> "#{k}=#{format_value(v)}" end)
-      |> Enum.join(" ")
+      |> Enum.map_join(" ", fn {k, v} -> "#{k}=#{format_value(v)}" end)
 
     ms = Float.round(duration_us / 1000, 2)
     IO.puts("  [#{format_ms(ms)} ms] #{name}  #{meta_parts}")

@@ -1,8 +1,8 @@
 defmodule Exgit.Transport.HttpSidebandTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Transport.HTTP
   alias Exgit.PktLine
+  alias Exgit.Transport.HTTP
 
   describe "sideband demuxing (P0.18)" do
     test "fetch response WITHOUT sideband framing is not demuxed" do

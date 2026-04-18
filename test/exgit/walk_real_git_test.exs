@@ -14,8 +14,8 @@ defmodule Exgit.WalkRealGitTest do
   use ExUnit.Case, async: false
   @moduletag :real_git
 
-  alias Exgit.Test.RealGit
   alias Exgit.{Repository, Walk}
+  alias Exgit.Test.RealGit
 
   @empty_tree_hex "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 

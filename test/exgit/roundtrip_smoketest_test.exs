@@ -279,8 +279,7 @@ defmodule Exgit.RoundtripSmoketest do
       # Walking the checkout finds exactly our files (minus .git).
       actual_paths =
         Path.wildcard(Path.join(checkout, "**/*"))
-        |> Enum.reject(&File.dir?/1)
-        |> Enum.reject(&String.contains?(&1, "/.git/"))
+        |> Enum.reject(&(File.dir?(&1) or String.contains?(&1, "/.git/")))
         |> Enum.map(&Path.relative_to(&1, checkout))
         |> MapSet.new()
 

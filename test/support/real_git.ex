@@ -106,9 +106,7 @@ defmodule Exgit.Test.RealGit do
   @doc "read-tree → write-tree given a list of {mode, path, sha}. Returns tree sha."
   def write_tree!(cwd, entries) do
     mkfile =
-      entries
-      |> Enum.map(fn {mode, path, sha} -> "#{mode} blob #{sha}\t#{path}\n" end)
-      |> Enum.join()
+      Enum.map_join(entries, fn {mode, path, sha} -> "#{mode} blob #{sha}\t#{path}\n" end)
 
     {out, _} = git_stdin!(cwd, ["mktree"], mkfile)
     String.trim(out)

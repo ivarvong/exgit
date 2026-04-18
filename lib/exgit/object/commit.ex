@@ -72,7 +72,7 @@ defmodule Exgit.Object.Commit do
     end
   end
 
-  @spec encode(t()) :: iodata()
+  @spec encode(t()) :: iolist()
   def encode(%__MODULE__{headers: headers, message: message}) do
     [
       Enum.map(headers, &encode_header/1),

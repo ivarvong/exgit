@@ -331,11 +331,11 @@ defmodule Exgit.Pack.Reader do
   defp check_ofs(_, _), do: :ok
 
   defp safe_delta_apply(base, delta) do
-    case Delta.apply(base, delta) do
-      {:ok, _} = ok -> ok
-      {:error, _} = err -> err
-      _other -> {:error, :delta_apply_failed}
-    end
+    # `Delta.apply/2` is spec'd to return `{:ok, _} | {:error, _}`;
+    # no extra fallback clause is needed (Dialyzer flags it as
+    # dead). We keep the `rescue` as defense-in-depth in case a
+    # future Delta implementation raises on a programming error.
+    Delta.apply(base, delta)
   rescue
     _ -> {:error, :delta_apply_raised}
   end
@@ -560,7 +560,11 @@ defmodule Exgit.Pack.Reader do
 
   defp drain_rest(z, acc, iters) do
     case :zlib.safeInflate(z, <<>>) do
-      {:continue, <<>>} -> {:ok, acc}
+      # `safeInflate` always returns an iolist for the output slot
+      # (never a bare binary), so an empty-output :continue appears
+      # as `[]` not `<<>>`. Dialyzer rejects the `<<>>` pattern as
+      # unreachable.
+      {:continue, []} -> {:ok, acc}
       {:continue, output} -> drain_rest(z, [acc, output], iters + 1)
       {:finished, output} -> {:ok, [acc, output]}
       {:need_dictionary, _, _} -> {:error, :zlib_need_dictionary}
@@ -658,7 +662,8 @@ defmodule Exgit.Pack.Reader do
 
   defp drain_silent(z, iters) do
     case :zlib.safeInflate(z, <<>>) do
-      {:continue, <<>>} -> :ok
+      # See `drain_rest/3`: safeInflate returns iolist, not binary.
+      {:continue, []} -> :ok
       {:continue, _} -> drain_silent(z, iters + 1)
       {:finished, _} -> :ok
       {:need_dictionary, _, _} -> :ok

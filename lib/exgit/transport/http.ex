@@ -1,4 +1,34 @@
 defmodule Exgit.Transport.HTTP do
+  @moduledoc """
+  `Exgit.Transport` implementation for git smart-HTTP v2.
+
+  Speaks git protocol v2 over HTTPS using `Req` as the HTTP client.
+  Implements `capabilities/1`, `ls_refs/2`, `fetch/3`, and
+  `push/4`; supports `want-ref`, `filter`, `sideband-all`, and
+  `symrefs` extensions.
+
+  ## Credentials
+
+  The `:auth` field accepts either a bare auth tuple (auto-wrapped
+  in `%Exgit.Credentials{}` with host-binding) or an explicit
+  `%Exgit.Credentials{}` struct. Host-bound credentials refuse to
+  emit auth headers when the URL host doesn't match the bound
+  pattern, defending against cross-origin leaks through redirects
+  or user-supplied URLs.
+
+  ## TLS
+
+  `verify_tls: true` (default) uses `:public_key.cacerts_get/0` and
+  enables hostname verification via `:ssl.pkix_verify_hostname/3`.
+
+  ## Redirects
+
+  Disabled by default to prevent any chance of credential leaks
+  through an unexpected redirect target. Opt-in via
+  `redirect: :same_origin` or `redirect: :follow`; host-binding on
+  `:auth` remains in force either way.
+  """
+
   alias Exgit.PktLine
 
   @enforce_keys [:url]

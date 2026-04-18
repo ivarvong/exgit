@@ -1,7 +1,7 @@
 defmodule Exgit.Object.CommitTest do
   use ExUnit.Case, async: true
 
-  alias Exgit.Object.{Commit, Blob}
+  alias Exgit.Object.{Blob, Commit}
   import Exgit.Test.GitHelper
 
   @author "Test User <test@example.com> 1000000000 +0000"

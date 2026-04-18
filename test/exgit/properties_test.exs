@@ -4,8 +4,8 @@ defmodule Exgit.PropertiesTest do
 
   @moduletag :property
 
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.PktLine
-  alias Exgit.Object.{Blob, Tree, Commit}
 
   # ---- F.1: pkt-line encode/decode round trip ----
 

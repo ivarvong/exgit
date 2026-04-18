@@ -1,8 +1,8 @@
 defmodule Exgit.CloneTest do
   use ExUnit.Case, async: true
 
+  alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.{ObjectStore, RefStore}
-  alias Exgit.Object.{Blob, Tree, Commit}
 
   setup do
     base = Path.join(System.tmp_dir!(), "exgit_clone_#{System.unique_integer([:positive])}")

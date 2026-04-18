@@ -160,7 +160,7 @@ defmodule Exgit.FilterTest do
       assert Exgit.Filter.encode({:blob, {:limit, 1024}}) == {:ok, "blob:limit=1024"}
     end
 
-    test "{:blob, {:limit, \"1m\"}} → \"blob:limit=1m\" (human-readable passthrough)" do
+    test ~s[{:blob, {:limit, "1m"}} → "blob:limit=1m" (human-readable passthrough)] do
       assert Exgit.Filter.encode({:blob, {:limit, "1m"}}) == {:ok, "blob:limit=1m"}
     end
 
