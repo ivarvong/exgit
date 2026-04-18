@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — observability + workload bench
+
+- **`Exgit.Profiler`** — structured trace of `:telemetry` span
+  events emitted during a function call. One-shot `profile/1`
+  returns `{result, %{total_us, totals, peak_cache_bytes,
+  events}}`; manual `attach/0` + `read/1` + `detach/1` for
+  long-running processes. Process-scoped — concurrent
+  profilers don't interfere.
+- **`Exgit.Repository.memory_report/1`** — structured memory
+  report (object counts by type, cache_bytes, max_cache_bytes,
+  mode, backend) with consistent shape across all object-store
+  backends. Suitable for emission into observability stacks.
+- **`bench/agent_workload.exs`** — realistic agent-session
+  benchmark: clone + prefetch + ls + grep + reads, with `:cold`
+  and `:hot` variants. Reports per-op breakdown + peak cache
+  bytes.
+- **`test/exgit/fs_grep_git_parity_test.exs`** — correctness
+  oracle: `Exgit.FS.grep` output vs `git grep -n` for 7
+  representative patterns. Tagged `:real_git :slow`; gates
+  every push via the extended CI tier.
+- **`docs/NOTES.md`** — design notes for deferred work (LRU
+  eviction, decompressed-blob cache, literal-string grep fast
+  path). Captures enough detail that future implementation
+  doesn't re-reason from scratch.
+
 ### Performance
 
 A perf-focused round triggered by a real-world bug report (partial

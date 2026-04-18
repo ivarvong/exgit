@@ -404,6 +404,68 @@ the corpus is future work; the current set catches regressions in
 line-number computation, regex semantics, and binary-file
 skipping — the classes of bug most likely to land silently.
 
+## What's next
+
+The measurement infrastructure is in place; optimization choices
+from here should be **data-driven** — profile a real agent
+workload against real fixtures, find the hotspot, optimize.
+Everything below is waiting on a concrete workload telling us
+what matters.
+
+### Candidate optimizations, not-yet-done
+
+- **Decompressed-blob cache.** Memory.get_object currently does
+  `:zlib.uncompress` on every call. For grep-heavy workloads
+  against the same repo, caching the decompressed bytes would
+  halve grep time. Costs memory (~3-5× per blob). Behind a flag.
+
+- **Literal-string fast path for grep.** Current `FS.grep`
+  compiles string patterns to `%Regex{}`. For literal patterns,
+  `:binary.match` (Boyer-Moore in the runtime) is 2-5× faster.
+  Detect via: pattern is a plain binary AND doesn't contain
+  regex metacharacters.
+
+- **Chunked parallel grep.** Per-file Task.async_stream was 22×
+  SLOWER than sequential (per-item spawn overhead dominates
+  microsecond regex work). A **chunked** version (batch 100-500
+  files per task) would amortize the overhead and likely win on
+  4k+ file repos. Needs the agent workload bench to confirm.
+
+- **Path → sha index.** `FS.walk` re-walks the tree on every
+  call. A one-time path→sha map built at prefetch would make
+  `read_path` O(1) instead of O(depth). Low priority — tree
+  walks are microseconds today.
+
+### Memory management — deferred
+
+A proper **LRU eviction** (access-time tracking, evicts
+blobs/trees/commits by age, eviction-aware streaming) is
+designed but not implemented. Current stance:
+
+- `:max_cache_bytes: :infinity` is the default.
+- `cache_bytes` is tracked accurately (compressed bytes).
+- `Exgit.Repository.memory_report/1` lets operators monitor.
+
+The LRU design is documented in [`docs/NOTES.md`](NOTES.md)
+for the future maintainer who hits a memory-bound workload.
+We'd rather build it against real usage constraints than
+guess.
+
+### New agent primitives
+
+Things agents ask for that exgit doesn't have yet:
+
+- **`FS.read_lines(repo, ref, path, line_range)`** — read only
+  the requested line range of a file.
+- **`FS.grep` with `:context`** — N lines of surrounding context
+  per match.
+- **`FS.multi_grep(patterns)`** — N patterns in one walk.
+- **`Exgit.Blame`** — last-writer-per-line. The single most
+  commonly-requested missing feature.
+
+Each of these reduces ops-per-task, which matters more for
+agent latency than microsecond-per-op optimization.
+
 ## Known caveats
 
 - `transport.fetch` is dominated by GitHub's side + HTTPS setup +
