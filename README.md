@@ -165,58 +165,34 @@ end
 
 ## Performance
 
-Every hot path emits [`:telemetry`](https://hexdocs.pm/telemetry/) span
-events. The numbers below are from **100 measured runs** against
-[`ivarvong/pyex`](https://github.com/ivarvong/pyex) (warm-up run
-discarded). Report bench harness lives in `bench/review_bench.exs`.
+Every hot path emits [`:telemetry`](https://hexdocs.pm/telemetry/)
+span events. Benchmark harness: `bench/review_bench.exs`. Full
+results + methodology + caveats:
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-| Property                                | Value       |
-|-----------------------------------------|-------------|
-| Total code (`cloc`)                     | 77,305 LOC  |
-| `lib/` only (Elixir)                    | 27,022 LOC  |
-| Files in tree                           | 259         |
-| Git objects in HEAD pack                | 1,490       |
-| Pack size over the wire                 | 1.2 MB      |
+**Steady-state `Exgit.FS.grep`** across three real GitHub fixtures:
+
+| Fixture | Files | Pack | Warm grep |
+|---|---:|---:|---:|
+| [`ivarvong/pyex`](https://github.com/ivarvong/pyex) | 275 | 1.2 MB | **11 ms** |
+| [`cloudflare/agents`](https://github.com/cloudflare/agents) | 1,418 | 4 MB | **58 ms** |
+| [`anomalyco/opencode`](https://github.com/anomalyco/opencode) | 4,600 | ~30 MB | **451 ms** |
+
+Near-linear scaling at ~40-100 µs per file. The one-time
+`clone → prefetch` setup is network-dominated (GitHub HTTPS
+round-trips, pack bytes over the wire). Steady-state reads run
+entirely against the in-memory cache — no syscalls, no network,
+no shelling out.
 
 ```elixir
-{:ok, repo} = Exgit.clone("https://github.com/ivarvong/pyex", lazy: true)
+{:ok, repo} = Exgit.clone("https://github.com/cloudflare/agents", lazy: true)
 {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
-Exgit.FS.grep(repo, "HEAD", "anthropic", case_insensitive: true)
+
+# All subsequent reads are ~10-500 ms depending on file count, no
+# network. Run as many as you want against the same repo struct.
+Exgit.FS.grep(repo, "HEAD", "agent", case_insensitive: true)
 |> Enum.to_list()
 ```
-
-Phase breakdown (median / p95 over 100 runs):
-
-| Phase                                | median   | p95      | min      |
-|--------------------------------------|---------:|---------:|---------:|
-| 1. `clone(url, lazy: true)`          |   80 ms  |   99 ms  |   54 ms  |
-| 2. `prefetch(blobs: true)`           |  674 ms  |  756 ms  |  647 ms  |
-| 3. `grep` case-insensitive           |  156 ms  |  164 ms  |  145 ms  |
-| **total**                            | **911 ms** | **1.12 s** | **859 ms** |
-
-Under the hood (telemetry medians across 100 runs):
-
-| Event                 | median   | p95      | note                                  |
-|-----------------------|---------:|---------:|---------------------------------------|
-| `transport.ls_refs`   |   80 ms  |   99 ms  | includes protocol-v2 `symrefs` probe  |
-| `transport.fetch`     |  309 ms  |  353 ms  | 1.2 MB pack, 1490 objects over HTTPS  |
-| `pack.parse`          |  127 ms  |  156 ms  | inflate + decode all objects          |
-| `fs.walk`             |  156 ms  |  164 ms  | walk the full tree in-memory          |
-| `fs.grep`             |  156 ms  |  164 ms  | scan 259 files, 2.9 MB, 2 matches     |
-| `object_store.get`    |  109 µs  |  1.4 ms  | 216×; pure in-memory                  |
-
-**~910 ms total, wall-clock, over real network.** Dominated by the
-network round-trip and pack inflation; the actual grep work is ~156 ms
-over 2.9 MB of source code. `pack.parse` is ~40% slower than our
-pre-review baseline — the deliberate cost of the new
-`safeInflate`-based tracked inflate that never calls
-`:zlib.uncompress/1` on hostile input (see review #4). Match count
-is deterministic (2) across all 100 runs.
-
-For partial clones (`filter: {:blob, :none}`), a fetch against a
-large repo drops from tens of seconds to a few seconds — see
-[`BENCHMARKS.md` in the smoketest
-repo](https://github.com/ivarvong/exgit_smoketest/blob/main/BENCHMARKS.md).
 
 ### Attaching your own handler
 

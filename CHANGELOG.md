@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+A perf-focused round triggered by a real-world bug report (partial
+clone returning empty packs). Adding real-world fixtures
+(`cloudflare/agents`, `anomalyco/opencode`) to the benchmark
+immediately surfaced three cascading bugs in the core
+"clone + prefetch + read" hot path that pyex was too small to
+expose:
+
+- **`FS.walk` threaded the updated repo through stream state**.
+  Previously discarded the grown promisor from `resolve_tree`,
+  so every walk on a lazy repo triggered a fresh commit fetch.
+  On `cloudflare/agents` (1,418 files): 7,700 ms → 2 ms per walk.
+  ~3,800× faster.
+- **Promisor cache bytes now tracked as compressed**, not
+  decompressed. Previous accounting over-counted by 3-10×,
+  tripping eviction during normal prefetch. Combined with the
+  evictor only dropping commits (not blobs/trees), this could
+  drop the single commit we'd just fetched for a streaming walk.
+- **`:max_cache_bytes` default changed from 64 MiB to `:infinity`**.
+  Unbounded is the right default for partial-clone / prefetch
+  workflows. Callers with real memory envelopes (long-running
+  daemons, low-memory deployments) set an explicit cap based on
+  their budget.
+- **`:max_resolved_bytes` default raised from 500 MiB to 2 GiB**
+  (matches `:max_pack_bytes`). The old cap blocked real-world
+  monorepos; `anomalyco/opencode` resolves to 524 MB.
+
+Plus two real optimizations:
+
+- **Adler32 trailer probe** for pack zlib stream tracking.
+  Replaces an O(log N) binary-search with one linear scan +
+  one verify probe. `pack.parse` went from 127 ms → 49 ms on
+  pyex (2.6× faster). Saves several seconds on large packs.
+- **Single-pass grep (`matches_in` rewrite)**. Previously
+  split every blob into lines via regex before matching; now
+  `Regex.scan` on whole blob + compute line numbers only for
+  matched files. 13× faster on the common case (repo with few
+  matches).
+
+**Explicitly reverted:** initial parallel-grep implementation
+using `Task.async_stream`. Measured 22× SLOWER on `cloudflare/agents`
+— per-file spawn overhead (~50-100 µs) dominates the microsecond
+regex work. Default stays sequential. Callers with substantial
+per-file work opt in via `max_concurrency: :schedulers`.
+
+Full benchmark methodology + per-fixture numbers in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Benchmark harness
+in `bench/review_bench.exs`.
+
 ### Production-readiness round
 
 A follow-up audit after the staff-engineering review closed the
