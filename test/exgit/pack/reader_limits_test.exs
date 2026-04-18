@@ -34,18 +34,27 @@ defmodule Exgit.Pack.ReaderLimitsTest do
     assert length(parsed) == 10
   end
 
-  # History lesson: we once defaulted to 500 MiB, figuring "any
-  # legitimate pack fits." Then anomalyco/opencode's partial-clone
-  # pack resolved to ~524 MB and tripped the cap. The new default
-  # is 2 GiB (matches :max_pack_bytes). This test asserts that a
-  # synthetic 600 MB payload parses under the default.
+  # History lesson: we once defaulted :max_resolved_bytes to 500
+  # MiB, figuring "any legitimate pack fits." Then
+  # anomalyco/opencode's partial-clone pack resolved to ~524 MB
+  # and tripped the cap. The new default is 2 GiB (matches
+  # :max_pack_bytes). This test asserts that a 600 MB aggregate
+  # payload parses under the default :max_resolved_bytes.
+  #
+  # We split into 100 × 6 MB blobs rather than one 600 MB blob
+  # because `:max_object_bytes` (100 MiB) is a separate cap — a
+  # single-blob test would trip per-object, not total-resolved.
+  # The aggregate pattern matches real repos (many smaller blobs)
+  # and is what the resolved-bytes cap actually protects.
   #
   # Tagged `:slow` because building a 600 MB pack takes seconds.
   @tag :slow
   test "default cap admits a 600 MiB legitimate pack (regression)" do
-    big_blob = Blob.new(:binary.copy("x", 600 * 1024 * 1024))
-    pack = Writer.build([big_blob])
+    chunk = :binary.copy("x", 6 * 1024 * 1024)
+    blobs = for i <- 1..100, do: Blob.new(<<i::32, chunk::binary>>)
+    pack = Writer.build(blobs)
 
-    assert {:ok, [_]} = Reader.parse(pack)
+    assert {:ok, parsed} = Reader.parse(pack)
+    assert length(parsed) == 100
   end
 end
