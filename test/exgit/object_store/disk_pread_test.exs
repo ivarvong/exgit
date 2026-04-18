@@ -40,10 +40,15 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
     small_time = time_sample_lookup(root, store, "small", small_blobs)
     large_time = time_sample_lookup(root, store, "large", large_blobs)
 
-    # Ratio should be near 1.0 for pread; unbounded for read-whole-pack.
+    # Ratio should be near 1.0 for pread; ~20× for read-whole-pack.
+    # Threshold of 10× catches the linear-scan regression without
+    # false-failing on GitHub runners whose microsecond-level timing
+    # jitter can push a well-behaved pread above 4×. See
+    # https://github.com/ivarvong/exgit/actions/runs/24607938895
+    # for the exact run that motivated the higher bound.
     ratio = large_time / max(small_time, 1)
 
-    assert ratio < 4.0,
+    assert ratio < 10.0,
            "large-pack lookup is #{Float.round(ratio, 2)}× slower than small-pack " <>
              "(#{large_time}us vs #{small_time}us) — store likely reads whole pack per lookup"
   end
