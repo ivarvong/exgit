@@ -107,9 +107,17 @@ defmodule Exgit do
   ## Examples
 
       {:ok, repo} = Exgit.lazy_clone("https://github.com/user/repo")
-      {:ok, {_mode, blob}} = Exgit.FS.read_path(repo, "HEAD", "README.md")
+      {:ok, {_mode, blob}, _repo} = Exgit.FS.read_path(repo, "HEAD", "README.md")
 
+  > #### Experimental {: .warning}
+  >
+  > Lazy clone, Promisor semantics, and `FS.prefetch/3` /
+  > `Repository.materialize/2` are **experimental in v0.x**. The
+  > Promisor struct shape and the threading contract for
+  > `FS.read_path/3` etc. returning `{:ok, result, repo}` may change
+  > before v1.0. File an issue if you find the shape awkward.
   """
+  @doc experimental: true
   @spec lazy_clone(String.t() | term(), keyword()) ::
           {:ok, Repository.t()} | {:error, term()}
   def lazy_clone(source, opts \\ []) do

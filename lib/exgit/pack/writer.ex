@@ -1,8 +1,33 @@
 defmodule Exgit.Pack.Writer do
-  alias Exgit.Pack.Common
+  @moduledoc """
+  Build a pack (`build/1`) and optionally its `.idx` index
+  (`build_with_index/1`) from a list of objects.
+
+  The idx output is v2 format and verifies clean with `git
+  verify-pack`. Objects are written as full (non-delta) compressed
+  zlib streams; delta compression is a v0.3+ item.
+  """
+
+  alias Exgit.Pack.{Common, Index}
 
   @spec build([Exgit.Object.t()]) :: binary()
   def build(objects) do
+    {pack, _idx_entries} = build_entries(objects)
+    pack
+  end
+
+  @doc """
+  Build a pack AND its index. Returns `{pack_bytes, idx_bytes}`.
+  """
+  @spec build_with_index([Exgit.Object.t()]) :: {binary(), binary()}
+  def build_with_index(objects) do
+    {pack, entries} = build_entries(objects)
+    pack_checksum = binary_part(pack, byte_size(pack) - 20, 20)
+    idx = Index.write(entries, pack_checksum)
+    {pack, idx}
+  end
+
+  defp build_entries(objects) do
     num_objects = length(objects)
 
     header = <<
@@ -11,10 +36,20 @@ defmodule Exgit.Pack.Writer do
       num_objects::32-big
     >>
 
-    entries = Enum.map(objects, &encode_object/1)
-    pack_data = IO.iodata_to_binary([header | entries])
-    checksum = :crypto.hash(:sha, pack_data)
-    pack_data <> checksum
+    {encoded, entries, _final_offset} =
+      Enum.reduce(objects, {[], [], 12}, fn obj, {bins, entries, offset} ->
+        encoded = encode_object(obj)
+        bin = IO.iodata_to_binary(encoded)
+        crc = :erlang.crc32(bin)
+        sha = Exgit.Object.sha(obj)
+        {[bin | bins], [{sha, crc, offset} | entries], offset + byte_size(bin)}
+      end)
+
+    pack_body = IO.iodata_to_binary([header, Enum.reverse(encoded)])
+    checksum = :crypto.hash(:sha, pack_body)
+    pack = pack_body <> checksum
+
+    {pack, Enum.reverse(entries)}
   end
 
   defp encode_object(object) do

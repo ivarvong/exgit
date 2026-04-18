@@ -43,14 +43,14 @@ defmodule Exgit.MixProject do
       links: %{
         "GitHub" => @source_url
       },
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md SECURITY.md)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md"],
+      extras: ["README.md", "CHANGELOG.md", "SECURITY.md"],
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]

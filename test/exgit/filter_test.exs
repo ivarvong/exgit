@@ -240,6 +240,35 @@ defmodule Exgit.FilterTest do
                Exgit.lazy_clone(transport, filter: {:blob, :none})
     end
 
+    test "tree:0 filter (shallow-commit-only) encodes correctly" do
+      assert Exgit.Filter.encode({:tree, 0}) == {:ok, "tree:0"}
+    end
+
+    test "blob:limit filter encodes size correctly" do
+      assert Exgit.Filter.encode({:blob, {:limit, 1024}}) == {:ok, "blob:limit=1024"}
+      assert Exgit.Filter.encode({:blob, {:limit, "1m"}}) == {:ok, "blob:limit=1m"}
+      assert Exgit.Filter.encode({:blob, {:limit, "100k"}}) == {:ok, "blob:limit=100k"}
+    end
+
+    test "server that advertises filter but rejects the specific filter returns error" do
+      # Simulate GitLab-style behavior: advertises "filter" but rejects
+      # some filter specs (e.g. unsupported sparse specs). Our FakeT
+      # always serves blob:none successfully, but a real rejection
+      # comes back as an error response from Transport.fetch — which
+      # we propagate via lazy_clone.
+      origin = build_origin()
+      transport = %{FilterFakeT.new(origin.store) | origin: origin.store}
+
+      :persistent_term.put({FilterFakeT, transport.calls, :refs}, [
+        {"refs/heads/main", origin.commit}
+      ])
+
+      # An invalid filter spec (neither :none nor a known tuple) fails
+      # at encode time before we hit the transport.
+      assert {:error, {:invalid_filter, _}} =
+               Exgit.lazy_clone(transport, filter: :invalid_filter_form)
+    end
+
     test "server without filter + if_unsupported: :ignore → falls back to full fetch" do
       origin = build_origin()
 

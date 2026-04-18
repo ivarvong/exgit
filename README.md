@@ -249,7 +249,36 @@ Every mutating operation returns the updated store. Thread the repo struct throu
 
 ## Status
 
-v0.1 — functional for clone, fetch, push over HTTPS. Tested against GitHub, validated with `git fsck`.
+v0.1 — functional for clone, fetch, push over HTTPS. Tested against
+GitHub, validated with `git fsck`.
+
+## Versioning
+
+Exgit follows [Semantic Versioning](https://semver.org). The **public
+API** for SemVer purposes is:
+
+- `Exgit.clone/2`, `lazy_clone/2`, `fetch/3`, `push/3`, `init/1`, `open/1`
+- `Exgit.FS.*` (every public `read_path`, `ls`, `stat`, `exists?`,
+  `prefetch`, `walk`, `glob`, `grep`, `write_path`)
+- `Exgit.Object.*` (Blob, Tree, Commit, Tag struct shape)
+- `Exgit.Credentials.*`
+- `Exgit.Transport` protocol + `Exgit.Transport.HTTP.new/2`
+- The `:telemetry` event shapes documented in `Exgit.Telemetry`
+
+Anything not in this list (including private modules, `@doc false`
+helpers, internal protocol functions) may change in any release.
+
+**0.x releases are permitted to break the public API** with a
+CHANGELOG entry and migration notes. From 1.0 onward, breaking
+changes require a major-version bump.
+
+Functions annotated `@doc experimental: true` — currently
+`lazy_clone/2`, `FS.prefetch/3`, and `Repository.materialize/2` —
+are explicitly exempt from SemVer guarantees until marked stable.
+
+See [CHANGELOG.md](./CHANGELOG.md) for release notes and
+[SECURITY.md](./SECURITY.md) for the threat model and disclosure
+policy.
 
 ## License
 
