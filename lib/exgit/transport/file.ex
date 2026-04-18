@@ -41,7 +41,23 @@ defmodule Exgit.Transport.File do
         []
       end
 
-    {:ok, head ++ Enum.map(refs, fn {ref, value} -> resolve_ref(ref_store, ref, value) end)}
+    entries =
+      (head ++ Enum.map(refs, fn {ref, value} -> resolve_ref(ref_store, ref, value) end))
+      |> Enum.filter(fn {ref, _sha} ->
+        if Exgit.RefName.valid?(ref) do
+          true
+        else
+          :telemetry.execute(
+            [:exgit, :security, :ref_rejected],
+            %{count: 1},
+            %{source: path, ref: ref}
+          )
+
+          false
+        end
+      end)
+
+    {:ok, entries}
   end
 
   def fetch(%__MODULE__{} = t, wants, opts \\ []) do

@@ -14,26 +14,54 @@ defmodule Exgit.Transport.HTTP do
     verify_tls: true
   ]
 
-  @type auth ::
+  @type auth_value ::
           nil
           | {:basic, String.t(), String.t()}
           | {:bearer, String.t()}
           | {:header, String.t(), String.t()}
-          | {:callback, (Req.Request.t() -> [{String.t(), String.t()}])}
+          | {:callback, (String.t() -> [{String.t(), String.t()}])}
+
+  @type auth :: auth_value() | Exgit.Credentials.t()
 
   @type t :: %__MODULE__{url: String.t(), auth: auth(), user_agent: String.t()}
 
   @spec new(String.t(), keyword()) :: t()
   def new(url, opts \\ []) do
-    defaults = %__MODULE__{url: String.trim_trailing(url, "/")}
+    trimmed_url = String.trim_trailing(url, "/")
+    defaults = %__MODULE__{url: trimmed_url}
 
     struct(defaults,
-      auth: Keyword.get(opts, :auth),
+      auth: normalize_auth(Keyword.get(opts, :auth), trimmed_url),
       user_agent: Keyword.get(opts, :user_agent, defaults.user_agent),
       connect_timeout: Keyword.get(opts, :connect_timeout, defaults.connect_timeout),
       receive_timeout: Keyword.get(opts, :receive_timeout, defaults.receive_timeout),
       verify_tls: Keyword.get(opts, :verify_tls, defaults.verify_tls)
     )
+  end
+
+  # Normalize the auth value:
+  #
+  #   - nil → nil (no auth)
+  #   - %Exgit.Credentials{} → passed through as-is (caller explicitly
+  #     chose the host binding, including :any for unbound).
+  #   - Bare auth tuple ({:basic, _, _} etc.) → WRAPPED in a
+  #     Credentials bound to the URL's host. Legacy callers who pass
+  #     raw tuples get automatic cross-origin leak protection; to
+  #     opt out, wrap the tuple in Credentials.unbound/1 explicitly.
+  defp normalize_auth(nil, _url), do: nil
+
+  defp normalize_auth(%Exgit.Credentials{} = cred, _url), do: cred
+
+  defp normalize_auth(auth_tuple, url) when is_tuple(auth_tuple) do
+    host = URI.parse(url).host
+
+    if is_binary(host) and host != "" do
+      Exgit.Credentials.host_bound(host, auth_tuple)
+    else
+      # No host to bind to (e.g. relative URL) — refuse to create an
+      # implicitly-bound credential; caller must be explicit.
+      Exgit.Credentials.unbound(auth_tuple)
+    end
   end
 
   def capabilities(%__MODULE__{} = t) do
@@ -79,7 +107,10 @@ defmodule Exgit.Transport.HTTP do
 
               case String.split(line, " ", parts: 2) do
                 [hex_sha, ref] when byte_size(hex_sha) == 40 ->
-                  [{ref, Base.decode16!(hex_sha, case: :mixed)}]
+                  case Base.decode16(hex_sha, case: :mixed) do
+                    {:ok, sha} -> filter_valid_ref(ref, sha, t.url)
+                    :error -> []
+                  end
 
                 _ ->
                   []
@@ -93,6 +124,23 @@ defmodule Exgit.Transport.HTTP do
 
       error ->
         error
+    end
+  end
+
+  # Drop any ref whose name would be unsafe to persist. Emit a
+  # telemetry event so operators can see hostile advertisements
+  # without the library raising.
+  defp filter_valid_ref(ref, sha, source) do
+    if Exgit.RefName.valid?(ref) do
+      [{ref, sha}]
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: source, ref: ref}
+      )
+
+      []
     end
   end
 
@@ -431,23 +479,56 @@ defmodule Exgit.Transport.HTTP do
   end
 
   defp do_request(method, url, headers, body, t) do
-    headers = headers ++ auth_headers(t.auth)
-
-    opts =
-      [
-        method: method,
-        url: url,
-        headers: headers,
-        decode_body: false,
-        receive_timeout: t.receive_timeout,
-        retry: false,
-        connect_options: connect_options(url, t)
-      ]
-
-    opts = if body, do: Keyword.put(opts, :body, body), else: opts
-
-    Req.request(opts)
+    Req.request(request_opts(t, method, url, headers, body))
   end
+
+  @doc """
+  Build the keyword list we'd pass to `Req.request/1` for the given
+  request. Exposed publicly for test introspection; production code
+  goes through `do_request/5`.
+  """
+  @spec request_opts(t(), atom(), String.t(), [{String.t(), String.t()}], binary() | nil) ::
+          keyword()
+  def request_opts(t, method, url, headers, body) do
+    headers = headers ++ auth_headers_for(t, url)
+
+    opts = [
+      method: method,
+      url: url,
+      headers: headers,
+      decode_body: false,
+      receive_timeout: t.receive_timeout,
+      retry: false,
+      # Pin redirect policy explicitly. We do not rely on Req's default
+      # cross-origin auth-stripping behavior — callers can set
+      # `:follow_redirects` explicitly when needed, and our credential
+      # host-binding enforces the leak check either way.
+      redirect: false,
+      connect_options: connect_options(url, t)
+    ]
+
+    if body, do: Keyword.put(opts, :body, body), else: opts
+  end
+
+  @doc """
+  Compute the auth headers for a specific request URL. Exposed for
+  testing; production call-sites use `request_opts/5` or `do_request/5`.
+
+  This is the enforcement point for credential host-binding: a
+  `%Exgit.Credentials{}` with a non-matching host pattern returns `[]`
+  regardless of what the caller thought they attached.
+  """
+  @spec auth_headers_for(t(), String.t()) :: [{String.t(), String.t()}]
+  def auth_headers_for(%__MODULE__{auth: nil}, _url), do: []
+
+  def auth_headers_for(%__MODULE__{auth: %Exgit.Credentials{} = cred}, url) do
+    case Exgit.Credentials.for_host(cred, url) do
+      {:ok, auth_value} -> auth_headers(auth_value, url)
+      :none -> []
+    end
+  end
+
+  def auth_headers_for(%__MODULE__{auth: auth}, url), do: auth_headers(auth, url)
 
   # TLS / transport options. Req's `connect_options` are forwarded to
   # Finch/Mint. For HTTPS we enforce peer verification; callers can opt
@@ -479,17 +560,27 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
-  defp auth_headers(nil), do: []
+  defp auth_headers(nil, _url), do: []
 
-  defp auth_headers({:basic, user, pass}),
+  defp auth_headers({:basic, user, pass}, _url),
     do: [{"authorization", "Basic " <> Base.encode64("#{user}:#{pass}")}]
 
-  defp auth_headers({:bearer, token}), do: [{"authorization", "Bearer #{token}"}]
-  defp auth_headers({:header, name, value}), do: [{name, value}]
+  defp auth_headers({:bearer, token}, _url), do: [{"authorization", "Bearer #{token}"}]
+  defp auth_headers({:header, name, value}, _url), do: [{name, value}]
 
-  defp auth_headers({:callback, fun}) do
-    fun.()
+  # Callback receives the URL so the auth can be computed per-request
+  # (e.g. AWS SigV4, SAS tokens). Typespec on `auth_value()` above
+  # promises arity 1 — we honor it.
+  defp auth_headers({:callback, fun}, url) when is_function(fun, 1) do
+    case fun.(url) do
+      headers when is_list(headers) -> headers
+      _ -> []
+    end
+  rescue
+    _ -> []
   end
+
+  defp auth_headers(_other, _url), do: []
 
   defp hex(sha) when byte_size(sha) == 20, do: Base.encode16(sha, case: :lower)
 end

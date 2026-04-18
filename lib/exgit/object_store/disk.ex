@@ -165,13 +165,9 @@ defmodule Exgit.ObjectStore.Disk do
       {pos, 1} ->
         <<header::binary-size(pos), 0, content::binary>> = raw
 
-        case String.split(header, " ", parts: 2) do
-          [type_str, _size_str] ->
-            type = type_atom(type_str)
-            Exgit.Object.decode(type, content)
-
-          _ ->
-            {:error, :malformed_object_header}
+        with {:ok, type, size} <- parse_loose_header(header),
+             :ok <- check_loose_size(content, size) do
+          Exgit.Object.decode(type, content)
         end
 
       :nomatch ->
@@ -179,10 +175,33 @@ defmodule Exgit.ObjectStore.Disk do
     end
   end
 
-  defp type_atom("blob"), do: :blob
-  defp type_atom("tree"), do: :tree
-  defp type_atom("commit"), do: :commit
-  defp type_atom("tag"), do: :tag
+  defp parse_loose_header(header) do
+    case String.split(header, " ", parts: 2) do
+      [type_str, size_str] ->
+        with {:ok, type} <- type_atom(type_str),
+             {size, ""} <- Integer.parse(size_str) do
+          {:ok, type, size}
+        else
+          :error -> {:error, {:unknown_object_type, type_str}}
+          _ -> {:error, {:malformed_object_size, size_str}}
+        end
+
+      _ ->
+        {:error, :malformed_object_header}
+    end
+  end
+
+  defp check_loose_size(content, declared) do
+    if byte_size(content) == declared,
+      do: :ok,
+      else: {:error, {:loose_size_mismatch, byte_size(content), declared}}
+  end
+
+  defp type_atom("blob"), do: {:ok, :blob}
+  defp type_atom("tree"), do: {:ok, :tree}
+  defp type_atom("commit"), do: {:ok, :commit}
+  defp type_atom("tag"), do: {:ok, :tag}
+  defp type_atom(other), do: {:error, {:unknown_object_type, other}}
 
   defp hex?(<<a, b>>) do
     hex_char?(a) and hex_char?(b)
@@ -290,11 +309,35 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
   end
 
   def import_objects(store, raw_objects) do
-    for {type, _sha, content} <- raw_objects do
-      {:ok, obj} = Exgit.Object.decode(type, content)
-      Disk.put_object(store, obj)
-    end
+    failures =
+      Enum.reduce(raw_objects, [], fn {type, sha, content}, errs ->
+        case safe_decode_and_put(store, type, content) do
+          :ok -> errs
+          {:error, reason} -> [{sha, reason} | errs]
+        end
+      end)
 
-    {:ok, store}
+    case failures do
+      [] ->
+        {:ok, store}
+
+      list ->
+        {:error, {:partial_import, Enum.reverse(list)}}
+    end
+  end
+
+  defp safe_decode_and_put(store, type, content) do
+    with {:ok, obj} <- safe_decode(type, content),
+         {:ok, _sha} <- Disk.put_object(store, obj) do
+      :ok
+    end
+  end
+
+  defp safe_decode(type, content) do
+    Exgit.Object.decode(type, content)
+  rescue
+    e -> {:error, {:decode_raised, Exception.message(e)}}
+  catch
+    kind, value -> {:error, {kind, value}}
   end
 end

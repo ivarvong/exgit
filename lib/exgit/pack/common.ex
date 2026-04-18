@@ -48,7 +48,8 @@ defmodule Exgit.Pack.Common do
     end
   end
 
-  @spec decode_type_size_varint(binary()) :: {integer(), integer(), binary()}
+  @spec decode_type_size_varint(binary()) ::
+          {integer(), integer(), binary()} | {:error, :truncated}
   def decode_type_size_varint(<<byte, rest::binary>>) do
     type = Bitwise.band(Bitwise.bsr(byte, 4), 0x07)
     size = Bitwise.band(byte, 0x0F)
@@ -56,10 +57,17 @@ defmodule Exgit.Pack.Common do
     if Bitwise.band(byte, 0x80) == 0 do
       {type, size, rest}
     else
-      {more_size, rest} = decode_varint(rest)
-      {type, Bitwise.bor(size, Bitwise.bsl(more_size, 4)), rest}
+      case decode_varint(rest) do
+        {:error, _} = err ->
+          err
+
+        {more_size, rest} ->
+          {type, Bitwise.bor(size, Bitwise.bsl(more_size, 4)), rest}
+      end
     end
   end
+
+  def decode_type_size_varint(<<>>), do: {:error, :truncated}
 
   @spec encode_varint(non_neg_integer()) :: binary()
   def encode_varint(n) when n < 128, do: <<n>>
@@ -69,7 +77,7 @@ defmodule Exgit.Pack.Common do
       encode_varint(Bitwise.bsr(n, 7))
   end
 
-  @spec decode_varint(binary()) :: {non_neg_integer(), binary()}
+  @spec decode_varint(binary()) :: {non_neg_integer(), binary()} | {:error, :truncated}
   def decode_varint(data), do: decode_varint(data, 0, 0)
 
   defp decode_varint(<<byte, rest::binary>>, acc, shift) do
@@ -81,6 +89,8 @@ defmodule Exgit.Pack.Common do
       decode_varint(rest, value, shift + 7)
     end
   end
+
+  defp decode_varint(<<>>, _acc, _shift), do: {:error, :truncated}
 
   @spec encode_ofs_varint(non_neg_integer()) :: binary()
   def encode_ofs_varint(n) do
@@ -111,7 +121,7 @@ defmodule Exgit.Pack.Common do
     end
   end
 
-  @spec decode_ofs_varint(binary()) :: {non_neg_integer(), binary()}
+  @spec decode_ofs_varint(binary()) :: {non_neg_integer(), binary()} | {:error, :truncated}
   def decode_ofs_varint(<<byte, rest::binary>>) do
     n = Bitwise.band(byte, 0x7F)
 
@@ -122,6 +132,8 @@ defmodule Exgit.Pack.Common do
     end
   end
 
+  def decode_ofs_varint(<<>>), do: {:error, :truncated}
+
   defp decode_ofs_varint_cont(<<byte, rest::binary>>, acc) do
     n = Bitwise.bor(Bitwise.bsl(acc + 1, 7), Bitwise.band(byte, 0x7F))
 
@@ -131,4 +143,6 @@ defmodule Exgit.Pack.Common do
       decode_ofs_varint_cont(rest, n)
     end
   end
+
+  defp decode_ofs_varint_cont(<<>>, _acc), do: {:error, :truncated}
 end

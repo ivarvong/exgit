@@ -44,12 +44,40 @@ defmodule Exgit do
     transport = to_transport(source, opts)
 
     with {:ok, repo} <- init(opts),
-         {:ok, refs} <- Transport.ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]),
+         {:ok, refs} <- safe_ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]),
          {:ok, repo} <- fetch_into(repo, transport, refs, opts),
          {:ok, repo} <- set_head_to_default(repo, refs) do
       {:ok, repo}
     end
   end
+
+  # All ref reads from a transport MUST go through this wrapper. Ref
+  # names from the wire are hostile input; see Exgit.RefName for the
+  # validation rules and `[:exgit, :security, :ref_rejected]` telemetry.
+  defp safe_ls_refs(transport, opts) do
+    case Transport.ls_refs(transport, opts) do
+      {:ok, refs} -> {:ok, Enum.filter(refs, &keep_ref?(&1, transport))}
+      other -> other
+    end
+  end
+
+  defp keep_ref?({ref, _sha}, transport) do
+    if Exgit.RefName.valid?(ref) do
+      true
+    else
+      :telemetry.execute(
+        [:exgit, :security, :ref_rejected],
+        %{count: 1},
+        %{source: describe_transport(transport), ref: ref}
+      )
+
+      false
+    end
+  end
+
+  defp describe_transport(%{url: url}), do: url
+  defp describe_transport(%{path: path}), do: path
+  defp describe_transport(other), do: inspect(other.__struct__)
 
   @doc """
   Lazily clone `source` — fetch refs only, defer all object fetching.
@@ -95,7 +123,7 @@ defmodule Exgit do
         with {:ok, filter_spec} <- resolve_filter(opts),
              :ok <- check_filter_capability(transport, filter_spec, opts),
              {:ok, refs} <-
-               Transport.ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]) do
+               safe_ls_refs(transport, prefix: ["refs/heads/", "refs/tags/"]) do
           promisor =
             ObjectStore.Promisor.new(transport,
               default_fetch_opts: promisor_fetch_opts(filter_spec)
@@ -209,7 +237,7 @@ defmodule Exgit do
     remote_name = Keyword.get(opts, :remote, "origin")
     prefix = Keyword.get(opts, :prefix, ["refs/heads/", "refs/tags/"])
 
-    with {:ok, refs} <- Transport.ls_refs(transport, prefix: prefix) do
+    with {:ok, refs} <- safe_ls_refs(transport, prefix: prefix) do
       fetch_into(repo, transport, refs, Keyword.put(opts, :remote, remote_name))
     end
   end
@@ -242,7 +270,7 @@ defmodule Exgit do
       end
 
     remote_refs =
-      case Transport.ls_refs(transport, prefix: ref_names) do
+      case safe_ls_refs(transport, prefix: ref_names) do
         {:ok, refs} -> Map.new(refs)
         _ -> %{}
       end
