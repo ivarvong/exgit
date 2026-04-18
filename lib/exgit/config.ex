@@ -186,15 +186,16 @@ defmodule Exgit.Config do
         end
 
       sec_key != nil ->
-        # parse_key_value always returns {:ok, _, _} today, but use a
-        # `case` rather than an unconditional pattern match so a
-        # future branch that returns {:error, _} cannot crash the
-        # parser — the moduledoc explicitly promises this function
-        # never raises on untrusted input.
-        case parse_key_value(trimmed) do
-          {:ok, key, value} -> parse_lines(rest, sec_key, [{key, value} | entries], acc)
-          {:error, _} = err -> err
-        end
+        # parse_key_value is total — every binary input returns
+        # `{:ok, key, value}`. If that ever changes (a future branch
+        # adds validation that may fail), this match will fail at
+        # compile-time on 1.19+ due to type inference, so the caller
+        # MUST update this call site alongside the return-shape
+        # change. Do not "future-proof" with a dead `{:error, _}`
+        # clause — Elixir 1.19's type checker rejects unreachable
+        # patterns under --warnings-as-errors.
+        {:ok, key, value} = parse_key_value(trimmed)
+        parse_lines(rest, sec_key, [{key, value} | entries], acc)
 
       true ->
         {:error, {:unexpected_line, trimmed}}

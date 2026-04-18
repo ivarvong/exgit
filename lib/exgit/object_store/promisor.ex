@@ -403,8 +403,13 @@ defmodule Exgit.ObjectStore.Promisor do
         {_key, sha, q2} = :gb_trees.take_smallest(q)
 
         # Drop the commit object from the Memory cache. Track the
-        # byte delta.
-        %ObjectStore.Memory{objects: objs} = p.cache
+        # byte delta. We pattern-match `p.cache` into a
+        # `%ObjectStore.Memory{}` binding first so the subsequent
+        # struct-update is visible to Elixir 1.19's type checker
+        # (a struct update on a field-access expression is rejected
+        # under --warnings-as-errors because the type is dynamic()
+        # at that site).
+        %ObjectStore.Memory{objects: objs} = cache = p.cache
 
         {dropped_bytes, new_objs} =
           case Map.pop(objs, sha) do
@@ -412,7 +417,7 @@ defmodule Exgit.ObjectStore.Promisor do
             {{_type, compressed}, o} -> {byte_size(compressed), o}
           end
 
-        new_cache = %ObjectStore.Memory{p.cache | objects: new_objs}
+        new_cache = %ObjectStore.Memory{cache | objects: new_objs}
 
         %{
           p

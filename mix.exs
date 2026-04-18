@@ -11,14 +11,12 @@ defmodule Exgit.MixProject do
       elixir: "~> 1.17",
       # The library doesn't use any 1.19-only features; pinning the
       # lower bound at 1.17 keeps it installable for older consumers.
+      # CI matrix tests both 1.17 (minimum-supported) and 1.19
+      # (primary + stricter type checks).
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: dialyzer(),
-      preferred_cli_env: [
-        dialyzer: :dev,
-        "bench.run": :test
-      ],
       # Don't consolidate protocols in test so test-only implementations
       # (e.g. fake transports) load without a clean rebuild.
       consolidate_protocols: Mix.env() != :test,
@@ -26,6 +24,18 @@ defmodule Exgit.MixProject do
       package: package(),
       source_url: @source_url,
       docs: docs()
+    ]
+  end
+
+  # Mix CLI configuration. Lives in its own callback (per Mix 1.14+)
+  # rather than in `def project` so that `:preferred_envs` doesn't
+  # trigger a deprecation warning under Mix 1.19.
+  def cli do
+    [
+      preferred_envs: [
+        dialyzer: :dev,
+        "bench.run": :test
+      ]
     ]
   end
 

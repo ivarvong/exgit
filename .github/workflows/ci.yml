@@ -22,10 +22,18 @@ jobs:
         include:
           # Primary target: newest stable Elixir (1.19.x) on newest OTP (28.x).
           # `erlef/setup-beam` resolves "1.19" to the latest 1.19.y.z that has
-          # an OTP-28 build on hex.pm.
+          # an OTP-28 build on hex.pm. Owns the quality gates (format,
+          # credo, dialyzer, integration).
           - elixir: "1.19"
             otp: "28"
             primary: true
+          # Minimum-supported version — matches the `elixir: "~> 1.17"`
+          # constraint in mix.exs. If we ever need a 1.18+ feature,
+          # bump both the constraint and this matrix entry. Compile +
+          # test only; quality gates run once on the primary.
+          - elixir: "1.17"
+            otp: "27"
+            primary: false
 
     env:
       MIX_ENV: test
