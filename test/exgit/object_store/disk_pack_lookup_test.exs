@@ -56,11 +56,17 @@ defmodule Exgit.ObjectStore.DiskPackLookupTest do
       ratio = t_large / max(t_small, 1)
 
       # Constant-time lookup would give ~1.0. Linear scan of pack per
-      # lookup gives ~4.0 (pack 4× bigger). 5.0 catches the
-      # regression we care about while tolerating microsecond
-      # jitter on GitHub runners — a 2.5 threshold tripped on
-      # stable pread code due to noise.
-      assert ratio < 5.0,
+      # lookup gives ~4× (pack 4× bigger). A linear scan that ALSO
+      # re-parses the pack header / index each time gives ~20-40×.
+      #
+      # Threshold at 10.0 catches the regression we actually care
+      # about (re-parsing) while tolerating GitHub Actions runner
+      # jitter — we've observed 7.4× on microsecond-scale baselines
+      # that aren't a regression, just noisy-neighbor scheduling.
+      # If this test starts failing consistently on a specific
+      # hardware class, the ratio likely crept up; investigate
+      # before raising the cutoff further.
+      assert ratio < 10.0,
              "time-per-lookup(#{large})/time-per-lookup(#{small}) = #{Float.round(ratio, 2)} " <>
                "— looks like full-pack re-parsing"
     end
