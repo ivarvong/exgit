@@ -628,6 +628,47 @@ mix run bench/blame_bench.exs                # all fixtures, 3 runs
 mix run bench/blame_bench.exs 5 claude_sdk   # 5 runs, claude_sdk
 ```
 
+### End-to-end agent session latency
+
+The meaningful number for "does this library deliver the agent
+experience the features are supposed to unlock": wall-clock of
+a complete investigation session using the Round 1 + Round 2
+primitives.
+
+Workload (see `bench/agent_session_bench.exs`):
+
+1. `multi_grep` for 3 patterns (50 total hits capped)
+2. For 5 unique-file hits: `grep(context: 3)` on that file
+3. For 2 hits: `Blame.blame(path)` — authorship check
+4. For 1 hit: `read_lines(path, N-10..N+10)` — wider context
+
+Warm-session median (3 runs):
+
+| Fixture | Total | multi_grep | grep+context | blame | read_lines |
+|---|---:|---:|---:|---:|---:|
+| `anthropics/claude-agent-sdk-python` | **483 ms** | 1.5 ms | 393 µs | 481 ms | 90 µs |
+| `cloudflare/agents` | **233 ms** | 17.6 ms | 9.5 ms | 206 ms | 76 µs |
+
+Both fixtures deliver sub-second warm-session latency for a
+realistic agent investigation workflow. **Blame is the dominant
+cost** (2 blame operations take ~98% of the time on
+claude-sdk, ~88% on agents). If blame latency is the workload's
+bottleneck, Myers diff as discussed above would reduce it.
+
+The combined Round 1 + Round 2 features bring an agent's
+"investigate this codebase" loop into interactive territory
+(sub-second). Pre-Round-1, the same workflow would require a
+grep + N `read_path` calls + client-side line slicing per hit
+(see grep+context benchmark above showing 5-7× speedup from
+that alone) plus no blame capability at all.
+
+Invocation:
+
+```
+mix run bench/agent_session_bench.exs                # both fixtures, 3 runs
+mix run bench/agent_session_bench.exs 5 claude_sdk   # 5 runs, claude_sdk
+```
+
 ## Known caveats
 
 - `transport.fetch` is dominated by GitHub's side + HTTPS setup +
