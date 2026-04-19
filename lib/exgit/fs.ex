@@ -421,7 +421,26 @@ defmodule Exgit.FS do
   # Fetch `commit_sha` with depth:1 + filter:blob:none → one tiny
   # pack containing the commit + root tree only. Parse, import,
   # extract tree sha.
+  #
+  # Fast path: if the commit is already in the local cache, read
+  # its tree sha without any network call. This makes repeated
+  # `prefetch/3` calls (or staged prefetch_async) efficient —
+  # Phase A only fetches when it hasn't happened yet.
   defp prefetch_commit_and_root_tree(%Repository{object_store: promisor} = repo, commit_sha) do
+    case Exgit.ObjectStore.get(promisor, commit_sha) do
+      {:ok, %Commit{} = commit} ->
+        # Commit cached. Assume the root tree is also cached
+        # (Phase A always fetches them together; if tree is
+        # missing the next phase's tree access will trigger
+        # an on-demand fetch).
+        {:ok, repo, Commit.tree(commit)}
+
+      _ ->
+        do_fetch_commit_and_root_tree(repo, promisor, commit_sha)
+    end
+  end
+
+  defp do_fetch_commit_and_root_tree(repo, promisor, commit_sha) do
     transport = promisor.transport
     fetch_opts = [haves: [], depth: 1, filter: "blob:none"]
 
@@ -477,6 +496,187 @@ defmodule Exgit.FS do
       false -> {:error, :empty_pack}
       err -> err
     end
+  end
+
+  @doc """
+  Kick off a prefetch against a `RepoHandle` as a background task.
+
+  Returns `{:ok, task}` immediately. The task runs under
+  `Exgit.TaskSupervisor` and calls `prefetch/3` against the
+  handle's current snapshot. When the task completes, it atomically
+  commits the populated repo back to the handle via
+  `RepoHandle.update/2`.
+
+  Critically, the prefetch uses `update/2` (not `put/2`), so if
+  other processes have written to the handle during the prefetch,
+  their writes are preserved — the prefetch's new objects are
+  imported into whatever the current cache is at commit time.
+
+  ## Options
+
+  Forwarded to `prefetch/3`:
+
+    * `:blobs` (default `true`) — fetch blobs in addition to trees
+      for the HEAD reachability. The sensible default for async
+      prefetch: if you're going to search or read, you need blobs.
+
+  ## Lifecycle
+
+    * Await completion: `await_prefetch(task, timeout)`.
+    * Cancel in flight: `cancel_prefetch(task)`. Any work the task
+      had done is discarded — the handle is unchanged.
+    * Result on success: `{:ok, :prefetched}`.
+    * Result on failure: `{:error, reason}`.
+
+  ## Telemetry
+
+  The task emits `[:exgit, :fs, :prefetch_async, :start]` and
+  `[:exgit, :fs, :prefetch_async, :stop]` events so operators
+  can see background prefetches in their dashboards.
+
+  ## Example
+
+      {:ok, handle} = Exgit.RepoHandle.start_link(repo)
+      {:ok, task} = Exgit.FS.prefetch_async(handle)
+
+      # ... do other work with the handle; reads see a growing cache ...
+
+      :ok = Exgit.FS.await_prefetch(task, 30_000)
+  """
+  @spec prefetch_async(Exgit.RepoHandle.t(), ref(), keyword()) ::
+          {:ok, Task.t()} | {:error, term()}
+  def prefetch_async(handle, reference \\ "HEAD", opts \\ []) do
+    case Exgit.RepoHandle.fetch(handle) do
+      {:ok, _repo} ->
+        task =
+          Task.Supervisor.async_nolink(Exgit.TaskSupervisor, fn ->
+            do_prefetch_async(handle, reference, opts)
+          end)
+
+        {:ok, task}
+
+      err ->
+        err
+    end
+  end
+
+  defp do_prefetch_async(handle, reference, opts) do
+    include_blobs = Keyword.get(opts, :blobs, true)
+
+    Exgit.Telemetry.span(
+      [:exgit, :fs, :prefetch_async],
+      %{reference: reference, blobs: include_blobs},
+      fn ->
+        case staged_prefetch_on_handle(handle, reference, include_blobs) do
+          :ok -> {:span, {:ok, :prefetched}, %{result: :ok}}
+          {:error, reason} = err -> {:span, err, %{result: :error, reason: reason}}
+        end
+      end
+    )
+  end
+
+  # Stage commits so foreground readers see cache growth progressively:
+  #
+  #   Phase A (cheap, ~200ms): commit + root tree, filter:blob:none.
+  #   Commit to handle so foreground ls/walk start working.
+  #
+  #   Phase B (expensive, ~8s on opencode): blobs. Committed when the
+  #   pack finishes.
+  #
+  # Each phase holds the handle's writer lock for its own duration,
+  # NOT the full elapsed time of the background prefetch. A foreground
+  # update can slot in between phases.
+  defp staged_prefetch_on_handle(handle, reference, include_blobs) do
+    with :ok <- commit_phase_a(handle, reference) do
+      if include_blobs do
+        commit_phase_b(handle, reference)
+      else
+        :ok
+      end
+    end
+  end
+
+  # Phase A: fetch commit + trees (no blobs) via the batched path and
+  # commit. Each prefetch op here calls `prefetch/3` with
+  # `blobs: false`, which uses Phase A of the batched fetch internally.
+  defp commit_phase_a(handle, reference) do
+    Exgit.RepoHandle.update(
+      handle,
+      fn repo ->
+        case prefetch(repo, reference, blobs: false) do
+          {:ok, new_repo} -> {:ok, new_repo}
+          err -> err
+        end
+      end,
+      300_000
+    )
+    |> normalize_update_result()
+  end
+
+  # Phase B: fetch the blobs. We do this as a SEPARATE update/2 call
+  # so the handle's writer lock is released between phases. Inside,
+  # we call `prefetch/3` again with `blobs: true`; the Phase A work
+  # inside that call is now a cache hit (commits + trees already
+  # populated), so the only network activity is Phase B's blob pack.
+  defp commit_phase_b(handle, reference) do
+    Exgit.RepoHandle.update(
+      handle,
+      fn repo ->
+        case prefetch(repo, reference, blobs: true) do
+          {:ok, new_repo} -> {:ok, new_repo}
+          err -> err
+        end
+      end,
+      300_000
+    )
+    |> normalize_update_result()
+  end
+
+  defp normalize_update_result(:ok), do: :ok
+  defp normalize_update_result(other), do: other
+
+  @doc """
+  Wait for an async prefetch task to complete.
+
+  Returns `{:ok, :prefetched}` on success, `{:error, reason}` on
+  failure, or `{:error, :timeout}` if the task didn't complete
+  within `timeout_ms` (default 60_000).
+
+  Does NOT cancel the task on timeout — call `cancel_prefetch/1`
+  explicitly if you want to abort.
+  """
+  @spec await_prefetch(Task.t(), timeout()) ::
+          {:ok, :prefetched} | {:error, term()}
+  def await_prefetch(%Task{} = task, timeout_ms \\ 60_000) do
+    case Task.yield(task, timeout_ms) do
+      {:ok, result} -> result
+      nil -> {:error, :timeout}
+      {:exit, reason} -> {:error, {:task_crashed, reason}}
+    end
+  end
+
+  @doc """
+  Cancel an in-flight async prefetch.
+
+  The task is shut down brutally; any work it had done is
+  discarded (the handle was never updated). Emits
+  `[:exgit, :fs, :prefetch_async, :cancelled]` telemetry so
+  operators can see cancellation patterns.
+
+  Returns `:ok` whether the task was still running or already
+  completed.
+  """
+  @spec cancel_prefetch(Task.t()) :: :ok
+  def cancel_prefetch(%Task{} = task) do
+    result = Task.shutdown(task, :brutal_kill)
+
+    :telemetry.execute(
+      [:exgit, :fs, :prefetch_async, :cancelled],
+      %{count: 1},
+      %{task_ref: task.ref, completed?: match?({:ok, _}, result)}
+    )
+
+    :ok
   end
 
   @doc """

@@ -164,6 +164,7 @@ defmodule Exgit.Telemetry do
       [:exgit, :fs, :stat],
       [:exgit, :fs, :walk],
       [:exgit, :fs, :grep],
+      [:exgit, :fs, :prefetch_async],
       [:exgit, :blame, :auto_fetch]
     ]
   end
@@ -183,7 +184,8 @@ defmodule Exgit.Telemetry do
   @spec emit_events() :: [[atom()]]
   def emit_events do
     [
-      [:exgit, :fs, :prefetch, :fallback]
+      [:exgit, :fs, :prefetch, :fallback],
+      [:exgit, :fs, :prefetch_async, :cancelled]
     ]
   end
 
