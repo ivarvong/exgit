@@ -191,6 +191,113 @@ defmodule Exgit.RepoHandleTest do
     end
   end
 
+  describe "fetch_once/3 dedup" do
+    test "serializes concurrent fetches for the same key", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      # Shared counter: how many times did the fetch fn actually run?
+      counter = :counters.new(1, [])
+
+      fetch_fn = fn repo ->
+        :counters.add(counter, 1, 1)
+        # Simulate a slow fetch.
+        Process.sleep(100)
+
+        {:ok, _sha, new_store} =
+          Exgit.ObjectStore.put(repo.object_store, Exgit.Object.Blob.new("fetched\n"))
+
+        {:ok, %{repo | object_store: new_store}}
+      end
+
+      # 5 concurrent callers with the SAME key.
+      tasks =
+        for _ <- 1..5 do
+          Task.async(fn -> RepoHandle.fetch_once(handle, :my_key, fetch_fn) end)
+        end
+
+      results = Task.await_many(tasks, 5_000)
+
+      # All 5 should get the same return value.
+      assert length(Enum.uniq(results)) == 1
+
+      # But fetch_fn should have been called only ONCE.
+      assert :counters.get(counter, 1) == 1
+
+      RepoHandle.stop(handle)
+    end
+
+    test "different keys trigger independent fetches", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      counter = :counters.new(1, [])
+
+      fetch_fn = fn repo ->
+        :counters.add(counter, 1, 1)
+        {:ok, repo}
+      end
+
+      # 3 different keys → 3 fetches.
+      for k <- [:a, :b, :c] do
+        {:ok, _} = RepoHandle.fetch_once(handle, k, fetch_fn)
+      end
+
+      assert :counters.get(counter, 1) == 3
+
+      RepoHandle.stop(handle)
+    end
+
+    test "fetch fn returning :error propagates to all waiters", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      fetch_fn = fn _repo ->
+        Process.sleep(50)
+        {:error, :transport_exploded}
+      end
+
+      tasks =
+        for _ <- 1..3 do
+          Task.async(fn -> RepoHandle.fetch_once(handle, :err_key, fetch_fn) end)
+        end
+
+      results = Task.await_many(tasks, 2_000)
+
+      # All 3 get the same error.
+      assert Enum.all?(results, &match?({:error, :transport_exploded}, &1))
+
+      RepoHandle.stop(handle)
+    end
+
+    test "handle stays responsive to reads during a slow fetch", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      slow_fetch = fn repo ->
+        Process.sleep(200)
+        {:ok, repo}
+      end
+
+      fetch_task =
+        Task.async(fn -> RepoHandle.fetch_once(handle, :slow, slow_fetch) end)
+
+      # While the fetch is in flight, reads should still be fast.
+      :timer.sleep(20)
+
+      start = System.monotonic_time()
+
+      for _ <- 1..100 do
+        _ = RepoHandle.get(handle)
+      end
+
+      us =
+        System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond)
+
+      assert us < 20_000,
+             "reads blocked during fetch_once (#{us}µs) — should be non-blocking"
+
+      Task.await(fetch_task)
+      RepoHandle.stop(handle)
+    end
+  end
+
   describe "read performance" do
     test "get/1 does not send a message to the handle", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)

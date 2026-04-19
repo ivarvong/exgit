@@ -101,7 +101,15 @@ defmodule Exgit.Blame do
       predictable no-network behavior — they should call
       `FS.prefetch_history/2` explicitly beforehand.
 
-  Regardless of the flag, every auto-fetch emits
+    * `:on_handle` — pass a `RepoHandle` pid. When set, auto-fetches
+      route through `RepoHandle.fetch_once/4`, which deduplicates
+      concurrent callers: N concurrent blames on the same file
+      trigger ONE history fetch and ONE path-blob fetch instead of
+      N of each. Without this option, each blame sees its own
+      snapshot of the repo and triggers its own fetches —
+      wasteful for shared-cache scenarios (LiveView, agent pools).
+
+  Regardless of the flags, every auto-fetch emits
   `[:exgit, :blame, :auto_fetch, :start]` and
   `[:exgit, :blame, :auto_fetch, :stop]` telemetry events so
   silent slowness is visible to operators.
@@ -110,10 +118,12 @@ defmodule Exgit.Blame do
           {:ok, [entry()], Repository.t()} | {:error, term()}
   def blame(%Repository{} = repo, reference, path, opts \\ []) do
     auto_fetch? = Keyword.get(opts, :auto_fetch, true)
+    on_handle = Keyword.get(opts, :on_handle)
 
     with {:ok, commit_sha} <- resolve_commit(repo, reference),
-         {:ok, repo} <- maybe_ensure_history(repo, commit_sha, auto_fetch?),
-         {:ok, repo} <- maybe_ensure_path_blobs(repo, commit_sha, path, auto_fetch?),
+         {:ok, repo} <- maybe_ensure_history(repo, commit_sha, auto_fetch?, on_handle),
+         {:ok, repo} <-
+           maybe_ensure_path_blobs(repo, commit_sha, path, auto_fetch?, on_handle),
          {:ok, target_lines} <- read_file_at_commit(repo, commit_sha, path) do
       # `pending` maps ORIGINAL target-file line index to the
       # current-commit's line index. Starts as identity (each line
@@ -134,16 +144,36 @@ defmodule Exgit.Blame do
     end
   end
 
-  defp maybe_ensure_history(repo, _commit_sha, false), do: {:ok, repo}
+  defp maybe_ensure_history(repo, _commit_sha, false, _on_handle), do: {:ok, repo}
 
-  defp maybe_ensure_history(repo, commit_sha, true) do
+  defp maybe_ensure_history(repo, commit_sha, true, nil) do
     ensure_history_available(repo, commit_sha)
   end
 
-  defp maybe_ensure_path_blobs(repo, _commit_sha, _path, false), do: {:ok, repo}
+  defp maybe_ensure_history(_repo, commit_sha, true, handle) do
+    # Route through the handle so concurrent blames dedup. fetch_once
+    # returns the latest repo snapshot (either freshly-fetched or
+    # the one the in-flight fetch produced). We return that snapshot
+    # so the rest of the blame walk sees the populated cache.
+    Exgit.RepoHandle.fetch_once(
+      handle,
+      {:blame_history, commit_sha},
+      fn current_repo -> ensure_history_available(current_repo, commit_sha) end
+    )
+  end
 
-  defp maybe_ensure_path_blobs(repo, commit_sha, path, true) do
+  defp maybe_ensure_path_blobs(repo, _commit_sha, _path, false, _on_handle), do: {:ok, repo}
+
+  defp maybe_ensure_path_blobs(repo, commit_sha, path, true, nil) do
     ensure_path_blobs_available(repo, commit_sha, path)
+  end
+
+  defp maybe_ensure_path_blobs(_repo, commit_sha, path, true, handle) do
+    Exgit.RepoHandle.fetch_once(
+      handle,
+      {:blame_path_blobs, commit_sha, path},
+      fn current_repo -> ensure_path_blobs_available(current_repo, commit_sha, path) end
+    )
   end
 
   # For Promisor-backed repos, blame needs the commit graph to walk
@@ -236,6 +266,8 @@ defmodule Exgit.Blame do
     end
   end
 
+  defp ensure_path_blobs_available(repo, _commit_sha, _path), do: {:ok, repo}
+
   # Batched historical-blob fetch with telemetry. See
   # `fetch_history_with_telemetry/2` for why the span wrapping
   # matters.
@@ -254,8 +286,6 @@ defmodule Exgit.Blame do
       end
     )
   end
-
-  defp ensure_path_blobs_available(repo, _commit_sha, _path), do: {:ok, repo}
 
   # Walk the first-parent chain, accumulating the blob sha of `path`
   # at each commit. Stops when we hit a commit where the path doesn't

@@ -184,6 +184,49 @@ defmodule Exgit.RepoHandle do
   end
 
   @doc """
+  Run `fetch_fn` against the current repo, deduplicating concurrent
+  callers with the same `key`.
+
+  The canonical shape: multiple processes want to trigger the same
+  expensive network fetch (e.g. prefetch commit history for blame).
+  Without dedup, each caller fires its own identical network call
+  — wasteful.
+
+  With `fetch_once/3`:
+
+    * First caller for `key` runs `fetch_fn(current_repo)` OUTSIDE
+      the handle (in a linked Task) so the handle stays responsive
+      to other reads.
+    * Subsequent concurrent callers with the same `key` do NOT
+      re-run the fetch; they block waiting for the first caller's
+      result.
+    * Task completes → result commits to the handle's ETS, all
+      waiters receive the same return value.
+
+  `fetch_fn` receives the current repo snapshot and must return
+  `{:ok, new_repo}` or `{:error, reason}`.
+
+  ## Example
+
+      # Three LV users trigger blame on the same file at once.
+      # Each tries to prefetch history. fetch_once ensures only ONE
+      # network fetch happens; the other two wait.
+      RepoHandle.fetch_once(handle, {:history, commit_sha}, fn repo ->
+        Exgit.FS.prefetch_history(repo, "HEAD")
+      end)
+
+  ## Errors
+
+  `{:error, :dead_handle}` if the handle isn't running. Propagates
+  `fetch_fn`'s errors verbatim.
+  """
+  @spec fetch_once(t(), term(), (Repository.t() -> {:ok, Repository.t()} | {:error, term()})) ::
+          {:ok, Repository.t()} | {:error, term()}
+  def fetch_once(handle, key, fetch_fn, timeout \\ 300_000) when is_function(fetch_fn, 1) do
+    GenServer.call(handle, {:fetch_once, key, fetch_fn}, timeout)
+  end
+
+  @doc """
   Get the ETS table reference for a handle. Exposed so very
   latency-sensitive callers can cache it across many reads.
   """
@@ -216,7 +259,12 @@ defmodule Exgit.RepoHandle do
     ])
 
     true = :ets.insert(table, {:repo, repo})
-    {:ok, %{table: table}}
+
+    # `in_flight`: %{key => %{task_ref: ref, waiters: [from, ...]}}
+    # Entries are created when the first fetch_once for a key
+    # arrives; removed when the task completes and all waiters
+    # have been replied to.
+    {:ok, %{table: table, in_flight: %{}}}
   end
 
   @impl true
@@ -243,6 +291,67 @@ defmodule Exgit.RepoHandle do
   def handle_call({:put, new_repo}, _from, %{table: table} = state) do
     true = :ets.insert(table, {:repo, new_repo})
     {:reply, :ok, state}
+  end
+
+  def handle_call({:fetch_once, key, fetch_fn}, from, state) do
+    case Map.get(state.in_flight, key) do
+      nil ->
+        # No pending fetch. Spawn a task to run the fetch outside
+        # the GenServer so we stay responsive to other reads /
+        # updates. We'll reply to `from` (and any waiters that
+        # register before the task finishes) when it completes.
+        handle_pid = self()
+
+        _ =
+          Task.Supervisor.start_child(Exgit.TaskSupervisor, fn ->
+            [{:repo, repo}] = :ets.lookup(state.table, :repo)
+            result = safe_fetch(fetch_fn, repo)
+            send(handle_pid, {:fetch_once_done, key, result})
+          end)
+
+        entry = %{waiters: [from]}
+        {:noreply, %{state | in_flight: Map.put(state.in_flight, key, entry)}}
+
+      %{waiters: waiters} = entry ->
+        # Already in-flight for this key. Add to waiters.
+        new_entry = %{entry | waiters: [from | waiters]}
+        {:noreply, %{state | in_flight: Map.put(state.in_flight, key, new_entry)}}
+    end
+  end
+
+  @impl true
+  def handle_info({:fetch_once_done, key, result}, state) do
+    case Map.pop(state.in_flight, key) do
+      {nil, _state} ->
+        # Shouldn't happen — we removed the entry out from under
+        # ourselves somehow. Log and continue.
+        {:noreply, state}
+
+      {%{waiters: waiters}, remaining} ->
+        # Commit the result to ETS if it succeeded, then reply to
+        # all waiters with the same return value.
+        reply_value =
+          case result do
+            {:ok, %Repository{} = new_repo} ->
+              true = :ets.insert(state.table, {:repo, new_repo})
+              {:ok, new_repo}
+
+            other ->
+              other
+          end
+
+        for from <- Enum.reverse(waiters) do
+          GenServer.reply(from, reply_value)
+        end
+
+        {:noreply, %{state | in_flight: remaining}}
+    end
+  end
+
+  defp safe_fetch(fun, repo) do
+    fun.(repo)
+  rescue
+    e -> {:error, {:fetch_fn_raised, e, __STACKTRACE__}}
   end
 
   @impl true
