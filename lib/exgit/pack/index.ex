@@ -220,26 +220,33 @@ defmodule Exgit.Pack.Index do
   defp safe_range(0), do: []
   defp safe_range(n) when n > 0, do: 0..(n - 1)
 
-  defp extract_large_offsets(offsets, total, rest) do
-    has_large =
-      Enum.any?(safe_range(total), fn i ->
-        raw = :binary.decode_unsigned(binary_part(offsets, i * 4, 4))
-        Bitwise.band(raw, 0x80000000) != 0
-      end)
+  # Count the large-offset entries (top bit set) in the 32-bit
+  # offsets table. Previously this function scanned the table twice:
+  # once with `Enum.any?` to detect presence, then again with
+  # `Enum.count` to get the count. One pass with binary pattern-
+  # matching is both shorter and avoids per-iteration `binary_part`
+  # allocations. `total` is redundant (the offsets binary is sized
+  # `total * 4`) but kept in the signature for call-site symmetry;
+  # we assert the relationship as a defense against a malformed
+  # header slicing the offsets table wrong.
+  defp extract_large_offsets(offsets, total, rest)
+       when byte_size(offsets) == total * 4 do
+    case count_large_offsets(offsets, 0) do
+      0 ->
+        {<<>>, rest}
 
-    if has_large do
-      # Count large offsets needed
-      large_count =
-        Enum.count(safe_range(total), fn i ->
-          raw = :binary.decode_unsigned(binary_part(offsets, i * 4, 4))
-          Bitwise.band(raw, 0x80000000) != 0
-        end)
-
-      large_size = large_count * 8
-      <<large::binary-size(large_size), rest::binary>> = rest
-      {large, rest}
-    else
-      {<<>>, rest}
+      large_count ->
+        large_size = large_count * 8
+        <<large::binary-size(large_size), rest::binary>> = rest
+        {large, rest}
     end
   end
+
+  defp count_large_offsets(<<>>, acc), do: acc
+
+  defp count_large_offsets(<<1::1, _::31, tail::binary>>, acc),
+    do: count_large_offsets(tail, acc + 1)
+
+  defp count_large_offsets(<<0::1, _::31, tail::binary>>, acc),
+    do: count_large_offsets(tail, acc)
 end
