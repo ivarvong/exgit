@@ -301,12 +301,43 @@ defmodule Exgit.FS do
           required(:path) => String.t(),
           required(:line_number) => pos_integer(),
           required(:line) => String.t(),
-          required(:match) => String.t()
+          required(:match) => String.t(),
+          optional(:context_before) => [{pos_integer(), String.t()}],
+          optional(:context_after) => [{pos_integer(), String.t()}]
         }
 
   @doc """
   Stream grep over the blobs reachable from `reference`. Streaming; does
   not grow the cache.
+
+  ## Options
+
+    * `:path` — glob restricting which paths are searched. Default `"**"`.
+    * `:max_count` — stop after N matches (across all files). Default
+      unlimited.
+    * `:include_binary` — include binary blobs. Default `false`; binary
+      detection is a NUL-byte heuristic on the first 8 KB.
+    * `:case_insensitive` — `"i"` regex flag. Default `false`.
+    * `:max_concurrency` — parallel worker count. Default `1`.
+
+  ### Context
+
+    * `:context` — symmetric context, N lines before + after each match.
+      Sets `:before` and `:after` to the same value.
+    * `:before` — lines of context BEFORE each match.
+    * `:after` — lines of context AFTER each match.
+
+  When any of `:context`, `:before`, or `:after` is positive, result
+  rows gain `:context_before` and `:context_after` fields, each a list
+  of `{line_number, line}` tuples. Lists may be empty when a match is
+  near the start or end of a file. When no context is requested, those
+  fields are absent from the returned map — existing callers pattern-
+  matching `%{path: _, line_number: _, line: _, match: _}` continue to
+  work.
+
+  When two matches in the same file are closer than `before + after`
+  lines, their context ranges overlap. Each match emits its own
+  independent row; the consumer may deduplicate by line number.
   """
   @spec grep(Repository.t(), ref(), String.t() | Regex.t(), keyword()) :: Enumerable.t()
   def grep(%Repository{} = repo, reference, pattern, opts \\ []) do
@@ -316,6 +347,7 @@ defmodule Exgit.FS do
     path_regex = compile_glob(path_glob)
     max_count = Keyword.get(opts, :max_count)
     include_binary = Keyword.get(opts, :include_binary, false)
+    context = parse_context_opts(opts)
 
     # Parallelism knob. Defaults to `1` (sequential). In-memory
     # grep over compressed blobs is CPU-light: regex scan against
@@ -363,7 +395,7 @@ defmodule Exgit.FS do
           :counters.add(bytes_counter, 1, byte_size(data))
 
           if include_binary or not binary_content?(data) do
-            matches = matches_in(path, data, regex)
+            matches = matches_in(path, data, regex, context)
             :counters.add(match_counter, 1, length(matches))
             matches
           else
@@ -748,7 +780,7 @@ defmodule Exgit.FS do
   #
   # The returned shape matches what callers expect:
   # `%{path, line_number, line, match}`.
-  defp matches_in(path, data, regex) do
+  defp matches_in(path, data, regex, context) do
     case Regex.scan(regex, data, return: :index, capture: :first) do
       [] ->
         []
@@ -759,14 +791,96 @@ defmodule Exgit.FS do
         # significantly faster than `String.split/2` with a regex
         # when we only need offsets.
         newline_positions = newline_offsets(data)
+        total_lines = count_lines(data, newline_positions)
 
         for [{pos, len}] <- matches do
           line_number = line_at(newline_positions, pos)
           line_text = line_contents(data, newline_positions, line_number)
           matched = binary_part(data, pos, len)
 
-          %{path: path, line_number: line_number, line: line_text, match: matched}
+          base = %{path: path, line_number: line_number, line: line_text, match: matched}
+
+          case context do
+            {0, 0} ->
+              base
+
+            {before_n, after_n} ->
+              Map.merge(base, %{
+                context_before:
+                  context_range(data, newline_positions, line_number, -before_n, -1),
+                context_after:
+                  context_range(
+                    data,
+                    newline_positions,
+                    line_number,
+                    1,
+                    after_n,
+                    total_lines
+                  )
+              })
+          end
         end
+    end
+  end
+
+  # Build a list of {line_number, line} tuples for lines offset by
+  # `first_delta..last_delta` from `anchor`, clamped to [1, ∞). The
+  # 6-arity variant additionally clamps to total_lines on the top
+  # end. Used for context_before (no top clamp needed; negative
+  # deltas can never exceed total_lines) and context_after (top
+  # clamp required).
+  defp context_range(data, newlines, anchor, first_delta, last_delta) do
+    for delta <- first_delta..last_delta//1,
+        ln = anchor + delta,
+        ln >= 1 do
+      {ln, line_contents(data, newlines, ln)}
+    end
+  end
+
+  defp context_range(data, newlines, anchor, first_delta, last_delta, total_lines) do
+    for delta <- first_delta..last_delta//1,
+        ln = anchor + delta,
+        ln >= 1 and ln <= total_lines do
+      {ln, line_contents(data, newlines, ln)}
+    end
+  end
+
+  # Extract :context / :before / :after from opts into a normalized
+  # {before_lines, after_lines} tuple. `:context` sets both;
+  # `:before`/`:after` override individually. Negative or invalid
+  # values are treated as 0.
+  defp parse_context_opts(opts) do
+    c = opts |> Keyword.get(:context, 0) |> max_nonneg()
+    b = opts |> Keyword.get(:before, c) |> max_nonneg()
+    a = opts |> Keyword.get(:after, c) |> max_nonneg()
+    {b, a}
+  end
+
+  defp max_nonneg(n) when is_integer(n) and n > 0, do: n
+  defp max_nonneg(_), do: 0
+
+  # Number of lines in `data` matching git's convention: lines are
+  # delimited by \n, a trailing \n does NOT create a phantom empty
+  # line, and a file lacking a trailing \n still has the partial
+  # last line counted.
+  #
+  #   ""                 -> 0 lines
+  #   "a"                -> 1 line  (no trailing \n)
+  #   "a\n"              -> 1 line  (trailing \n swallowed)
+  #   "a\nb"             -> 2 lines
+  #   "a\nb\n"           -> 2 lines
+  #   "\n"               -> 1 line  (one empty line)
+  defp count_lines(<<>>, _newlines), do: 0
+
+  defp count_lines(data, newlines) do
+    # `newlines` = [-1 | actual_newline_offsets]. Strip the sentinel
+    # to count real newlines.
+    real_nls = length(newlines) - 1
+
+    if :binary.last(data) == ?\n do
+      real_nls
+    else
+      real_nls + 1
     end
   end
 

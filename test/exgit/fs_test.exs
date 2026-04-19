@@ -471,6 +471,173 @@ defmodule Exgit.FsTest do
     end
   end
 
+  describe "grep/4 with context" do
+    # Dedicated fixture with rich, multi-line content so context
+    # ranges actually have content to slice. Also exercises
+    # start-of-file, end-of-file, and mid-file match positions.
+    setup do
+      store = ObjectStore.Memory.new()
+
+      a_ex = """
+      defmodule A do
+        @moduledoc "first"
+        def one, do: 1
+        def two, do: 2
+        def target, do: :hit
+        def four, do: 4
+        def five, do: 5
+      end
+      """
+
+      b_ex = """
+      defmodule B do
+        def first, do: "first target"
+        def middle, do: :ok
+        def last, do: "last target"
+      end
+      """
+
+      c_ex = "target\nonly one line after\n"
+
+      {:ok, a_sha, store} = ObjectStore.put(store, Blob.new(a_ex))
+      {:ok, b_sha, store} = ObjectStore.put(store, Blob.new(b_ex))
+      {:ok, c_sha, store} = ObjectStore.put(store, Blob.new(c_ex))
+
+      tree =
+        Tree.new([
+          {"100644", "a.ex", a_sha},
+          {"100644", "b.ex", b_sha},
+          {"100644", "c.ex", c_sha}
+        ])
+
+      {:ok, tree_sha, store} = ObjectStore.put(store, tree)
+
+      commit =
+        Commit.new(
+          tree: tree_sha,
+          parents: [],
+          author: "T <t@t> 1700000000 +0000",
+          committer: "T <t@t> 1700000000 +0000",
+          message: "ctx fixture\n"
+        )
+
+      {:ok, commit_sha, store} = ObjectStore.put(store, commit)
+
+      {:ok, rs} = RefStore.write(RefStore.Memory.new(), "refs/heads/main", commit_sha, [])
+      {:ok, rs} = RefStore.write(rs, "HEAD", {:symbolic, "refs/heads/main"}, [])
+
+      repo = %Exgit.Repository{
+        object_store: store,
+        ref_store: rs,
+        config: Exgit.Config.new(),
+        path: nil
+      }
+
+      {:ok, repo: repo}
+    end
+
+    test "no context option returns unchanged shape", %{repo: repo} do
+      [match] = Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex") |> Enum.to_list()
+      refute Map.has_key?(match, :context_before)
+      refute Map.has_key?(match, :context_after)
+    end
+
+    test ":context 2 yields 2 lines before + 2 after for a mid-file match", %{repo: repo} do
+      [match] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex", context: 2) |> Enum.to_list()
+
+      assert match.line_number == 5
+
+      assert match.context_before == [
+               {3, "  def one, do: 1"},
+               {4, "  def two, do: 2"}
+             ]
+
+      assert match.context_after == [
+               {6, "  def four, do: 4"},
+               {7, "  def five, do: 5"}
+             ]
+    end
+
+    test ":before and :after can be set independently", %{repo: repo} do
+      [match] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex", before: 1, after: 3)
+        |> Enum.to_list()
+
+      assert match.context_before == [{4, "  def two, do: 2"}]
+
+      assert match.context_after == [
+               {6, "  def four, do: 4"},
+               {7, "  def five, do: 5"},
+               {8, "end"}
+             ]
+    end
+
+    test "context clamps at start-of-file", %{repo: repo} do
+      # In c.ex, "target" is on line 1 → no lines before.
+      [match] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "c.ex", context: 3) |> Enum.to_list()
+
+      assert match.line_number == 1
+      assert match.context_before == []
+      assert match.context_after == [{2, "only one line after"}]
+    end
+
+    test "context clamps at end-of-file", %{repo: repo} do
+      # Last line of b.ex (line 5) is "end"; "last target" is line 4.
+      [match] =
+        Exgit.FS.grep(repo, "HEAD", "last target", path: "b.ex", context: 5)
+        |> Enum.to_list()
+
+      assert match.line_number == 4
+      # Only one line after ("end"), though we asked for 5.
+      assert match.context_after == [{5, "end"}]
+    end
+
+    test "multiple matches in one file each get their own context", %{repo: repo} do
+      # b.ex has "target" on lines 2 and 4.
+      matches =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "b.ex", context: 1)
+        |> Enum.to_list()
+
+      assert length(matches) == 2
+
+      [m2, m4] = Enum.sort_by(matches, & &1.line_number)
+
+      assert m2.line_number == 2
+      assert m2.context_before == [{1, "defmodule B do"}]
+      assert m2.context_after == [{3, "  def middle, do: :ok"}]
+
+      assert m4.line_number == 4
+      assert m4.context_before == [{3, "  def middle, do: :ok"}]
+      assert m4.context_after == [{5, "end"}]
+    end
+
+    test ":before alone adds only the before field", %{repo: repo} do
+      [match] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex", before: 2) |> Enum.to_list()
+
+      assert match.context_before == [
+               {3, "  def one, do: 1"},
+               {4, "  def two, do: 2"}
+             ]
+
+      assert match.context_after == []
+    end
+
+    test "negative or zero values for :context don't add fields", %{repo: repo} do
+      [match_zero] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex", context: 0) |> Enum.to_list()
+
+      refute Map.has_key?(match_zero, :context_before)
+
+      [match_neg] =
+        Exgit.FS.grep(repo, "HEAD", "target", path: "a.ex", context: -1) |> Enum.to_list()
+
+      refute Map.has_key?(match_neg, :context_before)
+    end
+  end
+
   describe "write_path/4" do
     test "writes a new file, returns {new_tree_sha, updated_repo}", %{repo: repo} do
       assert {:ok, new_tree_sha, repo2} =
