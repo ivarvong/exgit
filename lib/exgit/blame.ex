@@ -256,7 +256,11 @@ defmodule Exgit.Blame do
   # but scoped to a specific path's blob history.
   #
   # Non-Promisor stores: no-op.
-  defp ensure_path_blobs_available(%Repository{object_store: %Promisor{}} = repo, commit_sha, path) do
+  defp ensure_path_blobs_available(
+         %Repository{object_store: %Promisor{}} = repo,
+         commit_sha,
+         path
+       ) do
     shas = collect_path_blob_shas(repo, commit_sha, path, MapSet.new(), [])
     missing = Enum.reject(shas, fn sha -> ObjectStore.has?(repo.object_store, sha) end)
 
@@ -443,8 +447,7 @@ defmodule Exgit.Blame do
           |> Map.new()
 
         {new_pending, new_attributions} =
-          Enum.reduce(pending, {%{}, attributions}, fn {target_idx, current_idx},
-                                                       {np, attrs} ->
+          Enum.reduce(pending, {%{}, attributions}, fn {target_idx, current_idx}, {np, attrs} ->
             case Map.fetch(current_to_parent, current_idx) do
               {:ok, parent_idx} ->
                 # Line survives → update pending to parent's idx.

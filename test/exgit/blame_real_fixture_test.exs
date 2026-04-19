@@ -86,9 +86,7 @@ defmodule Exgit.BlameRealFixtureTest do
       # where our --first-parent-no-rename semantics differ.
       parity_fraction = measure_parity(repo, path, entries)
 
-      IO.puts(
-        "    #{:io_lib.format("~.1f", [parity_fraction * 100])}% agreement with git blame"
-      )
+      IO.puts("    #{:io_lib.format("~.1f", [parity_fraction * 100])}% agreement with git blame")
 
       assert parity_fraction >= @min_agreement,
              "Blame agreement below threshold: #{parity_fraction} < #{@min_agreement}"

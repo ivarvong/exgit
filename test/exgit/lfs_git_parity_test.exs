@@ -122,8 +122,7 @@ defmodule Exgit.LFSGitParityTest do
     malformed = [
       {"plain text", "hello world\n"},
       {"partial", "version https://git-lfs.github.com/spec/v1\n"},
-      {"wrong version url",
-       "version https://example.com/v1\noid sha256:#{hex64()}\nsize 1\n"},
+      {"wrong version url", "version https://example.com/v1\noid sha256:#{hex64()}\nsize 1\n"},
       {"missing oid", "version https://git-lfs.github.com/spec/v1\nsize 100\n"},
       {"keys reversed",
        "version https://git-lfs.github.com/spec/v1\nsize 100\noid sha256:#{hex64()}\n"}

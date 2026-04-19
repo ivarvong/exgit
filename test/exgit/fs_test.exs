@@ -758,7 +758,11 @@ defmodule Exgit.FsTest do
     end
 
     test "empty explicit range is not an error, returns empty list", %{repo: repo} do
-      assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "decad.txt", 5..4)
+      # Elixir 1.17+ requires an explicit step when first > last; without
+      # `//-1` this emits a warning that `mix test --warnings-as-errors`
+      # treats as a hard failure. Also exercises the normalize_line_range
+      # clause that explicitly accepts step -1 as an empty range.
+      assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "decad.txt", 5..4//-1)
     end
 
     test "missing path returns :not_found", %{repo: repo} do

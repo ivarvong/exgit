@@ -54,8 +54,7 @@ defmodule Exgit.FS do
 
   """
   @spec read_path(Repository.t(), ref(), path(), keyword()) ::
-          {:ok, {String.t(), Blob.t() | {:lfs_pointer, Exgit.LFS.pointer_info()}},
-           Repository.t()}
+          {:ok, {String.t(), Blob.t() | {:lfs_pointer, Exgit.LFS.pointer_info()}}, Repository.t()}
           | {:error, :not_found | :not_a_blob | term()}
   def read_path(%Repository{} = repo, reference, path, opts \\ []) do
     resolve_lfs? = Keyword.get(opts, :resolve_lfs_pointers, false)
@@ -1473,8 +1472,7 @@ defmodule Exgit.FS do
 
         {before_n, after_n} ->
           Map.merge(base, %{
-            context_before:
-              context_range(data, newline_positions, line_number, -before_n, -1),
+            context_before: context_range(data, newline_positions, line_number, -before_n, -1),
             context_after:
               context_range(data, newline_positions, line_number, 1, after_n, total_lines)
           })

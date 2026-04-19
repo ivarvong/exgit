@@ -250,13 +250,14 @@ defmodule Exgit.RepoHandle do
     # who have the PID can look up the table without an extra call
     # through the handle process; the table name is derived from
     # the PID.
-    table = :ets.new(table_name(self()), [
-      :set,
-      :public,
-      :named_table,
-      read_concurrency: true,
-      write_concurrency: false
-    ])
+    table =
+      :ets.new(table_name(self()), [
+        :set,
+        :public,
+        :named_table,
+        read_concurrency: true,
+        write_concurrency: false
+      ])
 
     true = :ets.insert(table, {:repo, repo})
 

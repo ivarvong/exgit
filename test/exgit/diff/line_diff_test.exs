@@ -173,9 +173,7 @@ defmodule Exgit.Diff.LineDiffTest do
 
     defp line do
       # Small alphabet ensures collisions so LCS actually does work.
-      StreamData.one_of(
-        Enum.map(["a", "b", "c", "d", "e"], &StreamData.constant/1)
-      )
+      StreamData.one_of(Enum.map(["a", "b", "c", "d", "e"], &StreamData.constant/1))
     end
   end
 end

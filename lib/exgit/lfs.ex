@@ -90,7 +90,9 @@ defmodule Exgit.LFS do
         {:error, :not_lfs_pointer}
 
       true ->
-        rest = binary_part(data, byte_size(@version_line), byte_size(data) - byte_size(@version_line))
+        rest =
+          binary_part(data, byte_size(@version_line), byte_size(data) - byte_size(@version_line))
+
         parse_body(rest, data)
     end
   end

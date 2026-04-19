@@ -238,11 +238,6 @@ defmodule Exgit.BlameGitParityTest do
     Exgit.Blame.blame(repo, "HEAD", path)
   end
 
-  defp git_rev_parse(tmp, ref) do
-    {out, 0} = RealGit.git!(tmp, ["rev-parse", ref])
-    String.trim(out)
-  end
-
   defp on_exit_cleanup(tmp) do
     on_exit(fn -> File.rm_rf!(tmp) end)
   end
