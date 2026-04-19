@@ -1,0 +1,324 @@
+defmodule Exgit.Blame do
+  @moduledoc """
+  Per-line authorship attribution for a file at a ref.
+
+  For each line of `path` at `ref`, `blame/3` returns the commit
+  that most recently introduced or modified that line, plus the
+  commit's author metadata.
+
+  ## Semantics
+
+  Follows `git blame --first-parent` semantics:
+
+    * Walks only the first-parent chain. Merge commits are
+      traversed by their first parent; contributions from merged
+      branches are attributed to the merge commit itself if the
+      line's first appearance on the first-parent chain is there.
+    * No move/copy detection. Lines that moved or were copied
+      between files are attributed to the commit that placed the
+      line at its current path.
+    * No rename following. If `path` was renamed at some commit
+      in history, blame attributes everything before the rename
+      to the rename commit.
+    * Lines are compared by exact byte equality. Whitespace
+      changes count as changes.
+
+  The 80% version. Full `git blame` has ~15 years of heuristics
+  (whitespace ignoring, `--ignore-revs`, patience diff, move +
+  copy detection) that aren't implemented here. For agent
+  workflows that want "who introduced this line?" this is
+  sufficient; for deep forensics, shell out to real git.
+
+  ## API
+
+      {:ok, entries, repo} = Exgit.Blame.blame(repo, ref, path)
+
+  Each entry:
+
+      %{
+        line_number: 1..N,
+        line: "source text",
+        commit_sha: <<20-byte raw sha>>,
+        author_name: "Alice",
+        author_email: "alice@example.com",
+        author_time: 1_700_000_000,   # Unix seconds
+        summary: "first line of commit message"
+      }
+
+  Returns `{:error, :not_found}` if `path` doesn't exist at
+  `ref`, `{:error, :not_a_blob}` if it's a directory,
+  `{:error, :unbounded_history}` if the walk exceeds
+  `@max_commits_walked` (hostile-input guard).
+  """
+
+  alias Exgit.Diff.LineDiff
+  alias Exgit.Object.{Blob, Commit, Tree}
+  alias Exgit.{ObjectStore, RefStore, Repository}
+
+  # Safety cap on how far back we'll walk. Real repos average
+  # tens to hundreds of commits per file; 100k is 10x-100x more
+  # than any realistic blame would need and prevents a runaway
+  # walk on a malformed commit chain.
+  @max_commits_walked 100_000
+
+  @type entry :: %{
+          line_number: pos_integer(),
+          line: String.t(),
+          commit_sha: binary(),
+          author_name: String.t(),
+          author_email: String.t(),
+          author_time: integer(),
+          summary: String.t()
+        }
+
+  @spec blame(Repository.t(), String.t() | binary(), String.t()) ::
+          {:ok, [entry()], Repository.t()} | {:error, term()}
+  def blame(%Repository{} = repo, reference, path) do
+    with {:ok, commit_sha} <- resolve_commit(repo, reference),
+         {:ok, target_lines} <- read_file_at_commit(repo, commit_sha, path) do
+      # `pending` maps ORIGINAL target-file line index to the
+      # current-commit's line index. Starts as identity (each line
+      # in target is itself in the target commit's version).
+      pending =
+        target_lines
+        |> Enum.with_index()
+        |> Map.new(fn {_line, idx} -> {idx, idx} end)
+
+      case walk(repo, commit_sha, path, pending, %{}, 0) do
+        {:ok, attributions} ->
+          {:ok, entries} = build_entries(repo, target_lines, attributions)
+          {:ok, entries, repo}
+
+        err ->
+          err
+      end
+    end
+  end
+
+  # --- The walk ---
+
+  # `pending`: %{target_idx => current_commit_line_idx}
+  # `attributions`: %{target_idx => commit_sha}
+  defp walk(_repo, _sha, _path, pending, attributions, _depth)
+       when map_size(pending) == 0 do
+    {:ok, attributions}
+  end
+
+  defp walk(_repo, _sha, _path, _pending, _attributions, depth)
+       when depth >= @max_commits_walked do
+    {:error, :unbounded_history}
+  end
+
+  defp walk(repo, commit_sha, path, pending, attributions, depth) do
+    case get_commit(repo, commit_sha) do
+      {:ok, commit} ->
+        case Commit.parents(commit) do
+          [] ->
+            # Root commit: everything still pending originated here.
+            {:ok, attribute_all(pending, attributions, commit_sha)}
+
+          [parent_sha | _] ->
+            step(repo, commit_sha, parent_sha, path, pending, attributions, depth)
+        end
+
+      err ->
+        err
+    end
+  end
+
+  defp step(repo, commit_sha, parent_sha, path, pending, attributions, depth) do
+    case read_file_at_commit(repo, parent_sha, path) do
+      {:ok, parent_lines} ->
+        propagate(repo, commit_sha, parent_sha, path, parent_lines, pending, attributions, depth)
+
+      {:error, :not_found} ->
+        # File didn't exist in parent → everything pending was
+        # introduced here at commit_sha.
+        {:ok, attribute_all(pending, attributions, commit_sha)}
+
+      err ->
+        err
+    end
+  end
+
+  defp propagate(repo, commit_sha, parent_sha, path, parent_lines, pending, attributions, depth) do
+    # Read the current commit's lines so we can diff full-to-full.
+    case read_file_at_commit(repo, commit_sha, path) do
+      {:ok, current_lines} ->
+        pairs = LineDiff.matched_pairs(parent_lines, current_lines)
+
+        # Map: current_commit_line_idx → parent_line_idx (for lines
+        # that survived from parent to current).
+        current_to_parent =
+          pairs
+          |> Enum.map(fn {a_idx, b_idx} -> {b_idx, a_idx} end)
+          |> Map.new()
+
+        {new_pending, new_attributions} =
+          Enum.reduce(pending, {%{}, attributions}, fn {target_idx, current_idx},
+                                                       {np, attrs} ->
+            case Map.fetch(current_to_parent, current_idx) do
+              {:ok, parent_idx} ->
+                # Line survives → update pending to parent's idx.
+                {Map.put(np, target_idx, parent_idx), attrs}
+
+              :error ->
+                # Line is new at commit_sha → attribute.
+                {np, Map.put(attrs, target_idx, commit_sha)}
+            end
+          end)
+
+        walk(repo, parent_sha, path, new_pending, new_attributions, depth + 1)
+
+      err ->
+        err
+    end
+  end
+
+  defp attribute_all(pending, attributions, commit_sha) do
+    Enum.reduce(pending, attributions, fn {target_idx, _}, acc ->
+      Map.put(acc, target_idx, commit_sha)
+    end)
+  end
+
+  # --- Commit and file helpers ---
+
+  defp resolve_commit(_repo, reference)
+       when is_binary(reference) and byte_size(reference) == 20 do
+    {:ok, reference}
+  end
+
+  defp resolve_commit(repo, reference) when is_binary(reference) do
+    case RefStore.read(repo.ref_store, reference) do
+      {:ok, sha} when is_binary(sha) and byte_size(sha) == 20 ->
+        {:ok, sha}
+
+      {:ok, {:symbolic, target}} ->
+        resolve_commit(repo, target)
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp get_commit(repo, sha) do
+    case ObjectStore.get(repo.object_store, sha) do
+      {:ok, %Commit{} = c} -> {:ok, c}
+      {:ok, _} -> {:error, :not_a_commit}
+      err -> err
+    end
+  end
+
+  defp read_file_at_commit(repo, commit_sha, path) do
+    with {:ok, commit} <- get_commit(repo, commit_sha),
+         tree_sha = Commit.tree(commit),
+         {:ok, blob_data} <- read_blob_at_tree(repo, tree_sha, path) do
+      {:ok, split_lines(blob_data)}
+    end
+  end
+
+  defp read_blob_at_tree(repo, tree_sha, path) do
+    segments = path |> String.split("/") |> Enum.reject(&(&1 == ""))
+    walk_tree(repo, tree_sha, segments)
+  end
+
+  defp walk_tree(_repo, _sha, []), do: {:error, :not_a_blob}
+
+  defp walk_tree(repo, tree_sha, [name]) do
+    case ObjectStore.get(repo.object_store, tree_sha) do
+      {:ok, %Tree{entries: entries}} ->
+        case Enum.find(entries, fn {_mode, n, _} -> n == name end) do
+          {_mode, ^name, blob_sha} ->
+            case ObjectStore.get(repo.object_store, blob_sha) do
+              {:ok, %Blob{data: data}} -> {:ok, data}
+              _ -> {:error, :not_a_blob}
+            end
+
+          nil ->
+            {:error, :not_found}
+        end
+
+      err ->
+        err
+    end
+  end
+
+  defp walk_tree(repo, tree_sha, [name | rest]) do
+    case ObjectStore.get(repo.object_store, tree_sha) do
+      {:ok, %Tree{entries: entries}} ->
+        case Enum.find(entries, fn {_mode, n, _} -> n == name end) do
+          {"40000", ^name, sub_sha} -> walk_tree(repo, sub_sha, rest)
+          {_mode, ^name, _} -> {:error, :not_a_blob}
+          nil -> {:error, :not_found}
+        end
+
+      err ->
+        err
+    end
+  end
+
+  # Split blob bytes into lines matching grep's convention (no
+  # phantom trailing empty line for a file ending in \n).
+  defp split_lines(""), do: []
+
+  defp split_lines(data) do
+    parts = String.split(data, "\n")
+
+    if String.ends_with?(data, "\n"),
+      do: Enum.drop(parts, -1),
+      else: parts
+  end
+
+  # --- Entry construction ---
+
+  defp build_entries(repo, target_lines, attrib_map) do
+    shas = attrib_map |> Map.values() |> Enum.uniq()
+    commits_by_sha = preload_commits(repo, shas)
+
+    entries =
+      for {line, i} <- Enum.with_index(target_lines) do
+        sha = Map.get(attrib_map, i)
+        c = Map.get(commits_by_sha, sha)
+        meta = commit_metadata(c)
+
+        %{
+          line_number: i + 1,
+          line: line,
+          commit_sha: sha,
+          author_name: meta.author_name,
+          author_email: meta.author_email,
+          author_time: meta.author_time,
+          summary: meta.summary
+        }
+      end
+
+    {:ok, entries}
+  end
+
+  defp preload_commits(repo, shas) do
+    Enum.reduce(shas, %{}, fn sha, acc ->
+      case get_commit(repo, sha) do
+        {:ok, c} -> Map.put(acc, sha, c)
+        _ -> acc
+      end
+    end)
+  end
+
+  defp commit_metadata(nil) do
+    %{author_name: "", author_email: "", author_time: 0, summary: ""}
+  end
+
+  defp commit_metadata(%Commit{message: message} = c) do
+    {name, email, time} = parse_author(Commit.author(c))
+    summary = message |> String.split("\n", parts: 2) |> hd()
+
+    %{author_name: name, author_email: email, author_time: time, summary: summary}
+  end
+
+  defp parse_author(line) when is_binary(line) do
+    case Regex.run(~r/^(.+?)\s+<([^>]*)>\s+(\d+)\s+[+-]\d{4}/, line) do
+      [_, name, email, ts] -> {name, email, String.to_integer(ts)}
+      _ -> {"", "", 0}
+    end
+  end
+end

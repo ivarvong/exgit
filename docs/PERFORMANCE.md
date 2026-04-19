@@ -476,10 +476,11 @@ Three shipped in the Round 1 push:
   `git grep -e P1 -e P2 ...`. See commit below + benchmark
   results below.
 
-Pending:
-
-- **`Exgit.Blame`** — last-writer-per-line. The single most
-  commonly-requested missing feature.
+- **`Exgit.Blame.blame(repo, ref, path)`** — per-line
+  authorship attribution. Follows `--first-parent` semantics;
+  no move/copy detection; no rename following. Real-fixture
+  parity tested against `git blame --first-parent` at ≥85%
+  agreement on rename-free files. See benchmark below.
 
 ### Benchmark: grep+context vs. grep+N×read_path
 
@@ -575,6 +576,56 @@ Invocation:
 ```
 mix run bench/multi_grep_bench.exs               # all fixtures, 5 runs
 mix run bench/multi_grep_bench.exs 10 opencode   # 10 runs, opencode
+```
+
+### Benchmark: Blame on real fixtures
+
+Blame cost scales with `(file_lines × commits_touching_file)`.
+A 300-line file with 10 commits is fast; a 1500-line file with
+100 commits is not. Measured per-file wall-clock against
+`anthropics/claude-agent-sdk-python` (3 runs, median):
+
+| Path | Lines | Commits touching | Median |
+|---|---:|---:|---:|
+| `src/claude_agent_sdk/_cli_version.py` | 3 | ~20 | **37 ms** |
+| `pyproject.toml` | 118 | ~80 | **96 ms** |
+| `README.md` | 359 | ~16 | **149 ms** |
+| `CHANGELOG.md` | 675 | ~68 | **450 ms** |
+
+Git-parity on rename-free paths (see test
+`blame_real_fixture_test.exs`):
+
+    README.md:          93.6% agreement with git blame
+    CHANGELOG.md:       90.1%
+    pyproject.toml:     96.6%
+    _cli_version.py:  100.0%
+
+The 5-10% divergence comes from merge-commit handling. Git's
+default blame has heuristics for picking which merge parent to
+credit; exgit's `--first-parent` walk follows a single chain,
+which is well-defined but differs on lines whose current form
+first appears on a merged-in branch.
+
+Files with rename history (where the file or its parent
+directory was renamed in the past) intentionally diverge
+further because exgit doesn't follow renames. These are
+filtered out of the parity tests; agents who need
+rename-following should shell out to `git blame` for that
+specific question.
+
+Algorithm: LCS dynamic programming over two consecutive commit
+versions of the file, backtracked for matched line pairs, with
+an identity short-circuit for commits that didn't touch the
+file. The key optimization was avoiding `Tuple.append/2`'s O(N)
+copy-per-insert in the DP row build — that reduced a 1376-line
+file blame from 67s to 1.9s. Future: Myers diff would further
+reduce cost for small per-commit edits.
+
+Invocation:
+
+```
+mix run bench/blame_bench.exs                # all fixtures, 3 runs
+mix run bench/blame_bench.exs 5 claude_sdk   # 5 runs, claude_sdk
 ```
 
 ## Known caveats
