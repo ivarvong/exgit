@@ -471,6 +471,184 @@ defmodule Exgit.FsTest do
     end
   end
 
+  describe "multi_grep/4" do
+    setup do
+      store = ObjectStore.Memory.new()
+
+      auth_ex = """
+      defmodule Auth do
+        @auth_token System.get_env("AUTH_TOKEN")
+        @api_key System.get_env("API_KEY")
+
+        def check, do: :ok
+      end
+      """
+
+      logging_ex = """
+      defmodule Logging do
+        # no secrets here
+        def info(msg), do: IO.puts(msg)
+      end
+      """
+
+      mixed_ex = """
+      # auth_token AND api_key both appear here
+      defmodule Mixed do
+        @creds {@auth_token, @api_key}
+      end
+      """
+
+      {:ok, a_sha, store} = ObjectStore.put(store, Blob.new(auth_ex))
+      {:ok, l_sha, store} = ObjectStore.put(store, Blob.new(logging_ex))
+      {:ok, m_sha, store} = ObjectStore.put(store, Blob.new(mixed_ex))
+
+      tree =
+        Tree.new([
+          {"100644", "auth.ex", a_sha},
+          {"100644", "logging.ex", l_sha},
+          {"100644", "mixed.ex", m_sha}
+        ])
+
+      {:ok, tree_sha, store} = ObjectStore.put(store, tree)
+
+      commit =
+        Commit.new(
+          tree: tree_sha,
+          parents: [],
+          author: "T <t@t> 1700000000 +0000",
+          committer: "T <t@t> 1700000000 +0000",
+          message: "mg\n"
+        )
+
+      {:ok, commit_sha, store} = ObjectStore.put(store, commit)
+
+      {:ok, rs} = RefStore.write(RefStore.Memory.new(), "refs/heads/main", commit_sha, [])
+      {:ok, rs} = RefStore.write(rs, "HEAD", {:symbolic, "refs/heads/main"}, [])
+
+      repo = %Exgit.Repository{
+        object_store: store,
+        ref_store: rs,
+        config: Exgit.Config.new(),
+        path: nil
+      }
+
+      {:ok, repo: repo}
+    end
+
+    test "map-form tagging with atoms", %{repo: repo} do
+      patterns = %{token: "auth_token", key: "api_key"}
+
+      results = FS.multi_grep(repo, "HEAD", patterns) |> Enum.to_list()
+
+      # auth.ex has token at line 2, key at line 3.
+      # mixed.ex has token at line 1 + line 3, key at line 1 + line 3.
+      by_tag = Enum.group_by(results, & &1.tag)
+
+      assert Map.keys(by_tag) |> Enum.sort() == [:key, :token]
+
+      # Every result carries a tag.
+      for r <- results do
+        assert r.tag in [:token, :key]
+        assert is_integer(r.line_number) and r.line_number >= 1
+      end
+    end
+
+    test "list-form uses pattern as its own tag", %{repo: repo} do
+      patterns = ["auth_token", "api_key"]
+
+      results = FS.multi_grep(repo, "HEAD", patterns) |> Enum.to_list()
+
+      tags = results |> Enum.map(& &1.tag) |> Enum.uniq() |> Enum.sort()
+      assert tags == ["api_key", "auth_token"]
+    end
+
+    test "empty pattern map returns empty stream", %{repo: repo} do
+      results = FS.multi_grep(repo, "HEAD", %{}) |> Enum.to_list()
+      assert results == []
+    end
+
+    test "same line matched by two patterns produces two rows", %{repo: repo} do
+      # mixed.ex line 3 contains both @auth_token and @api_key.
+      patterns = %{token: "auth_token", key: "api_key"}
+
+      rows =
+        FS.multi_grep(repo, "HEAD", patterns, path: "mixed.ex")
+        |> Enum.to_list()
+        |> Enum.filter(&(&1.line_number == 3))
+
+      tags = rows |> Enum.map(& &1.tag) |> Enum.sort()
+      assert tags == [:key, :token]
+    end
+
+    test "context applies to every pattern", %{repo: repo} do
+      patterns = %{token: "auth_token"}
+
+      [match] =
+        FS.multi_grep(repo, "HEAD", patterns, path: "auth.ex", context: 1)
+        |> Enum.to_list()
+
+      assert match.tag == :token
+      assert match.line_number == 2
+      assert match.context_before == [{1, "defmodule Auth do"}]
+    end
+
+    test "case_insensitive applies uniformly", %{repo: repo} do
+      patterns = %{token: "AUTH_TOKEN", key: "API_KEY"}
+
+      # auth.ex has @auth_token / @api_key (lowercase).
+      results =
+        FS.multi_grep(repo, "HEAD", patterns, path: "auth.ex", case_insensitive: true)
+        |> Enum.to_list()
+
+      tags = results |> Enum.map(& &1.tag) |> Enum.uniq() |> Enum.sort()
+      assert tags == [:key, :token]
+    end
+
+    test "path glob filters as in grep/4", %{repo: repo} do
+      patterns = %{token: "auth_token"}
+
+      results =
+        FS.multi_grep(repo, "HEAD", patterns, path: "logging.ex") |> Enum.to_list()
+
+      # logging.ex has no tokens — empty.
+      assert results == []
+    end
+
+    test "max_count caps across all patterns", %{repo: repo} do
+      patterns = %{token: "auth_token", key: "api_key"}
+
+      results = FS.multi_grep(repo, "HEAD", patterns, max_count: 2) |> Enum.to_list()
+      assert length(results) == 2
+    end
+
+    test "tag can be any term (tuple, string)", %{repo: repo} do
+      patterns = %{{:sev, :high} => "auth_token", "ascii-tag" => "api_key"}
+
+      results = FS.multi_grep(repo, "HEAD", patterns) |> Enum.to_list()
+
+      tags = results |> Enum.map(& &1.tag) |> Enum.uniq() |> Enum.sort()
+      assert tags == [{:sev, :high}, "ascii-tag"]
+    end
+
+    test "regex patterns work same as strings", %{repo: repo} do
+      patterns = %{token: ~r/auth_\w+/}
+
+      results = FS.multi_grep(repo, "HEAD", patterns) |> Enum.to_list()
+
+      for r <- results do
+        assert r.tag == :token
+        assert Regex.match?(~r/auth_\w+/, r.match)
+      end
+    end
+
+    test "grep/4 single-pattern behavior unchanged by multi_grep refactor",
+         %{repo: repo} do
+      # Sanity: grep still returns no :tag field.
+      [first | _] = FS.grep(repo, "HEAD", "auth_token") |> Enum.to_list()
+      refute Map.has_key?(first, :tag)
+    end
+  end
+
   describe "read_lines/4" do
     setup do
       store = ObjectStore.Memory.new()

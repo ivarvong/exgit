@@ -419,6 +419,20 @@ defmodule Exgit.FS do
           optional(:context_after) => [{pos_integer(), String.t()}]
         }
 
+  @type multi_grep_match :: %{
+          required(:tag) => term(),
+          required(:path) => String.t(),
+          required(:line_number) => pos_integer(),
+          required(:line) => String.t(),
+          required(:match) => String.t(),
+          optional(:context_before) => [{pos_integer(), String.t()}],
+          optional(:context_after) => [{pos_integer(), String.t()}]
+        }
+
+  @type multi_grep_patterns ::
+          %{required(atom() | String.t()) => String.t() | Regex.t()}
+          | [String.t() | Regex.t()]
+
   @doc """
   Stream grep over the blobs reachable from `reference`. Streaming; does
   not grow the cache.
@@ -456,25 +470,110 @@ defmodule Exgit.FS do
   def grep(%Repository{} = repo, reference, pattern, opts \\ []) do
     :ok = require_eager!(repo, :grep)
     regex = compile_grep_pattern(pattern, opts)
+    # Single-pattern grep is the no-tag case: emit maps without a
+    # :tag field. Internally we dispatch through the same engine as
+    # multi_grep with a marker tag that gets stripped on emit.
+    do_scan_and_stream(
+      repo,
+      reference,
+      [{:__single__, regex}],
+      pattern_repr(pattern),
+      opts,
+      _tagged? = false
+    )
+  end
+
+  @doc """
+  Stream `grep` over multiple patterns in a single tree walk.
+
+  Each result row is tagged with the pattern that matched, so an
+  agent looking for "any of N vulnerability signatures" or "any
+  of N identifiers" gets back a uniform stream with `:tag`
+  identifying which pattern hit.
+
+  `patterns` may be either:
+
+    * a **map** `%{tag => pattern}` — the tag is whatever the
+      caller chose (atom, string, tuple, anything); each result
+      row has `:tag => that_tag`.
+    * a **list** `[pattern, ...]` — each pattern is its own tag
+      (the pattern itself appears in `:tag`).
+
+  `pattern` in each position is the same type `grep/4` accepts:
+  a string (escaped to a literal regex) or a `%Regex{}`.
+
+  ## Result shape
+
+      %{
+        tag: :auth,
+        path: "lib/auth.ex",
+        line_number: 42,
+        line: "  @auth_token System.get_env(...)",
+        match: "auth_token",
+        # :context_before / :context_after present iff a context
+        # option was set (same semantics as `grep/4`).
+      }
+
+  Two patterns matching the same `(path, line_number)` produce
+  **two result rows**, each with its own tag. Consumers that want
+  per-line deduplication can merge on `(path, line_number)`.
+
+  ## Options
+
+  Same options as `grep/4`: `:path`, `:max_count`,
+  `:include_binary`, `:case_insensitive`, `:max_concurrency`,
+  `:context` / `:before` / `:after`. `:case_insensitive` applies
+  uniformly to all patterns.
+
+  Patterns within a list/map are NOT deduplicated; duplicate
+  patterns with distinct tags are scanned once per tag, producing
+  duplicate result rows (the caller asked for it).
+
+  ## Implementation
+
+  Sequentially applies each compiled regex to each blob. For N
+  patterns and M blobs this is O(N×M) regex scans, but the walk +
+  path-glob filter + binary-detection + blob-decompress happen
+  **once** per blob — dominating costs for real workloads. An
+  alternation-regex alternative (one scan, pattern dispatch via
+  named captures) would be a future optimization; the current
+  shape is correct-first and easy to debug.
+
+  ## Example
+
+      patterns = %{
+        token: ~r/auth_token/i,
+        key:   ~r/api_key/i,
+        secret: "SECRET"
+      }
+
+      repo
+      |> Exgit.FS.multi_grep("HEAD", patterns, context: 2)
+      |> Enum.group_by(& &1.tag)
+  """
+  @spec multi_grep(Repository.t(), ref(), multi_grep_patterns(), keyword()) :: Enumerable.t()
+  def multi_grep(%Repository{} = repo, reference, patterns, opts \\ []) do
+    :ok = require_eager!(repo, :grep)
+    compiled = compile_multi_patterns(patterns, opts)
+
+    repr =
+      compiled
+      |> Enum.map(fn {tag, _rx} -> tag end)
+      |> inspect()
+
+    do_scan_and_stream(repo, reference, compiled, repr, opts, _tagged? = true)
+  end
+
+  # The shared scan+stream engine for grep/4 and multi_grep/4.
+  # `patterns` is `[{tag, %Regex{}}]`. When `tagged?` is false, emit
+  # single-pattern shape (no :tag); when true, include :tag.
+  defp do_scan_and_stream(repo, reference, patterns, pattern_repr, opts, tagged?) do
     path_glob = Keyword.get(opts, :path, "**")
     path_regex = compile_glob(path_glob)
     max_count = Keyword.get(opts, :max_count)
     include_binary = Keyword.get(opts, :include_binary, false)
     context = parse_context_opts(opts)
 
-    # Parallelism knob. Defaults to `1` (sequential). In-memory
-    # grep over compressed blobs is CPU-light: regex scan against
-    # ~10 KB of code takes microseconds. Task.async_stream's
-    # per-file spawn + message-passing overhead is ~50-100 µs per
-    # item, which DOMINATES the work being parallelized for
-    # typical code-search workloads (1k-file repo → parallel is
-    # 20× SLOWER than sequential in our measurements).
-    #
-    # Parallelism IS a win when per-file work is substantial:
-    # large blobs (100 KB+), complex regex, or I/O-bound stores.
-    # Callers with that profile opt in by passing
-    # `max_concurrency: :schedulers` (uses
-    # System.schedulers_online()) or an integer.
     max_concurrency =
       Keyword.get(opts, :max_concurrency, 1) |> resolve_concurrency()
 
@@ -485,9 +584,10 @@ defmodule Exgit.FS do
 
     metadata = %{
       reference: reference,
-      pattern: pattern_repr(pattern),
+      pattern: pattern_repr,
       path_glob: path_glob,
-      max_concurrency: max_concurrency
+      max_concurrency: max_concurrency,
+      pattern_count: length(patterns)
     }
 
     :telemetry.execute(
@@ -496,11 +596,6 @@ defmodule Exgit.FS do
       metadata
     )
 
-    # Per-file work factored out so it can run either in the main
-    # process (sequential path) or in a worker Task (parallel
-    # path). Counters are `:counters` refs — concurrent-safe by
-    # design, which is the main reason this parallelization is so
-    # mechanical.
     scan_file = fn {path, sha} ->
       case ObjectStore.get(repo.object_store, sha) do
         {:ok, %Blob{data: data}} ->
@@ -508,7 +603,7 @@ defmodule Exgit.FS do
           :counters.add(bytes_counter, 1, byte_size(data))
 
           if include_binary or not binary_content?(data) do
-            matches = matches_in(path, data, regex, context)
+            matches = matches_in_multi(path, data, patterns, context, tagged?)
             :counters.add(match_counter, 1, length(matches))
             matches
           else
@@ -893,47 +988,84 @@ defmodule Exgit.FS do
   #
   # The returned shape matches what callers expect:
   # `%{path, line_number, line, match}`.
-  defp matches_in(path, data, regex, context) do
-    case Regex.scan(regex, data, return: :index, capture: :first) do
+  # Scan `data` for matches of every pattern in `tagged_patterns`
+  # and emit one result row per (pattern, match) pair. Shared by
+  # grep/4 (single pattern, `tagged?: false` strips the :tag field)
+  # and multi_grep/4 (N patterns, `tagged?: true` keeps it).
+  #
+  # Newline-offset + total-line computation is done ONCE per blob
+  # regardless of pattern count — that's the cost savings over
+  # running grep/4 N times sequentially.
+  defp matches_in_multi(path, data, tagged_patterns, context, tagged?) do
+    # Check all patterns up-front so the hot 'no hits' path
+    # short-circuits before allocating newline offsets for a file
+    # that no pattern matches.
+    scan_results =
+      for {tag, regex} <- tagged_patterns,
+          matches = Regex.scan(regex, data, return: :index, capture: :first),
+          matches != [] do
+        {tag, matches}
+      end
+
+    case scan_results do
       [] ->
         []
 
-      matches ->
-        # One-shot scan of all newline offsets. `:binary.matches/2`
-        # runs in native code and is O(bytes) with a low constant —
-        # significantly faster than `String.split/2` with a regex
-        # when we only need offsets.
+      _ ->
         newline_positions = newline_offsets(data)
         total_lines = count_lines(data, newline_positions)
 
-        for [{pos, len}] <- matches do
-          line_number = line_at(newline_positions, pos)
-          line_text = line_contents(data, newline_positions, line_number)
-          matched = binary_part(data, pos, len)
+        line_info = {newline_positions, total_lines}
 
-          base = %{path: path, line_number: line_number, line: line_text, match: matched}
-
-          case context do
-            {0, 0} ->
-              base
-
-            {before_n, after_n} ->
-              Map.merge(base, %{
-                context_before:
-                  context_range(data, newline_positions, line_number, -before_n, -1),
-                context_after:
-                  context_range(
-                    data,
-                    newline_positions,
-                    line_number,
-                    1,
-                    after_n,
-                    total_lines
-                  )
-              })
+        Enum.flat_map(scan_results, fn {tag, matches} ->
+          for [{pos, len}] <- matches do
+            build_match_row(path, data, {pos, len}, line_info, context, tag, tagged?)
           end
-        end
+        end)
     end
+  end
+
+  defp build_match_row(
+         path,
+         data,
+         {pos, len},
+         {newline_positions, total_lines},
+         context,
+         tag,
+         tagged?
+       ) do
+    line_number = line_at(newline_positions, pos)
+    line_text = line_contents(data, newline_positions, line_number)
+    matched = binary_part(data, pos, len)
+
+    base = %{path: path, line_number: line_number, line: line_text, match: matched}
+
+    base =
+      case context do
+        {0, 0} ->
+          base
+
+        {before_n, after_n} ->
+          Map.merge(base, %{
+            context_before:
+              context_range(data, newline_positions, line_number, -before_n, -1),
+            context_after:
+              context_range(data, newline_positions, line_number, 1, after_n, total_lines)
+          })
+      end
+
+    if tagged?, do: Map.put(base, :tag, tag), else: base
+  end
+
+  # Normalize map-form vs. list-form patterns into a single
+  # [{tag, %Regex{}}] list. Strings are escaped + compiled with
+  # the caller's :case_insensitive flag; regexes pass through.
+  defp compile_multi_patterns(patterns, opts) when is_map(patterns) do
+    Enum.map(patterns, fn {tag, pat} -> {tag, compile_grep_pattern(pat, opts)} end)
+  end
+
+  defp compile_multi_patterns(patterns, opts) when is_list(patterns) do
+    Enum.map(patterns, fn pat -> {pat, compile_grep_pattern(pat, opts)} end)
   end
 
   # Build a list of {line_number, line} tuples for lines offset by
