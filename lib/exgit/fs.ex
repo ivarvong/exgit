@@ -38,11 +38,28 @@ defmodule Exgit.FS do
   Read the blob at `path`. Returns `{:ok, {mode, %Blob{}}, repo}` or
   `{:error, reason}`. The returned `repo` reflects any cache growth
   triggered during resolution.
+
+  ## Options
+
+    * `:resolve_lfs_pointers` (default `false`) — when `true`, blobs
+      detected as git-lfs pointer files are returned as
+      `{:ok, {mode, {:lfs_pointer, info}}, repo}` instead of
+      `{:ok, {mode, %Blob{}}, repo}`. `info` is a map with
+      `:oid`, `:size`, and `:raw` (the original pointer bytes).
+
+      An agent reading blobs without this flag against an
+      LFS-using repo will silently receive ~130-byte pointer
+      text as if it were file content — a correctness cliff.
+      See `Exgit.LFS` for detection details.
+
   """
-  @spec read_path(Repository.t(), ref(), path()) ::
-          {:ok, {String.t(), Blob.t()}, Repository.t()}
+  @spec read_path(Repository.t(), ref(), path(), keyword()) ::
+          {:ok, {String.t(), Blob.t() | {:lfs_pointer, Exgit.LFS.pointer_info()}},
+           Repository.t()}
           | {:error, :not_found | :not_a_blob | term()}
-  def read_path(%Repository{} = repo, reference, path) do
+  def read_path(%Repository{} = repo, reference, path, opts \\ []) do
+    resolve_lfs? = Keyword.get(opts, :resolve_lfs_pointers, false)
+
     Exgit.Telemetry.span(
       [:exgit, :fs, :read_path],
       %{reference: reference, path: path},
@@ -50,14 +67,24 @@ defmodule Exgit.FS do
         with {:ok, tree_sha, repo} <- resolve_tree(repo, reference),
              {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, normalize_path(path)),
              {:ok, obj, repo} <- fetch_object(repo, sha) do
-          case obj do
-            %Blob{} = b -> {:ok, {mode, b}, repo}
-            _ -> {:error, :not_a_blob}
-          end
+          wrap_blob(obj, mode, repo, resolve_lfs?)
         end
       end
     )
   end
+
+  # Post-process a fetched object into the `read_path` return shape.
+  # Split out so the main `with` chain stays flat; credo flags the
+  # in-line nested `case + if + case` otherwise.
+  defp wrap_blob(%Blob{data: data} = b, mode, repo, true = _resolve_lfs?) do
+    case Exgit.LFS.parse(data) do
+      {:ok, info} -> {:ok, {mode, {:lfs_pointer, info}}, repo}
+      {:error, _} -> {:ok, {mode, b}, repo}
+    end
+  end
+
+  defp wrap_blob(%Blob{} = b, mode, repo, false), do: {:ok, {mode, b}, repo}
+  defp wrap_blob(_other, _mode, _repo, _), do: {:error, :not_a_blob}
 
   @doc """
   List entries of the directory at `path`. Returns `{:ok, entries, repo}`.

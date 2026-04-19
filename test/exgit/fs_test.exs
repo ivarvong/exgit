@@ -119,6 +119,112 @@ defmodule Exgit.FsTest do
     end
   end
 
+  describe "read_path/4 with resolve_lfs_pointers" do
+    # Build a repo containing:
+    #   /real.bin       (200 bytes random — looks like a real binary)
+    #   /pointed.bin    (a valid LFS pointer file, as if `git lfs`
+    #                   replaced the real content on commit)
+    #   /README.md      (plain text)
+    #
+    # and verify:
+    #   1. Default behavior (no flag) returns %Blob{} in all cases.
+    #   2. With resolve_lfs_pointers: true, pointed.bin surfaces as
+    #      {:lfs_pointer, info}; real.bin and README.md stay as blobs.
+    setup do
+      store = ObjectStore.Memory.new()
+
+      readme = Blob.new("# Project\n")
+      {:ok, readme_sha, store} = ObjectStore.put(store, readme)
+
+      # A real binary blob — 200 random bytes that should NEVER be
+      # mistaken for a pointer.
+      real_bin = Blob.new(:crypto.strong_rand_bytes(200))
+      {:ok, real_bin_sha, store} = ObjectStore.put(store, real_bin)
+
+      # A canonical LFS pointer (exactly what `git-lfs` would have
+      # written in place of a real binary). Size + oid are for a
+      # hypothetical 12345-byte payload.
+      pointer_text = """
+      version https://git-lfs.github.com/spec/v1
+      oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393
+      size 12345
+      """
+
+      pointer_blob = Blob.new(pointer_text)
+      {:ok, pointer_sha, store} = ObjectStore.put(store, pointer_blob)
+
+      root =
+        Tree.new([
+          {"100644", "README.md", readme_sha},
+          {"100644", "pointed.bin", pointer_sha},
+          {"100644", "real.bin", real_bin_sha}
+        ])
+
+      {:ok, root_sha, store} = ObjectStore.put(store, root)
+
+      commit =
+        Commit.new(
+          tree: root_sha,
+          parents: [],
+          author: "T <t@t> 1700000000 +0000",
+          committer: "T <t@t> 1700000000 +0000",
+          message: "init\n"
+        )
+
+      {:ok, commit_sha, store} = ObjectStore.put(store, commit)
+
+      {:ok, ref_store} =
+        RefStore.write(RefStore.Memory.new(), "refs/heads/main", commit_sha, [])
+
+      {:ok, ref_store} =
+        RefStore.write(ref_store, "HEAD", {:symbolic, "refs/heads/main"}, [])
+
+      repo = %Exgit.Repository{
+        object_store: store,
+        ref_store: ref_store,
+        config: Exgit.Config.new(),
+        path: nil
+      }
+
+      {:ok, repo: repo, pointer_text: pointer_text}
+    end
+
+    test "default behavior returns raw blob even for pointer files", %{
+      repo: repo,
+      pointer_text: pointer_text
+    } do
+      # Without the flag, an agent reading pointed.bin sees the ~130
+      # bytes of pointer text as if it were the actual file. This is
+      # the silent-correctness-cliff the flag exists to close.
+      assert {:ok, {"100644", %Blob{data: ^pointer_text}}, _} =
+               FS.read_path(repo, "HEAD", "pointed.bin")
+    end
+
+    test "with flag, pointer file surfaces as {:lfs_pointer, info}", %{repo: repo} do
+      assert {:ok, {"100644", {:lfs_pointer, info}}, _} =
+               FS.read_path(repo, "HEAD", "pointed.bin", resolve_lfs_pointers: true)
+
+      assert info.oid ==
+               "sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393"
+
+      assert info.size == 12_345
+      assert is_binary(info.raw)
+    end
+
+    test "with flag, normal binary blob stays as %Blob{}", %{repo: repo} do
+      # A 200-byte random blob must NOT be mistaken for a pointer.
+      assert {:ok, {"100644", %Blob{} = blob}, _} =
+               FS.read_path(repo, "HEAD", "real.bin", resolve_lfs_pointers: true)
+
+      assert byte_size(blob.data) == 200
+    end
+
+    test "with flag, plain text blob stays as %Blob{}", %{repo: repo} do
+      assert {:ok, {"100644", %Blob{data: "# Project\n"}}, _} =
+               FS.read_path(repo, "HEAD", "README.md", resolve_lfs_pointers: true)
+    end
+  end
+
   describe "ls/3" do
     test "lists top-level entries", %{repo: repo} do
       {:ok, entries, _repo} = FS.ls(repo, "HEAD", "")
