@@ -374,7 +374,11 @@ defmodule Exgit.FS do
   #
   # When any Phase fails (server doesn't support `depth`, `filter`,
   # or `want <tree_sha>`), we fall back to the legacy per-object
-  # recursive walk — correctness over performance.
+  # recursive walk — correctness over performance. The fallback is
+  # significantly slower (on opencode it's the ~52s vs ~8s difference)
+  # so operators need visibility when they hit it: emit a
+  # `[:exgit, :fs, :prefetch, :fallback]` telemetry event with the
+  # reason so a silently-slow production prefetch is debuggable.
   defp batched_prefetch(%Repository{} = repo, reference, include_blobs) do
     with {:ok, commit_sha} <- resolve_reference_to_sha(repo, reference),
          {:ok, repo, tree_sha} <- prefetch_commit_and_root_tree(repo, commit_sha) do
@@ -384,8 +388,14 @@ defmodule Exgit.FS do
         {:ok, repo}
       end
     else
-      {:error, _} ->
-        # Fall back to the legacy recursive walk. Slow but correct.
+      {:error, reason} ->
+        :telemetry.execute(
+          [:exgit, :fs, :prefetch, :fallback],
+          %{count: 1},
+          %{reason: reason, reference: reference, include_blobs: include_blobs}
+        )
+
+        # Legacy recursive walk. Slow but correct.
         case resolve_tree(repo, reference) do
           {:ok, tree_sha, repo} -> {:ok, fallback_prefetch_tree(repo, tree_sha, include_blobs)}
           err -> err

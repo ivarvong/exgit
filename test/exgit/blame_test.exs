@@ -191,4 +191,49 @@ defmodule Exgit.BlameTest do
     assert e2.commit_sha == shas.c1
     assert e3.commit_sha == shas.c2
   end
+
+  describe "auto_fetch option" do
+    # Non-Promisor (Memory-backed) repo: auto_fetch is a no-op by
+    # definition. These tests verify that blame produces identical
+    # attributions with and without the flag, because the network
+    # path is never invoked on a fully-local repo.
+    test "auto_fetch: false on Memory repo produces identical results",
+         %{repo: repo} do
+      {:ok, entries_on, _} = Blame.blame(repo, "HEAD", "f.txt", auto_fetch: true)
+      {:ok, entries_off, _} = Blame.blame(repo, "HEAD", "f.txt", auto_fetch: false)
+
+      assert entries_on == entries_off
+    end
+
+    test "default is auto_fetch: true", %{repo: repo} do
+      {:ok, entries_default, _} = Blame.blame(repo, "HEAD", "f.txt")
+      {:ok, entries_explicit, _} = Blame.blame(repo, "HEAD", "f.txt", auto_fetch: true)
+
+      assert entries_default == entries_explicit
+    end
+
+    test "no [:exgit, :blame, :auto_fetch, :start] events on non-Promisor repo",
+         %{repo: repo} do
+      # Memory-backed stores can't auto-fetch (nothing to fetch).
+      # The telemetry should not fire at all.
+      test_pid = self()
+
+      handler_id = "blame-autofetch-test-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:exgit, :blame, :auto_fetch, :start],
+        fn _event, _m, md, _ -> send(test_pid, {:auto_fetch_start, md}) end,
+        nil
+      )
+
+      try do
+        {:ok, _, _} = Blame.blame(repo, "HEAD", "f.txt")
+      after
+        :telemetry.detach(handler_id)
+      end
+
+      refute_received {:auto_fetch_start, _}
+    end
+  end
 end

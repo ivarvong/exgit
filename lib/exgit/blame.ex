@@ -80,12 +80,40 @@ defmodule Exgit.Blame do
           summary: String.t()
         }
 
-  @spec blame(Repository.t(), String.t() | binary(), String.t()) ::
+  @doc """
+  Produce per-line authorship attribution for `path` at `reference`.
+
+  ## Options
+
+    * `:auto_fetch` (default `true`) — when the repo is a
+      `Promisor`-backed lazy clone, blame walks history and
+      historical blob versions that `FS.prefetch/3` does not pull.
+      With `auto_fetch: true`, blame transparently triggers a
+      batched commit-graph fetch and a batched path-history blob
+      fetch before starting the walk. The first blame call on a
+      cold repo pays this one-time cost (typically 200-800 ms);
+      subsequent calls are warm.
+
+      With `auto_fetch: false`, blame does NOT trigger any network
+      requests. If required objects aren't cached, blame truncates
+      its walk at the first missing object and attributes remaining
+      lines to the current commit. Useful when callers want
+      predictable no-network behavior — they should call
+      `FS.prefetch_history/2` explicitly beforehand.
+
+  Regardless of the flag, every auto-fetch emits
+  `[:exgit, :blame, :auto_fetch, :start]` and
+  `[:exgit, :blame, :auto_fetch, :stop]` telemetry events so
+  silent slowness is visible to operators.
+  """
+  @spec blame(Repository.t(), String.t() | binary(), String.t(), keyword()) ::
           {:ok, [entry()], Repository.t()} | {:error, term()}
-  def blame(%Repository{} = repo, reference, path) do
+  def blame(%Repository{} = repo, reference, path, opts \\ []) do
+    auto_fetch? = Keyword.get(opts, :auto_fetch, true)
+
     with {:ok, commit_sha} <- resolve_commit(repo, reference),
-         {:ok, repo} <- ensure_history_available(repo, commit_sha),
-         {:ok, repo} <- ensure_path_blobs_available(repo, commit_sha, path),
+         {:ok, repo} <- maybe_ensure_history(repo, commit_sha, auto_fetch?),
+         {:ok, repo} <- maybe_ensure_path_blobs(repo, commit_sha, path, auto_fetch?),
          {:ok, target_lines} <- read_file_at_commit(repo, commit_sha, path) do
       # `pending` maps ORIGINAL target-file line index to the
       # current-commit's line index. Starts as identity (each line
@@ -104,6 +132,18 @@ defmodule Exgit.Blame do
           err
       end
     end
+  end
+
+  defp maybe_ensure_history(repo, _commit_sha, false), do: {:ok, repo}
+
+  defp maybe_ensure_history(repo, commit_sha, true) do
+    ensure_history_available(repo, commit_sha)
+  end
+
+  defp maybe_ensure_path_blobs(repo, _commit_sha, _path, false), do: {:ok, repo}
+
+  defp maybe_ensure_path_blobs(repo, commit_sha, path, true) do
+    ensure_path_blobs_available(repo, commit_sha, path)
   end
 
   # For Promisor-backed repos, blame needs the commit graph to walk
@@ -136,7 +176,7 @@ defmodule Exgit.Blame do
 
               {:error, _} ->
                 # Parent missing — pull the commit graph.
-                Exgit.FS.prefetch_history(repo, commit_sha)
+                fetch_history_with_telemetry(repo, commit_sha)
             end
         end
 
@@ -148,6 +188,26 @@ defmodule Exgit.Blame do
   end
 
   defp ensure_history_available(repo, _commit_sha), do: {:ok, repo}
+
+  # Wraps `FS.prefetch_history` in a telemetry span. Blame's implicit
+  # fetches used to be invisible; now `[:exgit, :blame, :auto_fetch, :*]`
+  # events fire around them so operators can see "ah, blame triggered
+  # a 300ms history fetch" in their dashboards without guessing.
+  defp fetch_history_with_telemetry(repo, commit_sha) do
+    Exgit.Telemetry.span(
+      [:exgit, :blame, :auto_fetch],
+      %{phase: :history, commit_sha: commit_sha},
+      fn ->
+        case Exgit.FS.prefetch_history(repo, commit_sha) do
+          {:ok, new_repo} = ok ->
+            {:span, ok, %{cache_bytes: new_repo.object_store.cache_bytes}}
+
+          {:error, reason} = err ->
+            {:span, err, %{error: reason}}
+        end
+      end
+    )
+  end
 
   # For Promisor-backed repos, blame's walk needs to read the blob of
   # `path` at every commit in the first-parent chain. These historical
@@ -172,8 +232,27 @@ defmodule Exgit.Blame do
 
     case missing do
       [] -> {:ok, repo}
-      _ -> batch_fetch(repo, missing)
+      _ -> fetch_path_blobs_with_telemetry(repo, path, missing)
     end
+  end
+
+  # Batched historical-blob fetch with telemetry. See
+  # `fetch_history_with_telemetry/2` for why the span wrapping
+  # matters.
+  defp fetch_path_blobs_with_telemetry(repo, path, missing) do
+    Exgit.Telemetry.span(
+      [:exgit, :blame, :auto_fetch],
+      %{phase: :path_blobs, path: path, blob_count: length(missing)},
+      fn ->
+        case batch_fetch(repo, missing) do
+          {:ok, new_repo} = ok ->
+            {:span, ok, %{cache_bytes: new_repo.object_store.cache_bytes}}
+
+          {:error, reason} = err ->
+            {:span, err, %{error: reason}}
+        end
+      end
+    )
   end
 
   defp ensure_path_blobs_available(repo, _commit_sha, _path), do: {:ok, repo}
