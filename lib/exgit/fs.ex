@@ -86,6 +86,119 @@ defmodule Exgit.FS do
   defp wrap_blob(%Blob{} = b, mode, repo, false), do: {:ok, {mode, b}, repo}
   defp wrap_blob(_other, _mode, _repo, _), do: {:error, :not_a_blob}
 
+  @type line_range :: pos_integer() | Range.t() | [pos_integer() | Range.t()]
+
+  @doc """
+  Read a slice of `path` at `reference`, returning only the lines
+  within `line_range`.
+
+  `line_range` is 1-indexed and accepts:
+
+    * `N` — a single line number.
+    * `first..last` — inclusive range (step must be 1).
+    * a list of any of the above.
+
+  Returns `{:ok, [{line_number, line}], repo}`. Line numbers match
+  `FS.grep/4`'s convention:
+
+    * trailing `\\n` does NOT create a phantom empty line;
+    * a file not ending in `\\n` still counts its partial last line;
+    * an empty file has zero lines.
+
+  Requested lines that fall outside the file are silently dropped
+  (so `read_lines(repo, ref, path, 1..1000)` returns up to as many
+  lines as the file has, rather than erroring). Duplicate or
+  overlapping ranges in a list-form range are deduplicated, and
+  returned lines are sorted ascending.
+
+  ## Errors
+
+    * `{:error, :not_found}` — path missing
+    * `{:error, :not_a_blob}` — path is a directory
+    * `{:error, {:invalid_line_range, term()}}` — unparseable
+      range (zero/negative line numbers, non-unit step, etc.)
+
+  ## Why not just `read_path` and slice?
+
+  For a 10k-line source file, `read_path` materializes the full
+  decompressed blob and the caller then does the line splitting
+  and binary_parts. This function does one decompress + one
+  newline scan + O(requested_lines) binary_parts — same result,
+  bounded work per call. It also composes with `grep` +
+  `:context`: grep can give you a match and narrow context;
+  `read_lines` can give you wider context only when the agent
+  asks.
+
+  ## Examples
+
+      {:ok, [{42, "def foo do"}], _repo} =
+        FS.read_lines(repo, "HEAD", "lib/a.ex", 42)
+
+      {:ok, lines, _repo} =
+        FS.read_lines(repo, "HEAD", "lib/a.ex", 10..20)
+
+      {:ok, lines, _repo} =
+        FS.read_lines(repo, "HEAD", "lib/a.ex", [1, 10..12, 100])
+  """
+  @spec read_lines(Repository.t(), ref(), path(), line_range()) ::
+          {:ok, [{pos_integer(), String.t()}], Repository.t()}
+          | {:error, term()}
+  def read_lines(%Repository{} = repo, reference, path, line_range) do
+    with {:ok, line_nums} <- normalize_line_range(line_range),
+         {:ok, tree_sha, repo} <- resolve_tree(repo, reference),
+         {:ok, {_mode, sha}, repo} <- walk_path(repo, tree_sha, normalize_path(path)),
+         {:ok, obj, repo} <- fetch_object(repo, sha) do
+      case obj do
+        %Blob{data: data} ->
+          {:ok, slice_lines(data, line_nums), repo}
+
+        _ ->
+          {:error, :not_a_blob}
+      end
+    end
+  end
+
+  # Normalize a line_range argument into a sorted-unique list of
+  # positive line numbers, or a tagged error.
+  defp normalize_line_range(n) when is_integer(n) and n >= 1, do: {:ok, [n]}
+
+  defp normalize_line_range(first..last//1) when first >= 1 and last >= first do
+    {:ok, Enum.to_list(first..last//1)}
+  end
+
+  # Elixir synthesizes `first..last` with step -1 when first > last.
+  # We accept that as an empty range (same semantics as `sed -n 'N,Mp'`
+  # when N > M), not an error.
+  defp normalize_line_range(first..last//-1) when first >= 1 and last <= first, do: {:ok, []}
+
+  defp normalize_line_range(items) when is_list(items) do
+    result =
+      Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+        case normalize_line_range(item) do
+          {:ok, nums} -> {:cont, {:ok, nums ++ acc}}
+          {:error, _} = err -> {:halt, err}
+        end
+      end)
+
+    case result do
+      {:ok, nums} -> {:ok, nums |> Enum.uniq() |> Enum.sort()}
+      err -> err
+    end
+  end
+
+  defp normalize_line_range(other), do: {:error, {:invalid_line_range, other}}
+
+  defp slice_lines(_data, []), do: []
+
+  defp slice_lines(data, line_nums) do
+    newlines = newline_offsets(data)
+    total = count_lines(data, newlines)
+
+    line_nums
+    |> Enum.filter(&(&1 <= total))
+    |> Enum.map(fn n -> {n, line_contents(data, newlines, n)} end)
+  end
+
   @doc """
   List entries of the directory at `path`. Returns `{:ok, entries, repo}`.
   """

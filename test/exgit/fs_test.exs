@@ -471,6 +471,124 @@ defmodule Exgit.FsTest do
     end
   end
 
+  describe "read_lines/4" do
+    setup do
+      store = ObjectStore.Memory.new()
+
+      # 10-line file.
+      decad = Enum.map_join(1..10, "\n", &"line #{&1}") <> "\n"
+      # File without trailing newline.
+      no_trail = "a\nb\nc"
+      # Empty file.
+      empty = ""
+
+      {:ok, d_sha, store} = ObjectStore.put(store, Blob.new(decad))
+      {:ok, n_sha, store} = ObjectStore.put(store, Blob.new(no_trail))
+      {:ok, e_sha, store} = ObjectStore.put(store, Blob.new(empty))
+
+      tree =
+        Tree.new([
+          {"100644", "decad.txt", d_sha},
+          {"100644", "empty.txt", e_sha},
+          {"100644", "no_trail.txt", n_sha}
+        ])
+
+      {:ok, tree_sha, store} = ObjectStore.put(store, tree)
+
+      commit =
+        Commit.new(
+          tree: tree_sha,
+          parents: [],
+          author: "T <t@t> 1700000000 +0000",
+          committer: "T <t@t> 1700000000 +0000",
+          message: "init\n"
+        )
+
+      {:ok, commit_sha, store} = ObjectStore.put(store, commit)
+
+      {:ok, rs} = RefStore.write(RefStore.Memory.new(), "refs/heads/main", commit_sha, [])
+      {:ok, rs} = RefStore.write(rs, "HEAD", {:symbolic, "refs/heads/main"}, [])
+
+      repo = %Exgit.Repository{
+        object_store: store,
+        ref_store: rs,
+        config: Exgit.Config.new(),
+        path: nil
+      }
+
+      {:ok, repo: repo}
+    end
+
+    test "single line integer", %{repo: repo} do
+      assert {:ok, [{3, "line 3"}], _} = FS.read_lines(repo, "HEAD", "decad.txt", 3)
+    end
+
+    test "inclusive range", %{repo: repo} do
+      assert {:ok, lines, _} = FS.read_lines(repo, "HEAD", "decad.txt", 3..5)
+      assert lines == [{3, "line 3"}, {4, "line 4"}, {5, "line 5"}]
+    end
+
+    test "first line", %{repo: repo} do
+      assert {:ok, [{1, "line 1"}], _} = FS.read_lines(repo, "HEAD", "decad.txt", 1)
+    end
+
+    test "last line of file ending with newline", %{repo: repo} do
+      assert {:ok, [{10, "line 10"}], _} = FS.read_lines(repo, "HEAD", "decad.txt", 10)
+    end
+
+    test "last (partial) line of file not ending with newline", %{repo: repo} do
+      assert {:ok, [{3, "c"}], _} = FS.read_lines(repo, "HEAD", "no_trail.txt", 3)
+    end
+
+    test "range overshooting EOF returns only existing lines", %{repo: repo} do
+      assert {:ok, lines, _} = FS.read_lines(repo, "HEAD", "decad.txt", 8..100)
+      assert lines == [{8, "line 8"}, {9, "line 9"}, {10, "line 10"}]
+    end
+
+    test "range entirely past EOF returns empty", %{repo: repo} do
+      assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "decad.txt", 100..200)
+    end
+
+    test "empty file returns empty list", %{repo: repo} do
+      assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "empty.txt", 1..10)
+    end
+
+    test "list of integers and ranges, deduplicated + sorted", %{repo: repo} do
+      assert {:ok, lines, _} =
+               FS.read_lines(repo, "HEAD", "decad.txt", [5, 1..2, 5, 8..9])
+
+      assert lines == [
+               {1, "line 1"},
+               {2, "line 2"},
+               {5, "line 5"},
+               {8, "line 8"},
+               {9, "line 9"}
+             ]
+    end
+
+    test "rejects zero or negative line numbers", %{repo: repo} do
+      assert {:error, {:invalid_line_range, 0}} =
+               FS.read_lines(repo, "HEAD", "decad.txt", 0)
+
+      assert {:error, {:invalid_line_range, -1}} =
+               FS.read_lines(repo, "HEAD", "decad.txt", -1)
+    end
+
+    test "rejects non-unit step ranges", %{repo: repo} do
+      assert {:error, {:invalid_line_range, _}} =
+               FS.read_lines(repo, "HEAD", "decad.txt", 1..10//2)
+    end
+
+    test "empty explicit range is not an error, returns empty list", %{repo: repo} do
+      assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "decad.txt", 5..4)
+    end
+
+    test "missing path returns :not_found", %{repo: repo} do
+      assert {:error, :not_found} =
+               FS.read_lines(repo, "HEAD", "nope.txt", 1..5)
+    end
+  end
+
   describe "grep/4 with context" do
     # Dedicated fixture with rich, multi-line content so context
     # ranges actually have content to slice. Also exercises

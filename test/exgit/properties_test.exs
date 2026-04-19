@@ -356,4 +356,102 @@ defmodule Exgit.PropertiesTest do
       end
     end
   end
+
+  # ---- F.N: FS.read_lines ----
+  #
+  # Property: for any blob with any combination of trailing-\n /
+  # no-trailing-\n, reading line N returns bytes identical to
+  # splitting the blob on \n and indexing with N-1. This pins the
+  # line-numbering convention the rest of the library uses (grep,
+  # grep+context, read_lines) and catches any drift.
+  describe "FS.read_lines (F.N)" do
+    alias Exgit.{FS, ObjectStore, RefStore, Repository}
+    alias Exgit.Object.{Commit, Tree}
+
+    property "read_lines agrees with split-on-\\n for every line in a blob" do
+      check all(
+              blob_data <- blob_like_binary(),
+              max_runs: 200
+            ) do
+        repo = build_one_file_repo(blob_data)
+
+        # Expected lines via a reference implementation (split on \n,
+        # drop phantom empty tail if the file ends with \n).
+        expected = reference_lines(blob_data)
+
+        for {expected_text, idx} <- Enum.with_index(expected, 1) do
+          assert {:ok, [{^idx, got}], _} = FS.read_lines(repo, "HEAD", "f.txt", idx)
+          assert got == expected_text
+        end
+
+        # And reading the full range returns the whole thing.
+        case length(expected) do
+          0 ->
+            assert {:ok, [], _} = FS.read_lines(repo, "HEAD", "f.txt", 1..1000)
+
+          n ->
+            {:ok, got, _} = FS.read_lines(repo, "HEAD", "f.txt", 1..n)
+
+            assert got == Enum.with_index(expected, 1) |> Enum.map(fn {t, i} -> {i, t} end)
+        end
+      end
+    end
+
+    defp blob_like_binary do
+      # Printable ASCII + \n, 0-256 bytes. Enough variation to hit
+      # trailing-\n / no-trailing-\n / empty / single-line / 10-line
+      # cases uniformly.
+      char_gen =
+        StreamData.frequency([
+          {10, StreamData.integer(32..126)},
+          {2, StreamData.constant(?\n)}
+        ])
+
+      StreamData.bind(
+        StreamData.list_of(char_gen, min_length: 0, max_length: 256),
+        fn chars -> StreamData.constant(IO.iodata_to_binary(chars)) end
+      )
+    end
+
+    # Reference implementation: git's convention.
+    defp reference_lines(""), do: []
+
+    defp reference_lines(data) do
+      parts = String.split(data, "\n")
+
+      # If data ends with \n, split produces a trailing empty element
+      # that isn't actually a line. Strip it.
+      if String.ends_with?(data, "\n"),
+        do: Enum.drop(parts, -1),
+        else: parts
+    end
+
+    defp build_one_file_repo(blob_data) do
+      store = ObjectStore.Memory.new()
+      {:ok, blob_sha, store} = ObjectStore.put(store, %Exgit.Object.Blob{data: blob_data})
+
+      tree = Tree.new([{"100644", "f.txt", blob_sha}])
+      {:ok, tree_sha, store} = ObjectStore.put(store, tree)
+
+      commit =
+        Commit.new(
+          tree: tree_sha,
+          parents: [],
+          author: "T <t@t> 1700000000 +0000",
+          committer: "T <t@t> 1700000000 +0000",
+          message: "one\n"
+        )
+
+      {:ok, commit_sha, store} = ObjectStore.put(store, commit)
+      {:ok, rs} = RefStore.write(RefStore.Memory.new(), "refs/heads/main", commit_sha, [])
+      {:ok, rs} = RefStore.write(rs, "HEAD", {:symbolic, "refs/heads/main"}, [])
+
+      %Repository{
+        object_store: store,
+        ref_store: rs,
+        config: Exgit.Config.new(),
+        path: nil
+      }
+    end
+  end
 end
