@@ -1,4 +1,10 @@
 defmodule Exgit.Blame do
+  # Silence Dialyzer false positives on MapSet opacity. Pattern
+  # borrowed from Exgit.Walk / Exgit.Diff — the `seen` set is a
+  # plain MapSet.t() but Dialyzer surfaces its internal
+  # :sets/map union at cross-function call sites.
+  @dialyzer :no_opaque
+
   @moduledoc """
   Per-line authorship attribution for a file at a ref.
 
@@ -53,7 +59,10 @@ defmodule Exgit.Blame do
 
   alias Exgit.Diff.LineDiff
   alias Exgit.Object.{Blob, Commit, Tree}
-  alias Exgit.{ObjectStore, RefStore, Repository}
+  alias Exgit.ObjectStore
+  alias Exgit.ObjectStore.Promisor
+  alias Exgit.RefStore
+  alias Exgit.Repository
 
   # Safety cap on how far back we'll walk. Real repos average
   # tens to hundreds of commits per file; 100k is 10x-100x more
@@ -75,6 +84,8 @@ defmodule Exgit.Blame do
           {:ok, [entry()], Repository.t()} | {:error, term()}
   def blame(%Repository{} = repo, reference, path) do
     with {:ok, commit_sha} <- resolve_commit(repo, reference),
+         {:ok, repo} <- ensure_history_available(repo, commit_sha),
+         {:ok, repo} <- ensure_path_blobs_available(repo, commit_sha, path),
          {:ok, target_lines} <- read_file_at_commit(repo, commit_sha, path) do
       # `pending` maps ORIGINAL target-file line index to the
       # current-commit's line index. Starts as identity (each line
@@ -92,6 +103,174 @@ defmodule Exgit.Blame do
         err ->
           err
       end
+    end
+  end
+
+  # For Promisor-backed repos, blame needs the commit graph to walk
+  # ancestors. If the target commit's parent is missing from the
+  # cache, trigger a one-shot `prefetch_history` to pull the commit
+  # graph (commits + trees, no blobs — those are only needed for the
+  # target commit's working tree, which prefetch/3 handles).
+  #
+  # This is lazy: we don't pay the history fetch unless blame is
+  # actually called, and we only pay it once per Promisor (the second
+  # blame call sees the cache populated and skips).
+  #
+  # Non-Promisor stores (Disk, Memory, eager) either have history
+  # or don't; there's no fetch to do, so this is a no-op.
+  defp ensure_history_available(%Repository{object_store: %Promisor{}} = repo, commit_sha) do
+    case ObjectStore.get(repo.object_store, commit_sha) do
+      {:ok, %Commit{} = commit} ->
+        case Commit.parents(commit) do
+          [] ->
+            # Root commit — no history to fetch.
+            {:ok, repo}
+
+          [parent_sha | _] ->
+            case ObjectStore.get(repo.object_store, parent_sha) do
+              {:ok, _} ->
+                # Parent already cached — history is likely
+                # already populated (or at least populated enough
+                # for this blame). Skip the fetch.
+                {:ok, repo}
+
+              {:error, _} ->
+                # Parent missing — pull the commit graph.
+                Exgit.FS.prefetch_history(repo, commit_sha)
+            end
+        end
+
+      {:error, _} ->
+        # Target commit itself missing; the outer `with` will
+        # surface the error.
+        {:ok, repo}
+    end
+  end
+
+  defp ensure_history_available(repo, _commit_sha), do: {:ok, repo}
+
+  # For Promisor-backed repos, blame's walk needs to read the blob of
+  # `path` at every commit in the first-parent chain. These historical
+  # blobs are NOT fetched by `FS.prefetch(blobs: true)` — that call
+  # only fetches blobs reachable from HEAD's tree. Historical versions
+  # of the same path are distinct blob SHAs.
+  #
+  # Strategy: walk the first-parent chain using the commit graph
+  # (which is cached after `ensure_history_available`), collect the
+  # unique blob SHAs for `path` at each commit, and batch-fetch
+  # any missing ones in a single `want <sha1> <sha2> ...` request.
+  #
+  # For a typical file (say README touched in 20 commits), this is
+  # ~20 SHAs in one batched fetch instead of 20 sequential
+  # on-demand fetches. Same idea as `FS.prefetch/3`'s batched fetch
+  # but scoped to a specific path's blob history.
+  #
+  # Non-Promisor stores: no-op.
+  defp ensure_path_blobs_available(%Repository{object_store: %Promisor{}} = repo, commit_sha, path) do
+    shas = collect_path_blob_shas(repo, commit_sha, path, MapSet.new(), [])
+    missing = Enum.reject(shas, fn sha -> ObjectStore.has?(repo.object_store, sha) end)
+
+    case missing do
+      [] -> {:ok, repo}
+      _ -> batch_fetch(repo, missing)
+    end
+  end
+
+  defp ensure_path_blobs_available(repo, _commit_sha, _path), do: {:ok, repo}
+
+  # Walk the first-parent chain, accumulating the blob sha of `path`
+  # at each commit. Stops when we hit a commit where the path doesn't
+  # exist (the file was introduced later), a commit with no parents,
+  # or @max_commits_walked as a safety cap on malformed chains.
+  defp collect_path_blob_shas(repo, commit_sha, path, seen, acc)
+       when map_size(seen) < @max_commits_walked do
+    if MapSet.member?(seen, commit_sha) do
+      Enum.uniq(acc)
+    else
+      seen = MapSet.put(seen, commit_sha)
+      step_commit(repo, commit_sha, path, seen, acc)
+    end
+  end
+
+  defp collect_path_blob_shas(_repo, _commit_sha, _path, _seen, acc) do
+    # Safety cap hit — return what we've collected; blame's own walk
+    # will surface :unbounded_history when it hits the same boundary.
+    Enum.uniq(acc)
+  end
+
+  defp step_commit(repo, commit_sha, path, seen, acc) do
+    case ObjectStore.get(repo.object_store, commit_sha) do
+      {:ok, %Commit{} = commit} ->
+        tree_sha = Commit.tree(commit)
+
+        acc =
+          case lookup_blob_sha(repo, tree_sha, path) do
+            {:ok, blob_sha} -> [blob_sha | acc]
+            {:error, _} -> acc
+          end
+
+        case Commit.parents(commit) do
+          [parent | _] -> collect_path_blob_shas(repo, parent, path, seen, acc)
+          [] -> Enum.uniq(acc)
+        end
+
+      # Commit not in cache — history wasn't fully fetched. Return
+      # what we've collected; blame's walk will terminate when it
+      # hits the same boundary.
+      _ ->
+        Enum.uniq(acc)
+    end
+  end
+
+  # Pure lookup: given a tree sha and a path, return the blob sha
+  # at that path — without going through Promisor on-demand fetch
+  # (we assume trees are already cached post-history-prefetch).
+  defp lookup_blob_sha(repo, tree_sha, path) do
+    segments = path |> String.split("/") |> Enum.reject(&(&1 == ""))
+    lookup_path(repo, tree_sha, segments)
+  end
+
+  defp lookup_path(_repo, _sha, []), do: {:error, :not_found}
+
+  defp lookup_path(repo, tree_sha, [name]) do
+    case ObjectStore.get(repo.object_store, tree_sha) do
+      {:ok, %Tree{entries: entries}} ->
+        case Enum.find(entries, fn {_, n, _} -> n == name end) do
+          {_mode, _, blob_sha} -> {:ok, blob_sha}
+          nil -> {:error, :not_found}
+        end
+
+      _ ->
+        {:error, :tree_not_cached}
+    end
+  end
+
+  defp lookup_path(repo, tree_sha, [name | rest]) do
+    case ObjectStore.get(repo.object_store, tree_sha) do
+      {:ok, %Tree{entries: entries}} ->
+        case Enum.find(entries, fn {_, n, _} -> n == name end) do
+          {"40000", _, sub_sha} -> lookup_path(repo, sub_sha, rest)
+          _ -> {:error, :not_found}
+        end
+
+      _ ->
+        {:error, :tree_not_cached}
+    end
+  end
+
+  # One batched `want sha1 sha2 ... shaN` request. Imports everything
+  # the server returns into the Promisor cache.
+  defp batch_fetch(%Repository{object_store: %Promisor{} = promisor} = repo, shas) do
+    transport = promisor.transport
+
+    with {:ok, pack_bytes, _} <- Exgit.Transport.fetch(transport, shas, haves: []),
+         true <- byte_size(pack_bytes) > 0 || {:error, :empty_pack},
+         {:ok, parsed} <- Exgit.Pack.Reader.parse(pack_bytes),
+         {:ok, new_promisor} <- Promisor.import_objects(promisor, parsed) do
+      {:ok, %{repo | object_store: new_promisor}}
+    else
+      false -> {:error, :empty_pack}
+      err -> err
     end
   end
 
