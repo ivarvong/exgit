@@ -71,6 +71,12 @@ fixtures = [
     second_search_term: "cloudflare"
   },
   %{
+    name: :claude_sdk,
+    url: "https://github.com/anthropics/claude-agent-sdk-python",
+    search_term: "claude",
+    second_search_term: "message"
+  },
+  %{
     name: :opencode,
     url: "https://github.com/anomalyco/opencode",
     search_term: "opencode",

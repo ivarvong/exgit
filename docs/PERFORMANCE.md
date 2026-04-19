@@ -17,6 +17,7 @@ them, and what we broke + fixed in order to make them honest.
 | Fixture | Files | Pack | Warm grep (median) | Per-file |
 |---|---:|---:|---:|---:|
 | [`ivarvong/pyex`](https://github.com/ivarvong/pyex) | 275 | 1.2 MB | **11 ms** | 40 µs |
+| [`anthropics/claude-agent-sdk-python`](https://github.com/anthropics/claude-agent-sdk-python) | 96 | ~1 MB | **6.8 ms** | 71 µs |
 | [`cloudflare/agents`](https://github.com/cloudflare/agents) | 1,418 | 4 MB | **58 ms** | 41 µs |
 | [`anomalyco/opencode`](https://github.com/anomalyco/opencode) | 4,600 | ~30 MB | **451 ms** | 98 µs |
 
@@ -451,20 +452,78 @@ for the future maintainer who hits a memory-bound workload.
 We'd rather build it against real usage constraints than
 guess.
 
-### New agent primitives
+### Agent primitives
 
-Things agents ask for that exgit doesn't have yet:
+Three shipped in the Round 1 push:
 
-- **`FS.read_lines(repo, ref, path, line_range)`** — read only
-  the requested line range of a file.
-- **`FS.grep` with `:context`** — N lines of surrounding context
-  per match.
+- **`FS.read_lines(repo, ref, path, line_range)`** — read only the
+  requested line range of a file. One decompress, bounded-work
+  slicing. Measured against `git show REF:path | sed -n 'L1,L2p'`
+  for parity. See commit `70627bc`.
+
+- **`FS.grep` with `:context` / `:before` / `:after`** — N lines of
+  surrounding context per match, `git grep -C N` parity. See
+  commit `7659c7f`. Benchmark results below.
+
+- **`FS.read_path(..., resolve_lfs_pointers: true)`** — detects
+  git-lfs pointer blobs and surfaces them as
+  `{:lfs_pointer, %{oid, size, raw}}` instead of silently
+  returning the ~130 bytes of pointer text. Byte-parity tested
+  against `git lfs pointer --check`. See commit `e5d3be2`.
+
+Pending:
+
 - **`FS.multi_grep(patterns)`** — N patterns in one walk.
 - **`Exgit.Blame`** — last-writer-per-line. The single most
   commonly-requested missing feature.
 
-Each of these reduces ops-per-task, which matters more for
-agent latency than microsecond-per-op optimization.
+### Benchmark: grep+context vs. grep+N×read_path
+
+The killer use case for `:context` is "find a match and show it
+with surrounding code." Before the flag shipped, an agent did
+that with a grep followed by N `read_path` calls (plus line
+splitting on the client). Now it's one call.
+
+Measured via `bench/grep_context_bench.exs` against four real
+fixtures, 5 runs each, median reported. Legacy = grep + up to 20
+read_path + manual line slicing. New = `grep(context: 3)` capped
+at 20 hits. Both produce equivalent output.
+
+| Fixture | Files | Hits | Legacy (median) | New (median) | Speedup |
+|---|---:|---:|---:|---:|---:|
+| `ivarvong/pyex` | 275 | 2 | 9.1 ms | 8.7 ms | **1.04×** |
+| `anthropics/claude-agent-sdk-python` | ~100 | 20 | 1.8 ms | 1.4 ms | **1.30×** |
+| `cloudflare/agents` | 1,418 | 20 | 1.1 ms | 171 µs | **6.49×** |
+| `anomalyco/opencode` | 4,600 | 20 | 1.5 ms | 280 µs | **5.47×** |
+
+Why the spread:
+
+- **pyex, 1.04×** — only 2 matches, so legacy does just 2
+  `read_path` calls. The overhead being saved is small; most of
+  the 9 ms is the grep itself scanning 275 files.
+- **claude-agent-sdk-python, 1.30×** — 20 matches but small files
+  (avg ~270 lines). Per-file decompress savings modest. Breakdown
+  from a separate profile: grep 711 µs, 20× read_path 855 µs,
+  grep+context 1305 µs. The "new way" adds ~600 µs of per-match
+  context slicing (30 µs × 20), which eats most of the saved
+  read_path time on small files.
+- **cloudflare/agents, 6.49×** and **opencode, 5.47×** — larger
+  files + hits scattered across the tree means legacy pays
+  full-blob decompress + tree-walk overhead 20 times. New way
+  does one walk + context slice per match.
+
+The win scales with the **aggregate decompressed bytes avoided**,
+not with file count. On small repos with tiny files, grep+context
+is a small improvement (~1.0-1.3×). On real-world repos with
+larger files and many matches, it's 5-7× — firmly in "this
+changes agent latency" territory.
+
+Invocation:
+
+```
+mix run bench/grep_context_bench.exs               # all fixtures, 5 runs
+mix run bench/grep_context_bench.exs 10 agents     # 10 runs, agents only
+```
 
 ## Known caveats
 
