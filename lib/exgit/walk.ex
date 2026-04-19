@@ -271,20 +271,30 @@ defmodule Exgit.Walk do
   @flag_stale 4
 
   defp find_merge_base(repo, sha_a, sha_b) do
-    # `find_merge_base_raw/3` is total (see merge_base_all/2 comment).
-    {:ok, candidates} = find_merge_base_raw(repo, sha_a, sha_b)
+    # `mb_bfs/3` is total (see merge_base_all/2 comment).
+    {:ok, candidate_ts} = mb_bfs(repo, sha_a, sha_b)
 
-    case candidates do
-      [] -> {:error, :none}
-      _ -> {:ok, pick_best_candidate(repo, candidates)}
+    case map_size(candidate_ts) do
+      0 -> {:error, :none}
+      _ -> {:ok, pick_best_candidate(candidate_ts)}
     end
   end
 
   # Run the frontier BFS and return the raw candidate list without
-  # picking a single winner. Used by `find_merge_base/3` (which then
-  # calls `pick_best_candidate/2`) and by the public
-  # `merge_base_all/2`.
+  # picking a single winner. Used by `merge_base_all/2`. The
+  # single-winner path (`find_merge_base/3`) calls `mb_bfs/3`
+  # directly so it can reuse the timestamps the BFS already
+  # computed — see `pick_best_candidate/1`.
   defp find_merge_base_raw(repo, sha_a, sha_b) do
+    case mb_bfs(repo, sha_a, sha_b) do
+      {:ok, candidate_ts} -> {:ok, Map.keys(candidate_ts)}
+    end
+  end
+
+  # Core BFS. Returns `{:ok, %{sha => author_ts}}` — the timestamp
+  # is captured at enqueue time, so callers who need it for
+  # tiebreaking don't have to re-fetch the commit object.
+  defp mb_bfs(repo, sha_a, sha_b) do
     flags =
       %{}
       |> Map.update(sha_a, @flag_a, &Bitwise.bor(&1, @flag_a))
@@ -294,12 +304,6 @@ defmodule Exgit.Walk do
       enqueue_seed(:gb_sets.empty(), repo, sha_a, flags)
       |> enqueue_seed_second(repo, sha_a, sha_b, flags)
 
-    # `candidates` is kept as a separate argument (rather than a key
-    # in `state`) so Dialyzer can track its `MapSet.t()` opacity
-    # without the type degenerating to a plain map through
-    # `state.candidates` access. The rest of the traversal state
-    # stays in a plain map because those fields don't need opaque
-    # handling.
     state = %{
       queue: queue,
       flags: flags,
@@ -307,29 +311,23 @@ defmodule Exgit.Walk do
       stale_in_queue: stale_in_queue
     }
 
-    mb_loop(repo, state, MapSet.new())
+    mb_loop(repo, state, %{})
   end
 
   # When the frontier BFS produces multiple candidate LCAs (classic
-  # criss-cross merge), `hd(candidates)` is nondeterministic — MapSet
-  # iteration order depends on insertion hashing.
+  # criss-cross merge), the chosen winner must be deterministic.
   #
   # Git's `merge-base` resolves ties by picking the newest commit by
   # author timestamp, with SHA as a stable tiebreaker. Emulate that
   # so single-base queries produce git-compatible output. Callers who
-  # want the full set of LCAs should use `merge_base_all/2` (future
-  # addition).
-  defp pick_best_candidate(repo, candidates) do
-    candidates
-    |> Enum.map(fn sha ->
-      ts =
-        case get_commit(repo, sha) do
-          {:ok, c} -> parse_timestamp(Commit.author(c))
-          _ -> 0
-        end
-
-      {sha, ts}
-    end)
+  # want the full set of LCAs should use `merge_base_all/2`.
+  #
+  # The BFS already computed each candidate's timestamp when it
+  # enqueued the commit (see `enqueue_seed` / `enqueue_parent`),
+  # so `mb_loop` threads a `%{sha => ts}` map and we sort that
+  # directly — no extra `get_commit` calls per candidate.
+  defp pick_best_candidate(candidate_ts) do
+    candidate_ts
     |> Enum.sort_by(fn {sha, ts} -> {-ts, sha} end)
     |> hd()
     |> elem(0)
@@ -377,12 +375,13 @@ defmodule Exgit.Walk do
     end
   end
 
-  @spec mb_loop(repo(), map(), MapSet.t()) :: {:ok, [binary()]}
+  @spec mb_loop(repo(), map(), %{binary() => integer()}) ::
+          {:ok, %{binary() => integer()}}
   defp mb_loop(repo, %{queue: queue} = state, candidates) do
     if :gb_sets.is_empty(queue) do
-      {:ok, MapSet.to_list(candidates)}
+      {:ok, candidates}
     else
-      {{_ts, sha, commit}, queue} = :gb_sets.take_smallest(queue)
+      {{neg_ts, sha, commit}, queue} = :gb_sets.take_smallest(queue)
 
       f = Map.fetch!(state.flags, sha)
       was_stale = Bitwise.band(f, @flag_stale) != 0
@@ -395,7 +394,10 @@ defmodule Exgit.Walk do
 
       {candidates, propagate_flag} =
         if both and not was_stale do
-          {MapSet.put(candidates, sha), @flag_stale}
+          # Negate back to the real (positive) author timestamp — the
+          # queue stores `-ts` for max-heap semantics under
+          # `:gb_sets.take_smallest/1`.
+          {Map.put(candidates, sha, -neg_ts), @flag_stale}
         else
           {candidates, 0}
         end
@@ -406,7 +408,7 @@ defmodule Exgit.Walk do
       # making merge_base O(|queue|^2) in the worst case. Now we
       # maintain stale_in_queue incrementally.
       if in_queue > 0 and in_queue == stale_in_queue do
-        {:ok, MapSet.to_list(candidates)}
+        {:ok, candidates}
       else
         {flags, {queue, in_queue, stale_in_queue}} =
           Enum.reduce(
