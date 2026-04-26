@@ -551,7 +551,7 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
     result =
       with :ok <- :file.write(handle.fd, final_chunks),
            :ok <- :file.sync(handle.fd) do
-        :file.close(handle.fd)
+        _ = :file.close(handle.fd)
 
         hex = Base.encode16(sha, case: :lower)
         <<prefix::binary-size(2), rest::binary>> = hex
@@ -560,7 +560,7 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
 
         if File.exists?(path) do
           # Already stored by a concurrent writer — idempotent.
-          File.rm(handle.tmp_path)
+          _ = File.rm(handle.tmp_path)
           {:ok, sha}
         else
           with :ok <- File.mkdir_p(dir),

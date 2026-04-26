@@ -8,11 +8,25 @@ Run these in order. CI runs all of them; catching failures locally is faster.
 mix format
 mix compile --warnings-as-errors
 MIX_ENV=dev mix credo --strict
+MIX_ENV=dev mix dialyzer
 mix test --warnings-as-errors
 ```
 
-CI also runs Dialyzer (`MIX_ENV=dev mix dialyzer`) but it's slow (~2 min
-on a cold PLT). Skip it locally unless you touched a typespec or protocol.
+Dialyzer is slow (~2 min on a cold PLT, ~30s warm). Run it every time —
+it catches type errors that Credo and the compiler miss entirely. The five
+Dialyzer classes that showed up in this codebase:
+
+- **`pattern_match`** — a clause that can never match given the inferred
+  types (e.g. `{:literal, s}` in a function Dialyzer proves only receives
+  `binary | %Regex{}`). Remove the dead clause.
+- **`unmatched_return`** — a call whose return type includes `{:error, _}`
+  but the result is discarded. Add `_ =` to silence intentional ignoring.
+- **`improper_list_constr`** — `[list | binary]` builds an improper list.
+  Use `[list, binary]` instead.
+- **`pattern_match` on `with`-else** — Dialyzer traces through the `with`
+  chain and knows the else block only receives one type. If it says
+  `{:error, _}` can't match, the inferred type is more specific (e.g.
+  always a tuple, so use `else err -> err`).
 
 ## What CI checks (`.github/workflows/ci.yml`)
 

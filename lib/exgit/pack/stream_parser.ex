@@ -570,7 +570,7 @@ defmodule Exgit.Pack.StreamParser do
 
   # Delta or fallback (no write handle): accumulate in inflate_out.
   defp route_chunk(_state, cur, chunk_bin) do
-    {:ok, %{cur | inflate_out: [cur.inflate_out | chunk_bin]}}
+    {:ok, %{cur | inflate_out: [cur.inflate_out, chunk_bin]}}
   end
 
   defp cancel_write_handle(_store, nil), do: :ok
@@ -769,8 +769,7 @@ defmodule Exgit.Pack.StreamParser do
              current: nil
          }}
       else
-        {:error, _} = err -> err
-        :error -> {:error, {:base_not_found, cur.obj_offset}}
+        err -> err
       end
     end
   end

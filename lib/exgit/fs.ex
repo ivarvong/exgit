@@ -1151,7 +1151,6 @@ defmodule Exgit.FS do
   defp resolve_concurrency(_), do: 1
 
   defp pattern_repr(%Regex{source: s}), do: "~r/#{s}/"
-  defp pattern_repr({:literal, s}), do: s
   defp pattern_repr(s) when is_binary(s), do: s
 
   @doc """
