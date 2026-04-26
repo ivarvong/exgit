@@ -437,30 +437,11 @@ defmodule Exgit.Transport.HTTP do
 
       # Streaming path: finalise the parser and return the updated store.
       {:ok, %{parser: %StreamParser{} = parser}} ->
-        Exgit.Telemetry.span(
-          [:exgit, :pack, :stream_parse],
-          %{objects: parser.objects_done},
-          fn ->
-            case StreamParser.finalize(parser) do
-              {:ok, n, final_store} ->
-                result = {:ok, <<>>, %{objects: n, store: final_store}}
-                {:span, result, %{object_count: n, checksum: :ok}}
-
-              {:error, reason} = err ->
-                {:span, err, %{error: reason}}
-            end
-          end
-        )
+        finalize_stream_parse(parser)
 
       # Legacy path: materialise the iolist into a binary for the caller.
       {:ok, %{pack_iolist: iolist}} ->
-        pack_data = IO.iodata_to_binary(iolist)
-
-        if byte_size(pack_data) > 0 do
-          {:ok, pack_data, %{}}
-        else
-          {:ok, <<>>, %{objects: 0}}
-        end
+        finalize_pack_iolist(iolist)
 
       error ->
         error
@@ -479,6 +460,31 @@ defmodule Exgit.Transport.HTTP do
   #   - Otherwise auto-detect on the FIRST pack-section data packet:
   #     leading byte 1/2/3 → sideband channel; anything else → raw stream.
   #
+  defp finalize_stream_parse(parser) do
+    Exgit.Telemetry.span(
+      [:exgit, :pack, :stream_parse],
+      %{objects: parser.objects_done},
+      fn ->
+        case StreamParser.finalize(parser) do
+          {:ok, n, final_store} ->
+            result = {:ok, <<>>, %{objects: n, store: final_store}}
+            {:span, result, %{object_count: n, checksum: :ok}}
+
+          {:error, reason} = err ->
+            {:span, err, %{error: reason}}
+        end
+      end
+    )
+  end
+
+  defp finalize_pack_iolist(iolist) do
+    pack_data = IO.iodata_to_binary(iolist)
+
+    if byte_size(pack_data) > 0,
+      do: {:ok, pack_data, %{}},
+      else: {:ok, <<>>, %{objects: 0}}
+  end
+
   # Streaming path (parser != nil):
   #   Pack bytes are fed directly to a StreamParser that writes objects to
   #   the object store as they arrive. No pack_iolist is accumulated.

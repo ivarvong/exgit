@@ -1417,7 +1417,7 @@ defmodule Exgit.FS do
             "reads; silent empty results would be worse than this error."
   end
 
-   defp compile_grep_pattern(%Regex{} = r, _opts), do: r
+  defp compile_grep_pattern(%Regex{} = r, _opts), do: r
 
   defp compile_grep_pattern(str, opts) when is_binary(str) do
     ci = Keyword.get(opts, :case_insensitive, false)

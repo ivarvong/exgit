@@ -140,16 +140,16 @@ defmodule Exgit.Object.Tree do
   #   - names starting with `/` (absolute-path write escape)
   #   - NUL bytes (already impossible because NUL is the terminator,
   #     but assert it for defense-in-depth)
-   #   - `.git` in any case — a hostile tree that carries `.GIT/config`
-    #     on a case-insensitive filesystem overwrites the real repo
-    #     config (CVE-2014-9390 / 2014-9390-class)
-    #
-    # `.gitmodules` is intentionally NOT blocked: it is a legitimate
-    # file present in any repo that uses submodules. The URL-injection
-    # risk only materialises if we process submodule config; we do not.
-    #
-    # Hostile trees are rejected at decode time; they never reach
-    # `FS.write_path`, a checkout, or `insert_blob_into_tree`.
+  #   - `.git` in any case — a hostile tree that carries `.GIT/config`
+  #     on a case-insensitive filesystem overwrites the real repo
+  #     config (CVE-2014-9390 / 2014-9390-class)
+  #
+  # `.gitmodules` is intentionally NOT blocked: it is a legitimate
+  # file present in any repo that uses submodules. The URL-injection
+  # risk only materialises if we process submodule config; we do not.
+  #
+  # Hostile trees are rejected at decode time; they never reach
+  # `FS.write_path`, a checkout, or `insert_blob_into_tree`.
   defp validate_entry_name(""), do: {:error, :tree_entry_name_empty}
   defp validate_entry_name("."), do: {:error, :tree_entry_name_dot}
   defp validate_entry_name(".."), do: {:error, :tree_entry_name_dotdot}

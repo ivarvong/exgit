@@ -571,7 +571,9 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
       end
 
     case result do
-      {:ok, sha} -> {:ok, sha, %Disk{root: root}}
+      {:ok, sha} ->
+        {:ok, sha, %Disk{root: root}}
+
       {:error, _} = err ->
         _ = :file.close(handle.fd)
         _ = File.rm(handle.tmp_path)

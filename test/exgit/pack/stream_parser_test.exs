@@ -1,10 +1,10 @@
 defmodule Exgit.Pack.StreamParserTest do
   use ExUnit.Case, async: true
 
+  alias Exgit.Object
   alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.ObjectStore.Memory
   alias Exgit.Pack.{Reader, StreamParser, Writer}
-  alias Exgit.{Object, ObjectStore}
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -24,7 +24,7 @@ defmodule Exgit.Pack.StreamParserTest do
   end
 
   # Feed `pack_binary` byte-by-byte (maximum streaming pressure).
-  defp parse_chunked(pack, chunk_size \\ 1) do
+  defp parse_chunked(pack, chunk_size) do
     store = new_store()
     parser = StreamParser.new(store)
 

@@ -40,23 +40,6 @@ defmodule Exgit.Pack.StreamParserAdversarialTest do
     body <> checksum
   end
 
-  # Encode a single object the same way Pack.Writer does (type/size varint + zlib).
-  defp encode_object_raw(type_code, content) do
-    varint = Common.encode_type_size_varint(type_code, byte_size(content))
-    compressed = :zlib.compress(content)
-    IO.iodata_to_binary([varint, compressed])
-  end
-
-  # Build a valid blob pack with a custom raw content size declared in the header
-  # but a different actual content (for zip-bomb simulation: claim tiny size but
-  # provide large compressed content, or claim large size with small content).
-  defp pack_with_declared_size(type_code, declared_size, actual_content) do
-    varint = Common.encode_type_size_varint(type_code, declared_size)
-    compressed = :zlib.compress(actual_content)
-    object_bin = IO.iodata_to_binary([varint, compressed])
-    raw_pack([object_bin])
-  end
-
   # ---------------------------------------------------------------------------
   # Object size cap
   # ---------------------------------------------------------------------------
@@ -303,7 +286,8 @@ defmodule Exgit.Pack.StreamParserAdversarialTest do
 
       # Second object: OFS_DELTA claiming base is 10000 bytes before it.
       # The pack starts at byte 12, so the base offset would be negative.
-      delta_content = <<4, 4, 0, 4>> <> "base"  # trivial delta: copy 4 bytes
+      # trivial delta: copy 4 bytes
+      delta_content = <<4, 4, 0, 4>> <> "base"
       delta_varint = Common.encode_type_size_varint(6, byte_size(delta_content))
       # neg_ofs = 10000; blob_2 offset = 12 + byte_size(blob_bin).
       neg_ofs_bin = Common.encode_ofs_varint(10_000)

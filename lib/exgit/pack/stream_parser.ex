@@ -67,8 +67,8 @@ defmodule Exgit.Pack.StreamParser do
   reach the correct final value until all bytes have been fed.
   """
 
-  alias Exgit.Pack.{Common, Delta}
   alias Exgit.{Object, ObjectStore}
+  alias Exgit.Pack.{Common, Delta}
 
   # ---------------------------------------------------------------------------
   # Defaults & constants
@@ -254,12 +254,7 @@ defmodule Exgit.Pack.StreamParser do
         if n > state.limits.max_objects do
           {:error, {:too_many_objects, n, state.limits.max_objects}}
         else
-          loop(%{state |
-            phase: {:objects, n},
-            num_objects: n,
-            buffer: rest,
-            buffer_start: 12
-          })
+          loop(%{state | phase: {:objects, n}, num_objects: n, buffer: rest, buffer_start: 12})
         end
 
       <<"PACK", v::32-big, _::binary>> ->
@@ -316,11 +311,7 @@ defmodule Exgit.Pack.StreamParser do
         # Delta objects still accumulate inflate_out for Delta.apply.
         {cur, state2} = maybe_open_write(cur, state)
 
-        state2 = %{state2 |
-          buffer: remaining,
-          buffer_start: bs + header_consumed,
-          current: cur
-        }
+        state2 = %{state2 | buffer: remaining, buffer_start: bs + header_consumed, current: cur}
 
         # do_inflate always returns {:ok, updated_state} | {:error, reason}.
         # When more bytes are needed, updated_state.current is non-nil and
@@ -425,7 +416,8 @@ defmodule Exgit.Pack.StreamParser do
       ref_base_sha: nil,
       # Streaming inflate state (Phase 3)
       zlib: nil,
-      inflate_out: [],        # used by delta objects only (Phase 3+)
+      # used by delta objects only (Phase 3+)
+      inflate_out: [],
       inflate_out_bytes: 0,
       inflate_in_bytes: 0,
       inflate_in_tail: <<>>,
@@ -456,7 +448,7 @@ defmodule Exgit.Pack.StreamParser do
   #   2. Fallback   — bisect on `buffer[0..inflate_in_bytes]`, which is still
   #      present in the buffer (not advanced until inflation completes).
   #
-  # TODO Phase 3+: add streaming store-write API so the inflate_out iolist
+  # Phase 3+ follow-up: add streaming store-write API so the inflate_out iolist
   # is flushed to the store chunk-by-chunk rather than materialised in full
   # before storing. That eliminates the O(object_size) heap spike for large
   # blobs. Requires new `open_object / write_chunk / close_object` callbacks
@@ -527,17 +519,20 @@ defmodule Exgit.Pack.StreamParser do
              new_out_bytes / new_in_bytes > limits.max_inflate_ratio do
           cleanup_zlib(zlib)
           cancel_write_handle(state.store, cur.write_handle)
-          {:error, {:inflate_ratio_exceeded, new_in_bytes, new_out_bytes, limits.max_inflate_ratio}}
+
+          {:error,
+           {:inflate_ratio_exceeded, new_in_bytes, new_out_bytes, limits.max_inflate_ratio}}
         else
           # Route output to write_handle (non-delta, Phase 3+) or inflate_out (delta).
           case route_chunk(state, cur, chunk_bin) do
             {:ok, cur} ->
-              cur = %{cur |
-                zlib: zlib,
-                inflate_out_bytes: new_out_bytes,
-                inflate_in_bytes: new_in_bytes,
-                inflate_in_tail: new_in_tail,
-                inflate_adler: new_adler
+              cur = %{
+                cur
+                | zlib: zlib,
+                  inflate_out_bytes: new_out_bytes,
+                  inflate_in_bytes: new_in_bytes,
+                  inflate_in_tail: new_in_tail,
+                  inflate_adler: new_adler
               }
 
               state = %{state | current: cur}
@@ -724,7 +719,7 @@ defmodule Exgit.Pack.StreamParser do
     new_buf = binary_part(state.buffer, zlib_consumed, byte_size(state.buffer) - zlib_consumed)
     new_bs = state.buffer_start + zlib_consumed
 
-      if cur.write_handle != nil do
+    if cur.write_handle != nil do
       # Streaming write path (Phase 3+): content already in the store via
       # write_handle chunks; just finalise and get the SHA back.
       # Raw content is NOT cached here (blobs/tags are rarely delta bases).
@@ -733,14 +728,15 @@ defmodule Exgit.Pack.StreamParser do
           type = Common.type_atom(cur.type_code)
 
           {:ok,
-           %{state |
-             store: new_store,
-             buffer: new_buf,
-             buffer_start: new_bs,
-             objects_done: state.objects_done + 1,
-             offset_to_sha: Map.put(state.offset_to_sha, cur.obj_offset, {type, sha, 0}),
-             sha_to_depth: Map.put(state.sha_to_depth, sha, 0),
-             current: nil
+           %{
+             state
+             | store: new_store,
+               buffer: new_buf,
+               buffer_start: new_bs,
+               objects_done: state.objects_done + 1,
+               offset_to_sha: Map.put(state.offset_to_sha, cur.obj_offset, {type, sha, 0}),
+               sha_to_depth: Map.put(state.sha_to_depth, sha, 0),
+               current: nil
            }}
 
         {:error, _} = err ->
@@ -760,16 +756,17 @@ defmodule Exgit.Pack.StreamParser do
           maybe_cache_raw(state, sha, type, final_content)
 
         {:ok,
-         %{state |
-           store: new_store,
-           buffer: new_buf,
-           buffer_start: new_bs,
-           objects_done: state.objects_done + 1,
-           offset_to_sha: Map.put(state.offset_to_sha, cur.obj_offset, {type, sha, depth}),
-           sha_to_depth: Map.put(state.sha_to_depth, sha, depth),
-           raw_cache: new_raw_cache,
-           raw_cache_bytes: new_raw_bytes,
-           current: nil
+         %{
+           state
+           | store: new_store,
+             buffer: new_buf,
+             buffer_start: new_bs,
+             objects_done: state.objects_done + 1,
+             offset_to_sha: Map.put(state.offset_to_sha, cur.obj_offset, {type, sha, depth}),
+             sha_to_depth: Map.put(state.sha_to_depth, sha, depth),
+             raw_cache: new_raw_cache,
+             raw_cache_bytes: new_raw_bytes,
+             current: nil
          }}
       else
         {:error, _} = err -> err
@@ -793,7 +790,11 @@ defmodule Exgit.Pack.StreamParser do
   end
 
   # OFS_DELTA: look up base via offset_to_sha, with raw_cache fast path.
-  defp resolve(state, %{type_code: 6, ofs_base_offset: base_offset, obj_offset: obj_offset}, delta) do
+  defp resolve(
+         state,
+         %{type_code: 6, ofs_base_offset: base_offset, obj_offset: obj_offset},
+         delta
+       ) do
     case Map.fetch(state.offset_to_sha, base_offset) do
       {:ok, {base_type, base_sha, base_depth}} ->
         case fetch_content(state, base_sha) do
@@ -839,7 +840,12 @@ defmodule Exgit.Pack.StreamParser do
   # Once the budget is exceeded we stop adding new entries (existing ones
   # remain valid until they're naturally evicted by SHA collision, which
   # doesn't happen since SHAs are unique).
-  defp maybe_cache_raw(%{raw_cache: cache, raw_cache_bytes: used, limits: limits}, sha, type, content) do
+  defp maybe_cache_raw(
+         %{raw_cache: cache, raw_cache_bytes: used, limits: limits},
+         sha,
+         type,
+         content
+       ) do
     budget = limits.raw_cache_budget || 0
     content_size = byte_size(content)
 

@@ -8,11 +8,11 @@ defmodule Exgit.Pack.StreamParserStreamingWriteTest do
 
   use ExUnit.Case, async: true
 
+  alias Exgit.Object
   alias Exgit.Object.Blob
   alias Exgit.ObjectStore
   alias Exgit.ObjectStore.{Disk, Memory}
   alias Exgit.Pack.{Reader, StreamParser, Writer}
-  alias Exgit.{Object}
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -65,13 +65,16 @@ defmodule Exgit.Pack.StreamParserStreamingWriteTest do
       blob_sha = Object.sha(blob)
       tree = Exgit.Object.Tree.new([{"100644", "file.txt", blob_sha}])
       tree_sha = Object.sha(tree)
-      commit = Exgit.Object.Commit.new(
-        tree: tree_sha,
-        parents: [],
-        author: "Test <t@t.com>",
-        committer: "Test <t@t.com>",
-        message: "init\n"
-      )
+
+      commit =
+        Exgit.Object.Commit.new(
+          tree: tree_sha,
+          parents: [],
+          author: "Test <t@t.com>",
+          committer: "Test <t@t.com>",
+          message: "init\n"
+        )
+
       pack = Writer.build([blob, tree, commit])
 
       {:ok, _n, stream_store} = parse_all(pack, Memory.new())
