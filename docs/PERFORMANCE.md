@@ -4,698 +4,368 @@ How fast is exgit at what it's designed for — agent workflows that
 lazy-clone a repo, prefetch the trees, and do many reads (grep,
 read_path, walk)?
 
-**Short answer:** on `ivarvong/pyex` (275 files, 1.2 MB pack),
-steady-state `grep` runs in 11 ms. On `anomalyco/opencode` (4,600
-files, ~30 MB pack), steady-state `grep` runs in 451 ms (~97 µs
-per file). Scaling is near-linear in file count.
-
-This document describes what the numbers are, how we measured
-them, and what we broke + fixed in order to make them honest.
+**Short answer:** on `anomalyco/opencode` (4,645 files, ~30 MB
+fetch pack), a cold clone + prefetch completes in **~7 s** and
+steady-state `grep` runs in **130–160 ms** for literal patterns
+(Boyer-Moore) or **~335 ms** for case-insensitive regex. On the
+436-file `adafruit/Adafruit_CircuitPython_Bundle`, steady-state
+`grep` runs in **~2 ms**.
 
 ## TL;DR
 
-| Fixture | Files | Pack | Warm grep (median) | Per-file |
-|---|---:|---:|---:|---:|
-| [`ivarvong/pyex`](https://github.com/ivarvong/pyex) | 275 | 1.2 MB | **11 ms** | 40 µs |
-| [`anthropics/claude-agent-sdk-python`](https://github.com/anthropics/claude-agent-sdk-python) | 96 | ~1 MB | **6.8 ms** | 71 µs |
-| [`cloudflare/agents`](https://github.com/cloudflare/agents) | 1,418 | 4 MB | **58 ms** | 41 µs |
-| [`anomalyco/opencode`](https://github.com/anomalyco/opencode) | 4,600 | ~30 MB | **451 ms** | 98 µs |
+| Fixture | Files | Fetch pack | Clone + prefetch | Grep (literal) | Grep (regex/ci) |
+|---|---:|---:|---:|---:|---:|
+| [`ivarvong/pyex`](https://github.com/ivarvong/pyex) | 275 | 1.2 MB | ~700 ms | ~11 ms | ~11 ms |
+| [`cloudflare/agents`](https://github.com/cloudflare/agents) | 1,418 | 4 MB | ~8 s | ~58 ms | ~58 ms |
+| [`anomalyco/opencode`](https://github.com/anomalyco/opencode) | 4,645 | ~30 MB | **~7 s** | **~140 ms** | **~335 ms** |
+| [`adafruit/Adafruit_CircuitPython_Bundle`](https://github.com/adafruit/Adafruit_CircuitPython_Bundle) | 436 | ~1 MB | ~2 s | **~2 ms** | ~15 ms |
 
-"Warm grep" = steady-state `Exgit.FS.grep/4` against a repo whose
-cache has already absorbed the first on-demand commit fetch. This
-is the number that matters for an agent loop doing many searches
-against the same repo; the first call pays a one-time ~50-500 ms
-tax for the commit fetch, everything after it is local.
+"Clone + prefetch" = `Exgit.clone(url, lazy: true)` +
+`Exgit.FS.prefetch(repo, "HEAD", blobs: true)`.
 
-Full numbers including the full `clone → prefetch → grep` workflow
-are in the **[Benchmarks](#benchmarks)** section.
+"Grep (literal)" = case-sensitive, no regex metacharacters;
+routes through `:binary.matches` (Boyer-Moore). "Grep (regex/ci)"
+= case-insensitive `%Regex{}` scan.
+
+Both grep numbers are steady-state (warm CPU, all objects in the
+Memory store). The first grep after prefetch is the same cost —
+unlike an older lazy-fetch path, prefetch now pre-populates
+everything.
 
 ## What we measure
 
-Three fixtures, each a real public GitHub repo. Picked to cover a
-small-to-large size range with **different ownership models** so
-the benchmark is reproducible without depending on any single
-maintainer's choices:
+Four fixtures, each a real public GitHub repo. Picked to cover a
+small-to-large size range with repos that have submodules, many
+binary assets, and diverse layouts:
 
 - `ivarvong/pyex` — **owned by the exgit maintainer**. Guaranteed
-  against surprise force-push / rename. Small (275 files).
-- `cloudflare/agents` — Cloudflare org repo. ~1.4k files. Medium
-  real-world project, representative of many production codebases.
-- `anomalyco/opencode` — Anomaly org repo. ~4.6k files. Large,
-  used for grep-at-scale validation.
+  against surprise force-push. Small (275 files), good for
+  validating algorithmic baselines.
+- `cloudflare/agents` — ~1.4k files. Medium real-world project.
+- `anomalyco/opencode` — ~4.6k files, 26 MB blob in the pack. Large.
+- `adafruit/Adafruit_CircuitPython_Bundle` — 436 files, uses git
+  submodules (`.gitmodules` present). Previously crashed on prefetch
+  due to an over-eager reserved-name check. Included as a regression
+  fixture.
 
 The benchmark harness (`bench/review_bench.exs`) does:
 
 1. `Exgit.clone(url, lazy: true)` — refs only, no objects.
-2. `Exgit.FS.prefetch(repo, "HEAD", blobs: true)` — fetch every
-   reachable tree and blob in one pack.
-3. **One "cold" grep** — triggers the commit-object on-demand fetch.
-4. **Five "warm" greps** — steady-state measurement; all cache hits
-   except possibly the first. We report the median.
-
-Runs are preceded by a warm-up iteration (discarded) so TLS
-session resumption and TCP connection-pool setup don't contaminate
-the timings.
-
-Every call site emits `:telemetry` span events, so the harness also
-reports per-event medians independently of the wall-clock phase
-timings.
+2. `Exgit.FS.prefetch(repo, "HEAD", blobs: true)` — stream the full
+   blob pack directly into the Memory store via `Pack.StreamParser`.
+3. **One "cold" grep** — steady-state (prefetch already populated everything).
+4. **Five "warm" greps** — report the median.
 
 ## Benchmarks
 
-All numbers below are medians over multiple runs from my MacBook to
-GitHub's public API, on a home internet connection. Network is the
-biggest source of variance — the same benchmark run an hour later
-can differ by 30-50% in `transport.fetch`. Steady-state
-cache-bound operations (`fs.walk`, `fs.grep`, `pack.parse`) are
-rock-solid stable run to run.
+All numbers are medians measured on a MacBook over a home internet
+connection. `transport.fetch` varies 30–50% run-to-run due to
+network; `pack.stream_parse`, `fs.grep`, and `fs.walk` are stable.
 
-### pyex (275 files, 1.2 MB pack)
+### anomalyco/opencode (4,645 files)
 
 ```
-Phase                                    median         p95
+Phase                                    measured
 --------------------------------------------------------------
-1. clone(url, lazy: true)               51.5 ms     58.5 ms
-2. prefetch(blobs: true)               633.0 ms    655.3 ms
-3a. grep (first / cold)                 11.0 ms     11.3 ms
-3b. grep (warm, median of 5)            10.7 ms     11.2 ms
-   total (1 + 2 + 3a)                  702.5 ms    717.8 ms
-
-Telemetry medians
------------------
-transport.ls_refs    51.4 ms
-transport.fetch     342.1 ms
-pack.parse           48.3 ms
-fs.walk              10.9 ms
-fs.grep              10.9 ms
-object_store.get     85 µs
+clone(url, lazy: true)                   0.26 s
+prefetch(blobs: true)                    6.4 s    ← streaming parser
+grep "scd"             literal           158 ms
+grep "TODO"            literal           130 ms
+grep "useState"        literal           138 ms
+grep "export default"  literal           132 ms
+grep "anthropic"       regex/ci          333 ms
 ```
 
-### cloudflare/agents (1,418 files, ~4 MB pack)
+**Grep phase breakdown (4,645 blobs, 82 MB raw text):**
+
+| Phase | Time | Share |
+|---|---:|---:|
+| Tree walk | 13 ms | 4% |
+| `zlib.uncompress` × 4,645 blobs | 140 ms | 43% |
+| Boyer-Moore scan (literal) | ~3 ms | 1% |
+| PCRE scan (regex/ci) | ~150 ms | 46% |
+| Line lookup + result alloc | ~15–65 ms | ~10% |
+
+Literal patterns spend almost no time in the scan phase; the
+bottleneck is `zlib.uncompress` in the Memory store. Case-insensitive
+regex pays both the decompress and a slower PCRE scan.
+
+### adafruit/Adafruit_CircuitPython_Bundle (436 files)
 
 ```
-Phase                                    median         p95
+Phase                                    measured
 --------------------------------------------------------------
-1. clone(url, lazy: true)               73.5 ms     75.3 ms
-2. prefetch(blobs: true)                 8.19 s      8.51 s
-3a. grep (first / cold)                 56.4 ms     58.2 ms
-3b. grep (warm, median of 5)            58.4 ms     60.9 ms
-   total (1 + 2 + 3a)                    8.32 s      8.63 s
-
-Telemetry medians
------------------
-transport.ls_refs    71.7 ms
-transport.fetch       2.63 s       (8 MB pack + TLS + GitHub)
-pack.parse          680.0 ms       (~1.2 MB/s decompress+verify)
-fs.walk              58.2 ms
-fs.grep              58.2 ms
-object_store.get    184 µs
+clone(url, lazy: true)                   1.16 s
+prefetch(blobs: true)                    0.65 s
+grep "scd"             literal           2.2 ms   (14 hits)
+grep "scd"             literal           2.5 ms
+grep "scd"             literal           2.3 ms
 ```
 
-### anomalyco/opencode (4,600 files, ~30 MB pack)
-
-```
-Phase                                    median
---------------------------------------------------------------
-1. clone(url, lazy: true)              270.3 ms
-2. prefetch(blobs: true)                57.39 s
-3a. grep (first / cold)                420.5 ms
-3b. grep (warm, median of 5)           451.3 ms
-   total (1 + 2 + 3a)                   58.09 s
-
-Telemetry medians
------------------
-transport.ls_refs   267.3 ms
-transport.fetch      28.24 s       (30 MB pack)
-pack.parse            6.52 s       (~4.6 MB/s decompress+verify)
-fs.walk             451.1 ms
-fs.grep             451.1 ms
-object_store.get    678 µs
-```
+436 files fit entirely in L3 cache after one prefetch pass;
+Boyer-Moore through the full repo takes 2 ms and barely registers.
 
 ### Scaling
 
-Grep time versus file count across fixtures:
-
-| Files | Grep (ms) | Per-file (µs) |
+| Files | Grep / literal (ms) | Per-file (µs) |
 |---:|---:|---:|
 | 275 | 11 | 40 |
+| 436 | 2 | 5 |
 | 1,418 | 58 | 41 |
-| 4,600 | 451 | 98 |
+| 4,645 | 140 | 30 |
 
-Near-linear up to ~1.5k files, with a step up at opencode scale.
-The step is binary-content detection (the NUL-byte scan on the
-first 8 KB of each file) showing up in the mix — opencode has
-more binary assets than the other two. Real code searches would
-typically pass a `:path` glob (`"**/*.ex"`) to filter upfront,
-which drops per-file cost.
+Per-file cost on opencode is **lower** than smaller repos because
+its blobs are larger (more bytes compressed per file → fewer
+`zlib.uncompress` calls relative to scan throughput); on adafruit
+it is 5 µs because the compressed blobs stay warm in CPU cache
+after the first grep.
 
-## What it takes to get there
+## Architecture: end-to-end streaming pipeline
 
-The numbers above aren't where we started. Three bugs in the core
-hot path compounded silently, each hiding behind the next:
+The biggest structural change since the original benchmarks is the
+replacement of the buffered pack pipeline with a fully streaming
+one. The old shape:
 
-### Bug 1: `FS.walk` discarded the updated repo after `resolve_tree`
-
-```elixir
-# The bug:
-case resolve_tree(repo, reference) do
-  {:ok, sha, _repo} -> [{"", sha}]   # _repo with the grown cache, discarded
-  _ -> []
-end
+```
+HTTP response → full binary in heap
+              → Pack.Reader.parse (binary + resolved objects in heap simultaneously)
+              → import_objects (another copy into the store)
 ```
 
-`resolve_tree` does an on-demand commit fetch for a lazy repo.
-The commit is cached, but we pattern-matched `_repo` and threw it
-away. Every call to `FS.walk` on a lazy repo whose commit wasn't
-already cached triggered a fresh network round-trip.
+Peak memory for opencode's 135 MB pack: ~400 MB (pack binary +
+decoded object list + compressed store).
 
-**Observed:** On `cloudflare/agents`, each `FS.walk` took **7.7
-seconds**. Not 7.7 ms — seconds. Because every walk re-fetched the
-same commit from GitHub, every time.
+The new shape:
 
-Nobody noticed because the offline test suite used a `Memory`
-object store where `resolve_tree` never fetched anything. The bug
-only manifested against a real lazy `Promisor`-backed repo, and
-we didn't have integration tests for partial-clone workflows. The
-bug was discovered when we added real-world fixtures to the
-benchmark.
-
-**Fix:** thread the updated repo through the `Stream.resource`
-state tuple as `{repo, stack}`. Now the grown cache is captured
-for the full lifetime of the stream.
-
-**Impact:** `FS.walk` on `cloudflare/agents`: 7.7s → **2 ms**.
-That's 3,800× faster.
-
-### Bug 2: Promisor cache accounting counted decompressed bytes
-
-`Promisor.fetch_and_cache/2` was doing:
-
-```elixir
-new_bytes = Enum.sum(for {_t, _s, c} <- parsed, do: byte_size(c))
+```
+HTTP chunks → PktLine.Decoder → sideband demux
+           → Pack.StreamParser.ingest/2 (one chunk at a time)
+                ├── type/size header decode
+                ├── zlib inflate port (open across ingest calls)
+                ├── streaming deflate → ObjectStore directly
+                └── OFS/REF delta resolved through store
+           → StreamParser.finalize/1 (checksum verify)
 ```
 
-But `c` is the **decompressed** object content. The Memory store
-actually holds compressed bytes. Accounting was off by 3-10×
-depending on content entropy.
+Peak memory: one HTTP chunk (~4 KB) + one object's compressed
+bytes in the write handle + the compressed store. The pack binary
+never exists as a whole.
 
-Combined with a previous 64 MiB default for `:max_cache_bytes`,
-this meant eviction fired on every real-world prefetch. Worse:
-the evictor only evicts **commits** — and when the cache was
-"overfull" during a walk, the evictor would drop the single
-commit we'd just fetched to make the walk work. Walk broke
-mid-stream.
+**opencode prefetch: 57 s → 6.4 s** — most of the 57 s was the
+old Pack.Reader holding 135 MB of binary and the object list
+simultaneously, triggering multiple major GC cycles. The streaming
+parser never triggers that pressure.
 
-**Fix:** two changes:
+### Adversarial hardening in the parser
 
-1. Track compressed-byte sizes via `compressed_size/2` and
-   `sum_compressed_bytes/2`. The number now reflects actual
-   memory consumption.
-2. Change `:max_cache_bytes` default to `:infinity`. Unbounded
-   is the right default for partial-clone / prefetch workflows:
-   callers prefetch a known working set and want it to stay in
-   memory. Callers with an actual memory envelope (long-running
-   daemon, low-memory deployment) set a cap based on their budget.
+`Pack.StreamParser.new/2` accepts limits enforced per-object
+during the streaming parse:
 
-The library's job is to give accurate metrics when asked. It is
-not the library's job to guess a cap that's wrong for every user.
+```
+max_object_bytes:   100 MB   — rejects before allocating
+max_inflate_ratio:  1000×    — zip-bomb defence (compressed/raw ratio)
+max_delta_depth:    50       — OFS/REF delta chain cap (same as git)
+max_objects:        10 M     — rejects absurd pack headers
+deadline:           nil      — monotonic cutoff; returns :deadline_exceeded
+```
 
-### Bug 3: `:max_resolved_bytes` default of 500 MiB blocked real repos
+These fire during streaming, not as a post-parse check, so a
+hostile pack stops consuming CPU/memory immediately.
 
-The pack reader has a cap on total resolved-object bytes —
-protection against a hostile pack that compresses tightly but
-expands to gigabytes. The default was 500 MiB; a guess, not a
-measurement.
+## Grep: literal pattern fast path
 
-`anomalyco/opencode` resolves to ~524 MiB, just over the cap.
-First time anyone tried to clone it with partial clone, the
-parser rejected the pack.
+`FS.grep/4` and `FS.multi_grep/4` detect case-sensitive literal
+patterns (no PCRE metacharacters) at compile time and route them
+through `:binary.matches` (Boyer-Moore-Horspool in the BEAM
+runtime) instead of `Regex.scan`:
 
-**Fix:** raise default to 2 GiB (matches `:max_pack_bytes`). A
-hostile pack that compresses to 2 GiB AND expands past 2 GiB
-would still be caught, but at that scale the attacker needs >2
-GiB of outgoing bandwidth and a pathological delta chain. Real
-monorepos are now trivially accommodated.
+```elixir
+# case-sensitive, no metacharacters → :binary.matches (9.5× faster)
+FS.grep(repo, "HEAD", "useState")
 
-### Optimization: Adler32 trailer probe for zlib tracking
+# case-insensitive or metacharacters → Regex.scan
+FS.grep(repo, "HEAD", "useState", case_insensitive: true)
+FS.grep(repo, "HEAD", "use.*State")
+```
 
-Separately from the bugs, there's a real perf win in how we find
-the end of each zlib stream in a pack. Packs concatenate zlib
-streams with no explicit length prefix, so the parser has to
-figure out where each stream ends.
+Measured on 7.4 MB of synthetic text:
 
-Original implementation: binary-search over prefix lengths,
-opening a fresh zlib stream at each probe. `O(log N)` port
-round-trips per object, each allocating a full decompressed
-result. Expensive at Linux-kernel scale.
+| Engine | Time | Speedup |
+|---|---:|---:|
+| `:binary.matches` (literal) | 8.6 ms | **1×** (baseline) |
+| `Regex.scan` (literal regex) | 82 ms | 9.5× slower |
+| `Regex.scan` (ci regex) | >10 s | >>100× slower at high hit density |
 
-New implementation: **Adler32 probe**. A zlib stream ends with a
-4-byte big-endian Adler32 of the decompressed content. After we
-decompress the object, we compute the checksum ourselves in BEAM
-(~nanoseconds), then `:binary.match` for the 4-byte trailer in
-the input. One pass, one verify. False-positive rate (the
-checksum bytes coincidentally appearing in the deflate body) is
-~1/2^32 per position; we verify with a single `inflateEnd` probe
-and fall back to the binary search if the probe fails.
+For typical code-search patterns (function names, import paths,
+identifiers), the literal path is the default. Most agent queries
+hit it without any caller changes.
 
-**Impact:** `Pack.Reader.parse` went from 127 ms → 49 ms on pyex
-(2.6× faster). At opencode scale (~30 MB pack), it saves several
-seconds per clone.
+## Parallelism: still a net loss
 
-### Anti-optimization: parallel grep (reverted)
+An earlier attempt parallelized `FS.grep` across blobs via
+`Task.async_stream`. Result on opencode:
 
-An initial attempt parallelized `FS.grep` across files via
-`Task.async_stream`. It was **22× slower** on `cloudflare/agents`.
+```
+sequential (default):   340 ms
+parallel (16 workers):  1550 ms   ← 4.5× SLOWER
+```
 
-Per-file work in grep is microseconds of regex scan on ~10 KB of
-code. `Task.async_stream`'s per-item spawn + message-passing
-overhead is ~50-100 µs. For a 1.4k-file repo, parallel dispatch
-paid 100 ms of overhead to save microseconds of work.
+The cause: `zlib.uncompress` is a regular (non-dirty) NIF. Running
+16 concurrent calls each allocating large binaries simultaneously
+causes severe GC pressure — 74 MB of heap allocation per grep in
+16 processes simultaneously fragments memory and triggers
+stop-the-world GC. The sequential path avoids this: each blob's
+bytes are allocated, used, and collected before the next blob is
+touched.
 
-Parallelism IS a win when per-file work is substantial (large
-blobs, complex regex, I/O-bound store). Callers with that
-profile opt in via `Exgit.FS.grep(repo, ref, pattern,
-max_concurrency: :schedulers)`. The default stays sequential.
+`max_concurrency: :schedulers` remains available for callers with
+workloads where per-file work is substantial (large blobs, I/O-bound
+stores). For typical code search on a Memory-backed repo, leave it
+at the default of `1`.
 
-## Optimizations that matter
+## Bug fixes in this cycle
 
-A summary of the perf wins that are live, in order of impact:
+### `.gitmodules` blocked legitimate repos
 
-1. **Adler32 probe for pack zlib tracking** — 2.6× faster `pack.parse`.
-2. **Single-pass grep (`matches_in` rewrite)** — 13× faster `grep`
-   on a repo with few matches (common case). Scan the whole blob
-   for matches once; compute line numbers only for matches.
-3. **Walk state threading** — eliminates per-walk network fetches.
-   3,800× faster on a 1.4k-file lazy repo.
-4. **Sequential grep as default** — avoids Task.async_stream
-   overhead on typical code-search workloads.
-5. **Unbounded cache default** — removes artificial cap that
-   previously fired during normal prefetch.
+`Tree.decode/1` was rejecting `.gitmodules` as a reserved entry
+name, treating it the same as `.git` (CVE-2014-9390 class). The
+comment even noted it was pre-emptive: "URL-injection vector for
+submodule handling *if/when we add submodules*."
+
+The consequence: any repo that uses git submodules — including
+`adafruit/Adafruit_CircuitPython_Bundle` — crashed on prefetch
+with `{:tree_entry_name_reserved, ".gitmodules"}`.
+
+**Fix:** `.gitmodules` is now accepted. The URL-injection concern
+only applies if we process submodule URLs, which exgit does not.
+`.git` remains rejected (CVE-2014-9390 is real on case-insensitive
+filesystems even for read-only clients).
+
+### Earlier bugs (still in history)
+
+Three compounding bugs in the original hot path documented here
+for historical context (fixes landed in commit `550100d`):
+
+1. **`FS.walk` discarded the updated repo** after `resolve_tree`,
+   re-fetching the same commit from GitHub on every `walk` call.
+   7.7s → 2 ms on cloudflare/agents.
+
+2. **Promisor cache accounting counted decompressed bytes** while
+   the store held compressed bytes; eviction fired 3–10× too early
+   and dropped commits that were immediately needed. Fixed by
+   tracking compressed sizes.
+
+3. **`:max_resolved_bytes` default of 500 MiB** rejected
+   opencode's ~524 MiB resolved set. Raised to 2 GiB.
+
+## Optimizations that matter (shipped)
+
+In order of impact:
+
+1. **Streaming pack parser** (`Pack.StreamParser`) — replaces the
+   buffered `Pack.Reader` in all fetch/prefetch paths. Eliminates
+   the O(pack_size) binary + object list from the heap; bounded to
+   one chunk + one object at a time. opencode prefetch: 57 s → 6 s.
+
+2. **Streaming object-store writes** — `open_write/write_chunk/close_write`
+   protocol on `ObjectStore`; Memory and Disk stores stream
+   compressed output as inflate output arrives. Raw content never
+   coexists with compressed form in the heap.
+
+3. **Walk state threading** — updated repo threaded through the
+   walk `Stream.resource` state, eliminating per-walk network
+   fetches on lazy repos. 3,800× faster on cloudflare/agents.
+
+4. **Literal grep fast path** — `:binary.matches` (Boyer-Moore)
+   for case-sensitive literal patterns. 9.5× faster scan per blob;
+   visible at adafruit scale (2 ms grep) and meaningful at opencode
+   scale (dominant cost shifts to `zlib.uncompress`, not scan).
+
+5. **Adler32 probe for pack zlib tracking** — finds the end of each
+   zlib stream in O(1) instead of O(log N) binary-search probes.
+   2.6× faster `Pack.Reader.parse` (still used for Disk store
+   random-access lookups).
+
+6. **Sequential grep as default** — avoids Task.async_stream GC
+   pressure on typical workloads.
 
 ## What we're not doing
 
-- **NIF-based zlib**. `:zlib` is a port, which costs round-trips.
-  A NIF via libdeflate would be ~3-5× faster on `pack.parse`.
-  Undercuts the "pure Elixir, no shelling out, no NIFs"
-  positioning; not doing this without a very clear reason.
-- **Parallel pack parsing**. Pack parsing has a sequential
-  dependency (OFS_DELTA chains reference earlier objects by
-  offset), so parallelizing the decode itself requires a
-  two-pass design. Worth doing when we see a real workload that
-  needs it.
-- **Index (`.git/index`) caching**. Currently `FS.walk` re-walks
-  the tree on every call. Building an index-style path→sha map
-  once per ref and reusing would halve some workloads. Revisit
-  when profiling says it matters.
+- **Decompressed-blob cache.** The 140 ms `zlib.uncompress` tax is
+  paid on every grep call. A `repo.blob_cache: %{sha => binary}`
+  field on the Repository struct, populated by a `FS.warm/2` call,
+  would reduce repeated greps to near-zero. The design is correct
+  (state on the struct, caller opts in, GC'd with the repo) but
+  deferred until a measured workload asks for it. We explicitly
+  ruled out ETS, Process dictionary, and persistent_term — any
+  cache must be caller-visible and scoped to the repo value.
+
+- **NIF-based zlib / libdeflate.** Would reduce `zlib.uncompress`
+  cost 3–5×, making the 140 ms → ~30 ms. Undercuts the
+  "pure Elixir, no NIFs" positioning; not doing this without a
+  concrete workload and a clear tradeoff decision.
+
+- **Parallel pack parsing.** OFS_DELTA chains impose a sequential
+  dependency (base must precede delta in the forward walk). A
+  two-pass design could unlock parallelism for the inflate phase;
+  left for when a workload demonstrates the need.
+
+- **Chunked parallel grep.** Per-task `Task.async_stream` at file
+  granularity is net-negative (4.5× slower). A chunked variant
+  batching 200–500 files per task would amortize spawn overhead and
+  likely win on 10k+ file repos. Needs a measured workload.
 
 ## Running the benchmark yourself
 
-```
-# Startup-cost bench: clone + prefetch + one grep
+```sh
+# Clone + prefetch + grep workflow (all fixtures, 30 runs each)
 mix run bench/review_bench.exs
 
-# Agent-workload bench: realistic mixed ls/grep/read session
-mix run bench/agent_workload.exs
+# Filter to one fixture
+mix run bench/review_bench.exs 10 opencode
 
-# Just pyex, 10 runs on either bench
-mix run bench/review_bench.exs 10 pyex
-mix run bench/agent_workload.exs 5 pyex hot
+# Local pack parse: StreamParser vs Pack.Reader head-to-head
+# (requires local opencode .git pack files)
+mix run bench/local_pack_eval.exs
 
-# Pack-parse scaling bench (synthetic, offline)
+# Pack parse scaling (synthetic, no network)
 mix run bench/pack_parse_bench.exs
+
+# Agent-session simulation: multi_grep + grep+context + blame + read_lines
+mix run bench/agent_session_bench.exs
 ```
 
-Harnesses live in `bench/`. They emit full per-phase and
-per-event numbers so you can see exactly where time is going for
-your network / workload.
+## Memory model summary
 
-## Instrumentation
+| Component | Bound |
+|---|---|
+| HTTP transport | One pkt-line per ingest chunk |
+| Pack buffer | One object's compressed bytes |
+| In-flight inflate | O(zlib_window) per chunk |
+| Streaming write handle | O(compressed output chunks) |
+| offset_to_sha map | ~35 bytes × N objects |
+| sha_to_depth map | ~30 bytes × N objects |
+| raw_cache (delta resolution) | 64 MB budget (plain map in StreamParser state) |
+| Object store (Memory) | All objects compressed — inherent minimum |
 
-Two new APIs for profiling and memory telemetry:
-
-### `Exgit.Profiler`
-
-Structured trace of every `:telemetry` span emitted during a
-function call. Use for ad-hoc "where did time go?" questions
-without adding print statements or building a handler.
-
-```elixir
-{result, profile} =
-  Exgit.Profiler.profile(fn ->
-    {:ok, repo} = Exgit.clone(url, lazy: true)
-    {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
-    Exgit.FS.grep(repo, "HEAD", "foo") |> Enum.to_list()
-  end)
-
-profile.total_us          # wall-clock in microseconds
-profile.peak_cache_bytes  # observed peak memory
-profile.totals            # %{"fs.grep" => %{count: 1, us: 11_000}, ...}
-profile.events            # full ordered event list for drill-down
-```
-
-Attach once and read periodically for long-running processes:
-
-```elixir
-{:ok, handle} = Exgit.Profiler.attach()
-# ... do work ...
-profile = Exgit.Profiler.read(handle)
-Exgit.Profiler.detach(handle)
-```
-
-### `Exgit.Repository.memory_report/1`
-
-Structured memory report for a repo. Call between operations to
-track peak memory, detect unexpected cache growth, or alert when
-a configured cap is approached.
-
-```elixir
-Exgit.Repository.memory_report(repo)
-# => %{
-#   object_count: 17_500,
-#   cache_bytes: 4_213_780,
-#   commit_count: 122,
-#   tree_count: 8_290,
-#   blob_count: 9_210,
-#   tag_count: 0,
-#   max_cache_bytes: :infinity,
-#   mode: :lazy,
-#   backend: Exgit.ObjectStore.Promisor
-# }
-```
-
-Consistent shape across all object-store backends. Suitable for
-emission into observability stacks (Prometheus, Datadog, etc.)
-without downstream branching on backend type.
+The object store is the floor: if you fetch a 135 MB pack and store
+it in a Memory backend, you'll hold however many bytes the compressed
+objects take. Exgit does not add overhead on top of that minimum.
 
 ## Correctness oracle
 
-`Exgit.FS.grep` output is validated against `git grep` via
+`FS.grep` output is validated against `git grep` via
 `test/exgit/fs_grep_git_parity_test.exs`. The test builds a small
 real-git repo, runs both `git grep -n` and `Exgit.FS.grep` against
-a set of representative patterns, and asserts the two agree on
-the `(path, line_number)` match set.
-
-Tagged `:real_git` (requires `git` on PATH) and `:slow` (runs 20+
-pattern variants). Part of the extended-tier CI run that gates
-every push.
-
-Today's coverage: 7 patterns against 5 synthetic files. Expanding
-the corpus is future work; the current set catches regressions in
-line-number computation, regex semantics, and binary-file
-skipping — the classes of bug most likely to land silently.
-
-## What's next
-
-The measurement infrastructure is in place; optimization choices
-from here should be **data-driven** — profile a real agent
-workload against real fixtures, find the hotspot, optimize.
-Everything below is waiting on a concrete workload telling us
-what matters.
-
-### Candidate optimizations, not-yet-done
-
-- **Decompressed-blob cache.** Memory.get_object currently does
-  `:zlib.uncompress` on every call. For grep-heavy workloads
-  against the same repo, caching the decompressed bytes would
-  halve grep time. Costs memory (~3-5× per blob). Behind a flag.
-
-- **Literal-string fast path for grep.** Current `FS.grep`
-  compiles string patterns to `%Regex{}`. For literal patterns,
-  `:binary.match` (Boyer-Moore in the runtime) is 2-5× faster.
-  Detect via: pattern is a plain binary AND doesn't contain
-  regex metacharacters.
-
-- **Chunked parallel grep.** Per-file Task.async_stream was 22×
-  SLOWER than sequential (per-item spawn overhead dominates
-  microsecond regex work). A **chunked** version (batch 100-500
-  files per task) would amortize the overhead and likely win on
-  4k+ file repos. Needs the agent workload bench to confirm.
-
-- **Path → sha index.** `FS.walk` re-walks the tree on every
-  call. A one-time path→sha map built at prefetch would make
-  `read_path` O(1) instead of O(depth). Low priority — tree
-  walks are microseconds today.
-
-### Memory management — deferred
-
-A proper **LRU eviction** (access-time tracking, evicts
-blobs/trees/commits by age, eviction-aware streaming) is
-designed but not implemented. Current stance:
-
-- `:max_cache_bytes: :infinity` is the default.
-- `cache_bytes` is tracked accurately (compressed bytes).
-- `Exgit.Repository.memory_report/1` lets operators monitor.
-
-The LRU design is documented in [`docs/NOTES.md`](NOTES.md)
-for the future maintainer who hits a memory-bound workload.
-We'd rather build it against real usage constraints than
-guess.
-
-### Agent primitives
-
-Three shipped in the Round 1 push:
-
-- **`FS.read_lines(repo, ref, path, line_range)`** — read only the
-  requested line range of a file. One decompress, bounded-work
-  slicing. Measured against `git show REF:path | sed -n 'L1,L2p'`
-  for parity. See commit `70627bc`.
-
-- **`FS.grep` with `:context` / `:before` / `:after`** — N lines of
-  surrounding context per match, `git grep -C N` parity. See
-  commit `7659c7f`. Benchmark results below.
-
-- **`FS.read_path(..., resolve_lfs_pointers: true)`** — detects
-  git-lfs pointer blobs and surfaces them as
-  `{:lfs_pointer, %{oid, size, raw}}` instead of silently
-  returning the ~130 bytes of pointer text. Byte-parity tested
-  against `git lfs pointer --check`. See commit `e5d3be2`.
-
-- **`FS.multi_grep(patterns)`** — N patterns in one walk.
-  Each result row tagged by pattern. Git-parity tested against
-  `git grep -e P1 -e P2 ...`. See commit below + benchmark
-  results below.
-
-- **`Exgit.Blame.blame(repo, ref, path)`** — per-line
-  authorship attribution. Follows `--first-parent` semantics;
-  no move/copy detection; no rename following. Real-fixture
-  parity tested against `git blame --first-parent` at ≥85%
-  agreement on rename-free files. See benchmark below.
-
-### Benchmark: grep+context vs. grep+N×read_path
-
-The killer use case for `:context` is "find a match and show it
-with surrounding code." Before the flag shipped, an agent did
-that with a grep followed by N `read_path` calls (plus line
-splitting on the client). Now it's one call.
-
-Measured via `bench/grep_context_bench.exs` against four real
-fixtures, 5 runs each, median reported. Legacy = grep + up to 20
-read_path + manual line slicing. New = `grep(context: 3)` capped
-at 20 hits. Both produce equivalent output.
-
-| Fixture | Files | Hits | Legacy (median) | New (median) | Speedup |
-|---|---:|---:|---:|---:|---:|
-| `ivarvong/pyex` | 275 | 2 | 9.1 ms | 8.7 ms | **1.04×** |
-| `anthropics/claude-agent-sdk-python` | ~100 | 20 | 1.8 ms | 1.4 ms | **1.30×** |
-| `cloudflare/agents` | 1,418 | 20 | 1.1 ms | 171 µs | **6.49×** |
-| `anomalyco/opencode` | 4,600 | 20 | 1.5 ms | 280 µs | **5.47×** |
-
-Why the spread:
-
-- **pyex, 1.04×** — only 2 matches, so legacy does just 2
-  `read_path` calls. The overhead being saved is small; most of
-  the 9 ms is the grep itself scanning 275 files.
-- **claude-agent-sdk-python, 1.30×** — 20 matches but small files
-  (avg ~270 lines). Per-file decompress savings modest. Breakdown
-  from a separate profile: grep 711 µs, 20× read_path 855 µs,
-  grep+context 1305 µs. The "new way" adds ~600 µs of per-match
-  context slicing (30 µs × 20), which eats most of the saved
-  read_path time on small files.
-- **cloudflare/agents, 6.49×** and **opencode, 5.47×** — larger
-  files + hits scattered across the tree means legacy pays
-  full-blob decompress + tree-walk overhead 20 times. New way
-  does one walk + context slice per match.
-
-The win scales with the **aggregate decompressed bytes avoided**,
-not with file count. On small repos with tiny files, grep+context
-is a small improvement (~1.0-1.3×). On real-world repos with
-larger files and many matches, it's 5-7× — firmly in "this
-changes agent latency" territory.
-
-Invocation:
-
-```
-mix run bench/grep_context_bench.exs               # all fixtures, 5 runs
-mix run bench/grep_context_bench.exs 10 agents     # 10 runs, agents only
-```
-
-### Benchmark: multi_grep vs. N sequential greps
-
-"Find any of these N patterns" is a common agent workload —
-security audits ("scan for any of 20 leaked-secret signatures"),
-migrations ("find all uses of the old API"), usage surveys. The
-naive way is N separate `grep` calls, each walking the tree and
-decompressing every blob. `multi_grep` does one walk and
-decompresses each blob once, running N regexes per blob.
-
-Measured via `bench/multi_grep_bench.exs` across the same four
-fixtures, 5 runs, median reported. Match counts are identical
-between legacy and new paths on every combination (strong
-parity check beyond the git-grep parity tests).
-
-| Fixture | 3 patterns | 10 patterns |
-|---|---:|---:|
-| `ivarvong/pyex` | 1.74× | 1.41× |
-| `anthropics/claude-agent-sdk-python` | 1.19× | 1.42× |
-| `cloudflare/agents` | 1.21× | 1.47× |
-| `anomalyco/opencode` | 1.17× | 1.60× |
-
-Key observations:
-
-- The win is **consistent (1.2-1.7×)**, not dramatic. Unlike
-  grep+context (which can be 6-7× on real repos), multi_grep's
-  savings come from the amortized walk + per-blob decompress,
-  which is already fast (the commit `550100d` FS.walk/grep
-  perf rework made it so).
-- Larger pattern counts win more (0.2-0.4× bigger speedup
-  going 3 → 10 patterns) because the per-blob work that's
-  being amortized grows with N.
-- Absolute savings are meaningful: on opencode-scale
-  (~4,600 files), a 10-pattern search drops from 4.6 s to
-  2.8 s — 1.8 seconds of agent latency recovered.
-
-For very large N (say 50+ patterns) the alternation-regex
-approach mentioned in the module doc would likely win further
-by running one regex scan per blob instead of N. Today that's
-an optimization awaiting a workload that profiles it as the
-bottleneck.
-
-Invocation:
-
-```
-mix run bench/multi_grep_bench.exs               # all fixtures, 5 runs
-mix run bench/multi_grep_bench.exs 10 opencode   # 10 runs, opencode
-```
-
-### Benchmark: Blame on real fixtures
-
-Blame cost scales with `(file_lines × commits_touching_file)`.
-A 300-line file with 10 commits is fast; a 1500-line file with
-100 commits is not. Measured per-file wall-clock against
-`anthropics/claude-agent-sdk-python` (3 runs, median):
-
-| Path | Lines | Commits touching | Median |
-|---|---:|---:|---:|
-| `src/claude_agent_sdk/_cli_version.py` | 3 | ~20 | **37 ms** |
-| `pyproject.toml` | 118 | ~80 | **96 ms** |
-| `README.md` | 359 | ~16 | **149 ms** |
-| `CHANGELOG.md` | 675 | ~68 | **450 ms** |
-
-Git-parity on rename-free paths (see test
-`blame_real_fixture_test.exs`):
-
-    README.md:          93.6% agreement with git blame
-    CHANGELOG.md:       90.1%
-    pyproject.toml:     96.6%
-    _cli_version.py:  100.0%
-
-The 5-10% divergence comes from merge-commit handling. Git's
-default blame has heuristics for picking which merge parent to
-credit; exgit's `--first-parent` walk follows a single chain,
-which is well-defined but differs on lines whose current form
-first appears on a merged-in branch.
-
-Files with rename history (where the file or its parent
-directory was renamed in the past) intentionally diverge
-further because exgit doesn't follow renames. These are
-filtered out of the parity tests; agents who need
-rename-following should shell out to `git blame` for that
-specific question.
-
-Algorithm: LCS dynamic programming over two consecutive commit
-versions of the file, backtracked for matched line pairs, with
-an identity short-circuit for commits that didn't touch the
-file. The key optimization was avoiding `Tuple.append/2`'s O(N)
-copy-per-insert in the DP row build — that reduced a 1376-line
-file blame from 67s to 1.9s. Future: Myers diff would further
-reduce cost for small per-commit edits.
-
-Invocation:
-
-```
-mix run bench/blame_bench.exs                # all fixtures, 3 runs
-mix run bench/blame_bench.exs 5 claude_sdk   # 5 runs, claude_sdk
-```
-
-### End-to-end agent session latency
-
-The meaningful number for "does this library deliver the agent
-experience the features are supposed to unlock": wall-clock of
-a complete investigation session using the Round 1 + Round 2
-primitives.
-
-Workload (see `bench/agent_session_bench.exs`):
-
-1. `multi_grep` for 3 patterns (50 total hits capped)
-2. For 5 unique-file hits: `grep(context: 3)` on that file
-3. For 2 hits: `Blame.blame(path)` — authorship check
-4. For 1 hit: `read_lines(path, N-10..N+10)` — wider context
-
-Warm-session median (3 runs):
-
-| Fixture | Total | multi_grep | grep+context | blame | read_lines |
-|---|---:|---:|---:|---:|---:|
-| `anthropics/claude-agent-sdk-python` | **483 ms** | 1.5 ms | 393 µs | 481 ms | 90 µs |
-| `cloudflare/agents` | **233 ms** | 17.6 ms | 9.5 ms | 206 ms | 76 µs |
-
-Both fixtures deliver sub-second warm-session latency for a
-realistic agent investigation workflow. **Blame is the dominant
-cost** (2 blame operations take ~98% of the time on
-claude-sdk, ~88% on agents). If blame latency is the workload's
-bottleneck, Myers diff as discussed above would reduce it.
-
-The combined Round 1 + Round 2 features bring an agent's
-"investigate this codebase" loop into interactive territory
-(sub-second). Pre-Round-1, the same workflow would require a
-grep + N `read_path` calls + client-side line slicing per hit
-(see grep+context benchmark above showing 5-7× speedup from
-that alone) plus no blame capability at all.
-
-Invocation:
-
-```
-mix run bench/agent_session_bench.exs                # both fixtures, 3 runs
-mix run bench/agent_session_bench.exs 5 claude_sdk   # 5 runs, claude_sdk
-```
-
-## Known caveats
-
-- `transport.fetch` is dominated by GitHub's side + HTTPS setup +
-  raw pack bytes over your uplink. Numbers above are from a home
-  residential connection. Datacenter-to-GitHub would be 2-5×
-  faster. VPNs / corporate proxies can be much slower.
-- Cold-cache performance on the first call after `clone(lazy: true)`
-  includes an on-demand commit fetch (~50-500 ms depending on
-  repo). All numbers reported here are steady-state unless
-  labeled "cold."
-- Binary file detection (`binary_content?/1`) runs on every blob
-  during grep; it's cheap (8 KB NUL scan) but scales linearly with
-  file count. A `:path` glob short-circuits this for files that
-  don't match the glob.
+a set of representative patterns, and asserts the two agree on the
+`(path, line_number)` match set. Tagged `:real_git` and `:slow`.
 
 ## History
 
-See [`CHANGELOG.md`](../CHANGELOG.md) for the feature-level
-history. The perf work documented above landed in commits:
+See [`CHANGELOG.md`](../CHANGELOG.md) for the feature-level history.
+Key perf commits:
 
-- `550100d` — FS.walk state threading; cache accounting fix; `:max_resolved_bytes` default raise; Adler32 probe.
-- `9bb1256` — Partial clone haves bug fix (a different class of bug that was also silently killing the read path).
-- `8678b0d` — Initial Adler32 probe work; code-quality gates.
-
-None of this would have surfaced without real-world fixtures. The
-pre-review baseline benchmark ran only against `ivarvong/pyex`,
-which is small enough that all three bugs were invisible at its
-scale. Adding `cloudflare/agents` and `anomalyco/opencode` as
-fixtures was the highest-leverage change we made to the
-benchmark suite.
+- Streaming pack parser, streaming writes, literal grep, `.gitmodules` fix — current PR
+- `550100d` — walk state threading; cache accounting fix; Adler32 probe
+- `9bb1256` — partial clone haves bug fix
+- `8678b0d` — initial Adler32 probe; code-quality gates

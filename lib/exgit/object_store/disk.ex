@@ -478,4 +478,123 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
   catch
     kind, value -> {:error, {kind, value}}
   end
+
+  # ---------------------------------------------------------------------------
+  # Streaming write (Phase 3+)
+  #
+  # The handle holds an open zlib deflate port, an incremental SHA-1 context,
+  # and an open file descriptor pointing at a temp path. Content (including
+  # the git object header) is streamed through deflate directly to disk as it
+  # arrives. On close, we finalize the deflate stream, fsync, and atomically
+  # rename the temp file to the final object path.
+  # ---------------------------------------------------------------------------
+
+  def open_write(%Disk{root: root}, type, expected_size) do
+    type_str = Atom.to_string(type)
+    # Build the git object header "type size\0". This is part of the SHA
+    # and is the first bytes written through the deflate port.
+    header = "#{type_str} #{expected_size}\0"
+
+    # SHA-1 covers the header + content.
+    sha_ctx = :crypto.hash_init(:sha)
+    sha_ctx = :crypto.hash_update(sha_ctx, header)
+
+    # We don't know the final path until SHA is computed at close_write,
+    # so write to a temporary file in objects/tmp/.
+    tmp_dir = Path.join([root, "objects", "tmp"])
+
+    with :ok <- File.mkdir_p(tmp_dir) do
+      tmp_path = Path.join(tmp_dir, "stream.#{System.unique_integer([:positive])}")
+
+      case :file.open(tmp_path, [:write, :raw, :binary]) do
+        {:ok, fd} ->
+          z = :zlib.open()
+          :zlib.deflateInit(z, :default)
+          # Write the compressed git header to the file immediately.
+          compressed_header = :zlib.deflate(z, header)
+          :ok = :file.write(fd, compressed_header)
+
+          handle = %{
+            __type__: :disk_write,
+            store_type: type,
+            sha_ctx: sha_ctx,
+            deflate: z,
+            fd: fd,
+            tmp_path: tmp_path,
+            root: root
+          }
+
+          {:ok, handle}
+
+        {:error, reason} ->
+          {:error, {:open_tmp_failed, reason}}
+      end
+    end
+  end
+
+  def write_chunk(_store, %{__type__: :disk_write} = handle, chunk) when is_binary(chunk) do
+    sha_ctx = :crypto.hash_update(handle.sha_ctx, chunk)
+    compressed_chunks = :zlib.deflate(handle.deflate, chunk)
+
+    case :file.write(handle.fd, compressed_chunks) do
+      :ok -> {:ok, %{handle | sha_ctx: sha_ctx}}
+      {:error, reason} -> {:error, {:write_chunk_failed, reason}}
+    end
+  end
+
+  def close_write(%Disk{root: root}, %{__type__: :disk_write} = handle) do
+    sha = :crypto.hash_final(handle.sha_ctx)
+    final_chunks = :zlib.deflate(handle.deflate, <<>>, :finish)
+    :zlib.deflateEnd(handle.deflate)
+    :zlib.close(handle.deflate)
+
+    result =
+      with :ok <- :file.write(handle.fd, final_chunks),
+           :ok <- :file.sync(handle.fd) do
+        _ = :file.close(handle.fd)
+
+        hex = Base.encode16(sha, case: :lower)
+        <<prefix::binary-size(2), rest::binary>> = hex
+        dir = Path.join([root, "objects", prefix])
+        path = Path.join(dir, rest)
+
+        if File.exists?(path) do
+          # Already stored by a concurrent writer — idempotent.
+          _ = File.rm(handle.tmp_path)
+          {:ok, sha}
+        else
+          with :ok <- File.mkdir_p(dir),
+               :ok <- File.rename(handle.tmp_path, path) do
+            {:ok, sha}
+          end
+        end
+      end
+
+    case result do
+      {:ok, sha} ->
+        {:ok, sha, %Disk{root: root}}
+
+      {:error, _} = err ->
+        _ = :file.close(handle.fd)
+        _ = File.rm(handle.tmp_path)
+        err
+    end
+  end
+
+  def cancel_write(_store, %{__type__: :disk_write} = handle) do
+    try do
+      :zlib.deflateEnd(handle.deflate)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    :zlib.close(handle.deflate)
+    _ = :file.close(handle.fd)
+    _ = File.rm(handle.tmp_path)
+    :ok
+  end
+
+  def cancel_write(_store, _handle), do: :ok
 end

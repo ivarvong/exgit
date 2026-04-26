@@ -143,8 +143,10 @@ defmodule Exgit.Object.Tree do
   #   - `.git` in any case — a hostile tree that carries `.GIT/config`
   #     on a case-insensitive filesystem overwrites the real repo
   #     config (CVE-2014-9390 / 2014-9390-class)
-  #   - `.gitmodules` in any case — URL-injection vector for submodule
-  #     handling if/when we add submodules
+  #
+  # `.gitmodules` is intentionally NOT blocked: it is a legitimate
+  # file present in any repo that uses submodules. The URL-injection
+  # risk only materialises if we process submodule config; we do not.
   #
   # Hostile trees are rejected at decode time; they never reach
   # `FS.write_path`, a checkout, or `insert_blob_into_tree`.
@@ -168,13 +170,11 @@ defmodule Exgit.Object.Tree do
     end
   end
 
-  # Any component that lowercases to `.git` or `.gitmodules` is rejected.
-  # Matches git's own case-insensitive reservation even on case-sensitive
-  # filesystems, because a repository cloned to a case-insensitive FS
-  # (macOS default, Windows) would otherwise be vulnerable.
+  # Reject `.git` in any case. Matches git's own CVE-2014-9390
+  # reservation: a tree with `.GIT/config` on a case-insensitive
+  # filesystem would silently overwrite the real repo config.
   defp dangerous_dotgit?(name) do
-    lower = String.downcase(name)
-    lower == ".git" or lower == ".gitmodules"
+    String.downcase(name) == ".git"
   end
 
   defp take_until(data, byte) do
