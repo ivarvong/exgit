@@ -31,7 +31,8 @@ defmodule Exgit.Application do
       # Named Task.Supervisor for async prefetch tasks. Name is
       # module-global so the FS.prefetch_async/2 API can find it
       # without each caller threading a supervisor ref.
-      {Task.Supervisor, name: Exgit.TaskSupervisor}
+      {Task.Supervisor, name: Exgit.TaskSupervisor},
+
     ]
 
     opts = [strategy: :one_for_one, name: Exgit.Supervisor]

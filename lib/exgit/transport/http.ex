@@ -29,7 +29,9 @@ defmodule Exgit.Transport.HTTP do
   `:auth` remains in force either way.
   """
 
+  alias Exgit.Pack.StreamParser
   alias Exgit.PktLine
+  alias Exgit.PktLine.Decoder
 
   @enforce_keys [:url]
   defstruct [
@@ -207,19 +209,19 @@ defmodule Exgit.Transport.HTTP do
         PktLine.flush()
       ])
 
-    case post_upload_pack(t, body) do
-      {:ok, response_body} ->
-        # Fold the pkt-line stream into a {refs, meta} accumulator.
-        # `refs` is a reverse-order list of {name, sha} pairs.
-        # `meta` is `%{head: name, peeled: %{name => sha}}`.
-        {refs_rev, meta} =
-          response_body
-          |> PktLine.decode_stream()
-          |> Enum.reduce({[], %{peeled: %{}}}, fn
-            {:data, line}, acc -> parse_ls_refs_line(line, t.url, acc)
-            _, acc -> acc
-          end)
+    # Stream-fold the pkt-line response into the {refs, meta} accumulator
+    # without ever materializing the full response body or the list of
+    # decoded packets. For repos with tens of thousands of refs (esp-idf,
+    # linux), this keeps the transport's memory bound flat in ref count.
+    init_acc = {[], %{peeled: %{}}}
 
+    handle_packet = fn
+      {:data, line}, acc -> parse_ls_refs_line(line, t.url, acc)
+      _, acc -> acc
+    end
+
+    case stream_upload_pack(t, body, init_acc, handle_packet) do
+      {:ok, {refs_rev, meta}} ->
         meta =
           if map_size(meta.peeled) == 0, do: Map.delete(meta, :peeled), else: meta
 
@@ -417,16 +419,133 @@ defmodule Exgit.Transport.HTTP do
         PktLine.flush()
       ])
 
-    case post_upload_pack(t, body) do
-      {:ok, response_body} ->
-        # Sideband is auto-detected in the response regardless of what
-        # the client asked for. The explicit `:sideband` kw overrides
-        # (needed by test cases that simulate specific framings).
-        parse_fetch_response(response_body, Keyword.take(opts, [:sideband]))
+    # Stream-decode the fetch response: pkt-lines flow in, get fed to a
+    # state machine that (1) skips the acks/shallow prelude until it sees
+    # the `packfile` section marker, then (2) demuxes sideband and either:
+    #   a) feeds pack bytes directly to a StreamParser (zero-copy to store), or
+    #   b) appends to a pack_iolist for the caller to parse (legacy path).
+    #
+    # Path (a) is taken when `opts[:object_store]` is provided. Memory is
+    # bounded by one pkt-line + one object's compressed bytes — the key fix
+    # for the OOM on multi-GB packs (esp-idf, linux).
+    object_store = Keyword.get(opts, :object_store)
+    init = init_fetch_state(Keyword.get(opts, :sideband), object_store)
+
+    case stream_upload_pack(t, body, init, &handle_fetch_packet/2) do
+      {:ok, %{error: msg}} when is_binary(msg) ->
+        {:error, {:server_error, msg}}
+
+      # Streaming path: finalise the parser and return the updated store.
+      {:ok, %{parser: %StreamParser{} = parser}} ->
+        Exgit.Telemetry.span(
+          [:exgit, :pack, :stream_parse],
+          %{objects: parser.objects_done},
+          fn ->
+            case StreamParser.finalize(parser) do
+              {:ok, n, final_store} ->
+                result = {:ok, <<>>, %{objects: n, store: final_store}}
+                {:span, result, %{object_count: n, checksum: :ok}}
+
+              {:error, reason} = err ->
+                {:span, err, %{error: reason}}
+            end
+          end
+        )
+
+      # Legacy path: materialise the iolist into a binary for the caller.
+      {:ok, %{pack_iolist: iolist}} ->
+        pack_data = IO.iodata_to_binary(iolist)
+
+        if byte_size(pack_data) > 0 do
+          {:ok, pack_data, %{}}
+        else
+          {:ok, <<>>, %{objects: 0}}
+        end
 
       error ->
         error
     end
+  end
+
+  # Fetch-response state machine driven by `stream_upload_pack/4`.
+  #
+  # Phases:
+  #   :prelude     — skipping acks/shallow/etc until the "packfile" marker.
+  #   :in_packfile — every {:data, _} packet carries (possibly sideband-framed)
+  #                  pack bytes, dispatched to parser OR appended to pack_iolist.
+  #
+  # Sideband decision:
+  #   - Caller-supplied sideband (true|false) wins (used by tests).
+  #   - Otherwise auto-detect on the FIRST pack-section data packet:
+  #     leading byte 1/2/3 → sideband channel; anything else → raw stream.
+  #
+  # Streaming path (parser != nil):
+  #   Pack bytes are fed directly to a StreamParser that writes objects to
+  #   the object store as they arrive. No pack_iolist is accumulated.
+  #
+  # Legacy path (parser == nil):
+  #   Pack bytes are appended to pack_iolist for the caller to parse.
+  defp init_fetch_state(explicit_sideband, object_store) do
+    parser = if object_store, do: StreamParser.new(object_store), else: nil
+
+    %{
+      phase: :prelude,
+      sideband: explicit_sideband,
+      pack_iolist: if(is_nil(parser), do: [], else: nil),
+      parser: parser,
+      error: nil
+    }
+  end
+
+  defp handle_fetch_packet(_pkt, %{error: e} = state) when not is_nil(e), do: state
+
+  defp handle_fetch_packet({:data, line}, %{phase: :prelude} = state) do
+    case line do
+      "packfile\n" -> %{state | phase: :in_packfile}
+      "packfile" -> %{state | phase: :in_packfile}
+      _ -> state
+    end
+  end
+
+  defp handle_fetch_packet({:data, data}, %{phase: :in_packfile, sideband: nil} = state) do
+    # First pack-section data packet: decide sideband from leading byte.
+    sideband =
+      case data do
+        <<b, _::binary>> when b in 1..3 -> true
+        _ -> false
+      end
+
+    handle_fetch_packet({:data, data}, %{state | sideband: sideband})
+  end
+
+  defp handle_fetch_packet({:data, data}, %{phase: :in_packfile, sideband: true} = state) do
+    case data do
+      <<1, payload::binary>> -> dispatch_pack_bytes(state, payload)
+      # Channel 2 = progress; ignored.
+      <<2, _::binary>> -> state
+      <<3, msg::binary>> -> %{state | error: msg}
+      _ -> state
+    end
+  end
+
+  defp handle_fetch_packet({:data, data}, %{phase: :in_packfile, sideband: false} = state) do
+    dispatch_pack_bytes(state, data)
+  end
+
+  # Route pack bytes to either the streaming parser or the legacy iolist.
+  # All other packet types (flush, delim, etc.) are no-ops.
+  defp handle_fetch_packet(_pkt, state), do: state
+
+  # Route pack bytes to either the streaming parser or the legacy iolist.
+  defp dispatch_pack_bytes(%{parser: %StreamParser{} = parser} = state, bytes) do
+    case StreamParser.ingest(parser, bytes) do
+      {:ok, new_parser} -> %{state | parser: new_parser}
+      {:error, reason} -> %{state | error: reason}
+    end
+  end
+
+  defp dispatch_pack_bytes(%{pack_iolist: iolist} = state, bytes) do
+    %{state | pack_iolist: [iolist | bytes]}
   end
 
   # Returns `{sideband, thin_pack, ofs_delta}` for the REQUEST. Honors
@@ -553,82 +672,6 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
-  # --- Fetch response parsing ---
-
-  defp parse_fetch_response(body, opts) do
-    packets = PktLine.decode_all(body)
-
-    # The fetch response has sections: acknowledgments, shallow info, then packfile
-    {_before_pack, pack_packets} = split_at_packfile(packets)
-
-    # Auto-detect sideband framing. Some servers (GitHub) apply it
-    # regardless of client declaration. We check the first data pkt-line
-    # of the pack section: if it starts with a channel byte (1-3)
-    # AND the caller didn't explicitly disable sideband, demux.
-    sideband = decide_sideband(pack_packets, opts)
-
-    pack_data =
-      pack_packets
-      |> Enum.flat_map(&demux_pack_packet(&1, sideband))
-      |> IO.iodata_to_binary()
-
-    if byte_size(pack_data) > 0 do
-      {:ok, pack_data, %{}}
-    else
-      {:ok, <<>>, %{objects: 0}}
-    end
-  catch
-    {:server_error, msg} -> {:error, {:server_error, msg}}
-  end
-
-  # Auto-detect whether the response is sideband-framed by peeking at
-  # the first data pkt-line's first byte.
-  #
-  # The protocol guarantee this relies on: a non-sideband pack stream
-  # begins with the bytes "PACK" (0x50 0x41 0x43 0x4B). Git protocol
-  # sideband channels are 1, 2, 3 — distinct from any pack-stream
-  # leading byte. So `first_byte in [1, 2, 3]` is a reliable indicator
-  # of sideband framing without a separate capability handshake.
-  #
-  # See Documentation/gitprotocol-common.txt in git.git and
-  # https://git-scm.com/docs/protocol-v2#_packfile_stream.
-  defp decide_sideband(pack_packets, opts) do
-    case Keyword.get(opts, :sideband) do
-      nil ->
-        # Auto-detect from the first data pkt-line. Sideband channel
-        # bytes are 1, 2, or 3; a plain PACK stream never starts with
-        # those inside a pkt-line.
-        case Enum.find(pack_packets, &match?({:data, _}, &1)) do
-          {:data, <<b, _::binary>>} when b in [1, 2, 3] -> true
-          _ -> false
-        end
-
-      explicit ->
-        explicit
-    end
-  end
-
-  # When sideband framing is in effect, each pack pkt-line is prefixed
-  # with a channel byte (1=pack, 2=progress, 3=error). Without sideband
-  # the pkt-line contains the pack bytes directly and must not be
-  # rewritten.
-  defp demux_pack_packet({:data, <<1, data::binary>>}, true), do: [data]
-  defp demux_pack_packet({:data, <<2, _progress::binary>>}, true), do: []
-  defp demux_pack_packet({:data, <<3, error::binary>>}, true), do: throw({:server_error, error})
-  defp demux_pack_packet({:data, data}, false), do: [data]
-  defp demux_pack_packet(_, _), do: []
-
-  defp split_at_packfile(packets) do
-    case Enum.split_while(packets, fn
-           {:data, "packfile\n"} -> false
-           {:data, "packfile"} -> false
-           _ -> true
-         end) do
-      {before, [{:data, _} | after_pack]} -> {before, after_pack}
-      {before, []} -> {before, []}
-    end
-  end
-
   # --- Push response parsing ---
 
   defp parse_push_report(body) do
@@ -648,7 +691,19 @@ defmodule Exgit.Transport.HTTP do
 
   # --- HTTP helpers ---
 
-  defp post_upload_pack(t, body) do
+  # Streaming POST to /git-upload-pack. Feeds each chunk of the response
+  # body through an incremental pkt-line decoder; each fully-decoded
+  # packet is dispatched to `handle_packet.(packet, acc)`. Memory is
+  # bounded by `decoder.buffer + handler_acc`, which never holds the full
+  # response — the canonical fix for the OOM on multi-GB packs (esp-idf,
+  # linux). Non-2xx responses fall back to a buffered error body capped
+  # at @error_body_cap bytes so we still produce a useful error.
+  @error_body_cap 64 * 1024
+  @spec stream_upload_pack(t(), iodata(), acc, (PktLine.packet(), acc -> acc)) ::
+          {:ok, acc} | {:error, term()}
+        when acc: term()
+  defp stream_upload_pack(%__MODULE__{} = t, body, init_acc, handle_packet)
+       when is_function(handle_packet, 2) do
     headers = [
       {"content-type", "application/x-git-upload-pack-request"},
       {"accept", "application/x-git-upload-pack-result"},
@@ -657,17 +712,106 @@ defmodule Exgit.Transport.HTTP do
     ]
 
     url = "#{t.url}/git-upload-pack"
+    full_headers = headers ++ auth_headers_for(t, url)
 
-    case do_request(:post, url, headers, body, t) do
-      {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
-        {:ok, resp_body}
+    init_state = %{
+      decoder: Decoder.new(),
+      handler: handle_packet,
+      handler_acc: init_acc,
+      error: nil,
+      # Captures non-2xx body up to @error_body_cap bytes so we can
+      # report something useful when the server returns 401/500/etc.
+      error_body: <<>>
+    }
 
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, {:http_error, status, resp_body}}
+    # Closure form so we can capture `init_state`. The Req `into:`
+    # callback receives a freshly-built `resp` (its `private` is empty
+    # on the first invocation), so we lazy-init state in `resp.private`
+    # there and update it on every subsequent chunk.
+    into_fn = fn {:data, chunk}, {req, resp} ->
+      state = Map.get(resp.private, :exgit_stream, init_state)
+      stream_step(chunk, state, req, resp)
+    end
+
+    req_opts = [
+      method: :post,
+      url: url,
+      headers: full_headers,
+      body: IO.iodata_to_binary(body),
+      decode_body: false,
+      receive_timeout: t.receive_timeout,
+      retry: false,
+      redirect: req_redirect_setting(t.redirect),
+      connect_options: connect_options(url, t),
+      into: into_fn
+    ]
+
+    case Req.request(req_opts) do
+      {:ok, %{status: status, private: %{exgit_stream: state}}} when status in 200..299 ->
+        with :ok <- Decoder.finalize(state.decoder) do
+          if state.error, do: {:error, state.error}, else: {:ok, state.handler_acc}
+        end
+
+      {:ok, %{status: status, private: %{exgit_stream: state}}} ->
+        {:error, {:http_error, status, state.error_body}}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:http_error, status, body}}
 
       {:error, _} = err ->
         err
     end
+  end
+
+  # One streaming step: feed `chunk` through either the error buffer
+  # (non-2xx) or the pkt-line decoder + handler (2xx), and stash the
+  # updated state in `resp.private.exgit_stream`.
+  defp stream_step(chunk, state, req, resp) do
+    cond do
+      resp.status not in 200..299 ->
+        room = @error_body_cap - byte_size(state.error_body)
+
+        captured =
+          if room > 0 do
+            take = min(room, byte_size(chunk))
+            <<head::binary-size(take), _::binary>> = chunk
+            <<state.error_body::binary, head::binary>>
+          else
+            state.error_body
+          end
+
+        {:cont, {req, put_private(resp, %{state | error_body: captured})}}
+
+      state.error != nil ->
+        {:halt, {req, put_private(resp, state)}}
+
+      true ->
+        case Decoder.feed(state.decoder, chunk) do
+          {:ok, decoder, packets} ->
+            handler_acc =
+              Enum.reduce(packets, state.handler_acc, fn pkt, acc ->
+                state.handler.(pkt, acc)
+              end)
+
+            new_state = %{state | decoder: decoder, handler_acc: handler_acc}
+
+            cont_or_halt =
+              case handler_acc do
+                %{error: e} when not is_nil(e) -> :halt
+                _ -> :cont
+              end
+
+            {cont_or_halt, {req, put_private(resp, new_state)}}
+
+          {:error, reason} ->
+            new_state = %{state | error: {:malformed_response, reason}}
+            {:halt, {req, put_private(resp, new_state)}}
+        end
+    end
+  end
+
+  defp put_private(resp, state) do
+    %{resp | private: Map.put(resp.private, :exgit_stream, state)}
   end
 
   defp do_request(method, url, headers, body, t) do

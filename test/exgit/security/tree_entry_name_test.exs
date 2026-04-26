@@ -15,7 +15,7 @@ defmodule Exgit.Security.TreeEntryNameTest do
     * empty names
     * `.` and `..`
     * names containing `/` or NUL
-    * case-insensitive `.git` / `.gitmodules`
+     * case-insensitive `.git` (`.gitmodules` is accepted — legitimate submodule config)
   """
 
   use ExUnit.Case, async: true
@@ -63,10 +63,13 @@ defmodule Exgit.Security.TreeEntryNameTest do
       end
     end
 
-    test "`.gitmodules` is reserved (case-insensitive)" do
+    test "`.gitmodules` is accepted — legitimate submodule config file" do
+      # `.gitmodules` is NOT reserved: it is a standard file present in any
+      # repo that uses submodules. The URL-injection concern only applies if we
+      # process submodule config, which we do not.
       for variant <- [".gitmodules", ".GITMODULES", ".GitModules"] do
         raw = entry("100644", variant, @sha)
-        assert {:error, {:tree_entry_name_reserved, ^variant}} = safe_decode(raw)
+        assert {:ok, %Tree{}} = safe_decode(raw)
       end
     end
 

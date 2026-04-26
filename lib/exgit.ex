@@ -472,7 +472,19 @@ defmodule Exgit do
     if wants == [] do
       {:ok, repo}
     else
-      case Transport.fetch(transport, wants, opts) do
+      # Pass the object store so HTTP transport can stream pack bytes
+      # directly into it via Pack.StreamParser, avoiding the O(pack_size)
+      # intermediate binary and the full-pack-in-memory parse.
+      fetch_opts = Keyword.put_new(opts, :object_store, repo.object_store)
+
+      case Transport.fetch(transport, wants, fetch_opts) do
+        # Streaming path: objects already written; summary carries the
+        # updated store (required for value-typed stores like Memory).
+        {:ok, <<>>, %{store: updated_store}} ->
+          repo = %{repo | object_store: updated_store}
+          update_remote_refs(repo, refs, remote_name)
+
+        # Non-streaming path (e.g. file transport, or empty response).
         {:ok, pack_data, _summary} when byte_size(pack_data) > 0 ->
           with {:ok, repo} <- unpack_into(repo, pack_data) do
             update_remote_refs(repo, refs, remote_name)

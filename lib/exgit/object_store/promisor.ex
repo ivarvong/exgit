@@ -647,4 +647,29 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Promisor do
 
   def import_objects(store, raw_objects),
     do: Promisor.import_objects(store, raw_objects)
+
+  # ---------------------------------------------------------------------------
+  # Streaming write (Phase 3+) — delegate to the inner Memory cache.
+  # The handle is the same as Memory's handle; at close_write we splice the
+  # updated cache back into the Promisor struct.
+  # ---------------------------------------------------------------------------
+
+  def open_write(%Promisor{cache: cache}, type, expected_size) do
+    Exgit.ObjectStore.open_write(cache, type, expected_size)
+  end
+
+  def write_chunk(%Promisor{cache: cache}, handle, chunk) do
+    Exgit.ObjectStore.write_chunk(cache, handle, chunk)
+  end
+
+  def close_write(%Promisor{cache: cache} = store, handle) do
+    case Exgit.ObjectStore.close_write(cache, handle) do
+      {:ok, sha, updated_cache} -> {:ok, sha, %{store | cache: updated_cache}}
+      {:error, _} = err -> err
+    end
+  end
+
+  def cancel_write(%Promisor{cache: cache}, handle) do
+    Exgit.ObjectStore.cancel_write(cache, handle)
+  end
 end

@@ -88,4 +88,66 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Memory do
 
   def import_objects(store, raw_objects),
     do: Memory.import_objects(store, raw_objects)
+
+  # ---------------------------------------------------------------------------
+  # Streaming write (Phase 3+)
+  #
+  # The write handle holds an open zlib deflate port and an incremental SHA-1
+  # context. Content is compressed on-the-fly as chunks arrive; only the
+  # compressed output is accumulated. The full uncompressed content never
+  # coexists with the compressed form in the same heap.
+  # ---------------------------------------------------------------------------
+
+  def open_write(_store, type, expected_size) do
+    type_str = Atom.to_string(type)
+    sha_ctx = :crypto.hash_init(:sha)
+    # Git object header is part of the SHA but NOT part of the stored content.
+    header = "#{type_str} #{expected_size}\0"
+    sha_ctx = :crypto.hash_update(sha_ctx, header)
+
+    z = :zlib.open()
+    :zlib.deflateInit(z, :default)
+
+    handle = %{
+      __type__: :memory_write,
+      store_type: type,
+      sha_ctx: sha_ctx,
+      deflate: z,
+      acc: []
+    }
+
+    {:ok, handle}
+  end
+
+  def write_chunk(_store, %{deflate: z, sha_ctx: sha_ctx, acc: acc} = handle, chunk)
+      when is_binary(chunk) do
+    sha_ctx = :crypto.hash_update(sha_ctx, chunk)
+    compressed_chunks = :zlib.deflate(z, chunk)
+    {:ok, %{handle | sha_ctx: sha_ctx, acc: [acc | compressed_chunks]}}
+  end
+
+  def close_write(%Memory{objects: objects} = store, %{__type__: :memory_write} = handle) do
+    sha = :crypto.hash_final(handle.sha_ctx)
+    final_chunks = :zlib.deflate(handle.deflate, <<>>, :finish)
+    :zlib.deflateEnd(handle.deflate)
+    :zlib.close(handle.deflate)
+    compressed = IO.iodata_to_binary([handle.acc | final_chunks])
+    new_objects = Map.put(objects, sha, {handle.store_type, compressed})
+    {:ok, sha, %{store | objects: new_objects}}
+  end
+
+  def cancel_write(_store, %{__type__: :memory_write, deflate: z}) do
+    try do
+      :zlib.deflateEnd(z)
+    rescue
+      _ -> :ok
+    catch
+      _, _ -> :ok
+    end
+
+    :zlib.close(z)
+    :ok
+  end
+
+  def cancel_write(_store, _handle), do: :ok
 end
