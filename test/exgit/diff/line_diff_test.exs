@@ -171,9 +171,59 @@ defmodule Exgit.Diff.LineDiffTest do
       end
     end
 
+    # Optimality check. The other properties verify that matched_pairs
+    # produces a valid common subsequence (matching lines, increasing
+    # indices). They do NOT verify it is the LONGEST. A Myers bug that
+    # produces a shorter-but-valid CS would pass everything else and
+    # silently miscredit blame lines. This property pins length parity
+    # against a textbook O(NM) DP — the simplest correct LCS — so any
+    # divergence from optimal trips immediately.
+    property "matched_pairs length equals LCS length (parity with naive DP)" do
+      check all(
+              a <- StreamData.list_of(line(), max_length: 10),
+              b <- StreamData.list_of(line(), max_length: 10),
+              max_runs: 300
+            ) do
+        myers_len = length(LineDiff.matched_pairs(a, b))
+        lcs_len = naive_lcs_length(a, b)
+
+        assert myers_len == lcs_len,
+               "Myers produced #{myers_len} pairs but optimal LCS is " <>
+                 "#{lcs_len} for a=#{inspect(a)} b=#{inspect(b)}"
+      end
+    end
+
     defp line do
       # Small alphabet ensures collisions so LCS actually does work.
       StreamData.one_of(Enum.map(["a", "b", "c", "d", "e"], &StreamData.constant/1))
+    end
+
+    # Textbook O(NM) DP for LCS length — the reference implementation.
+    # Used only by the parity property; not exposed.
+    defp naive_lcs_length([], _), do: 0
+    defp naive_lcs_length(_, []), do: 0
+
+    defp naive_lcs_length(a, b) do
+      a_t = List.to_tuple(a)
+      b_t = List.to_tuple(b)
+      m = length(a)
+      n = length(b)
+
+      dp =
+        Enum.reduce(1..m, %{}, fn i, dp ->
+          Enum.reduce(1..n, dp, fn j, dp ->
+            val =
+              if elem(a_t, i - 1) == elem(b_t, j - 1) do
+                Map.get(dp, {i - 1, j - 1}, 0) + 1
+              else
+                max(Map.get(dp, {i - 1, j}, 0), Map.get(dp, {i, j - 1}, 0))
+              end
+
+            Map.put(dp, {i, j}, val)
+          end)
+        end)
+
+      Map.get(dp, {m, n}, 0)
     end
   end
 end
