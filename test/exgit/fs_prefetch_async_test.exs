@@ -4,6 +4,11 @@ defmodule Exgit.FSPrefetchAsyncTest do
   alias Exgit.{FS, ObjectStore, RefStore, RepoHandle, Repository}
   alias Exgit.Object.{Blob, Commit, Tree}
 
+  # Named handler — avoids telemetry's local-function performance warning.
+  def forward_cancelled(_event, _measurements, metadata, parent) do
+    send(parent, {:cancelled, metadata})
+  end
+
   # Memory-backed repo. `FS.prefetch/3` on a non-Promisor store is a
   # no-op, so these tests exercise the ASYNC plumbing + handle
   # integration, not the network path. A separate :network-tagged
@@ -160,8 +165,8 @@ defmodule Exgit.FSPrefetchAsyncTest do
       :telemetry.attach(
         handler_id,
         [:exgit, :fs, :prefetch_async, :cancelled],
-        fn _event, _m, md, _ -> send(test_pid, {:cancelled, md}) end,
-        nil
+        &__MODULE__.forward_cancelled/4,
+        test_pid
       )
 
       try do

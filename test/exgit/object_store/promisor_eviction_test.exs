@@ -23,6 +23,11 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
     def push(_, _, _, _), do: {:error, :unsupported}
   end
 
+  # Named handler — avoids telemetry's local-function performance warning.
+  def forward_overfull(_event, measurements, metadata, parent) do
+    send(parent, {:overfull, measurements, metadata})
+  end
+
   defp make_commit(message) do
     Commit.new(
       tree: :binary.copy(<<0>>, 20),
@@ -113,10 +118,8 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
       :telemetry.attach(
         "overfull-log-test",
         [:exgit, :object_store, :cache_overfull],
-        fn _, measurements, metadata, _ ->
-          send(test_pid, {:overfull, measurements, metadata})
-        end,
-        nil
+        &__MODULE__.forward_overfull/4,
+        test_pid
       )
 
       # cap=1 byte + a blob of several bytes → overfull, nothing in

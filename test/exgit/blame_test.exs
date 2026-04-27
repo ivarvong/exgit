@@ -5,6 +5,11 @@ defmodule Exgit.BlameTest do
   alias Exgit.Object.{Blob, Commit, Tree}
   alias Exgit.{ObjectStore, RefStore}
 
+  # Named handler — avoids telemetry's local-function performance warning.
+  def forward_auto_fetch_start(_event, _measurements, metadata, parent) do
+    send(parent, {:auto_fetch_start, metadata})
+  end
+
   # Build a linear history: commit 1 creates a file with lines
   # [L1, L2, L3]; commit 2 adds L4; commit 3 replaces L2 with X2.
   # Final file at HEAD: [L1, X2, L3, L4].
@@ -223,8 +228,8 @@ defmodule Exgit.BlameTest do
       :telemetry.attach(
         handler_id,
         [:exgit, :blame, :auto_fetch, :start],
-        fn _event, _m, md, _ -> send(test_pid, {:auto_fetch_start, md}) end,
-        nil
+        &__MODULE__.forward_auto_fetch_start/4,
+        test_pid
       )
 
       try do

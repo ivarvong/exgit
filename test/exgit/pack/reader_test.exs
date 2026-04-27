@@ -35,7 +35,7 @@ defmodule Exgit.Pack.ReaderTest do
       tmp = Path.join(System.tmp_dir!(), "exgit_delta_#{System.unique_integer([:positive])}")
       File.mkdir_p!(tmp)
 
-      System.cmd("git", ["init", tmp], stderr_to_stdout: true)
+      System.cmd("git", ["init", "--initial-branch=main", "-q", tmp], stderr_to_stdout: true)
       System.cmd("git", ["-C", tmp, "config", "user.email", "t@t.com"])
       System.cmd("git", ["-C", tmp, "config", "user.name", "Test"])
 

@@ -130,7 +130,7 @@ defmodule Exgit.Pack.StreamParserAdversarialTest do
 
       File.mkdir_p!(tmp)
 
-      System.cmd("git", ["init", tmp], stderr_to_stdout: true)
+      System.cmd("git", ["init", "--initial-branch=main", "-q", tmp], stderr_to_stdout: true)
       System.cmd("git", ["-C", tmp, "config", "user.email", "t@t.com"])
       System.cmd("git", ["-C", tmp, "config", "user.name", "Test"])
 

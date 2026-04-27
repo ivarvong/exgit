@@ -1,39 +1,67 @@
 defmodule Exgit.Diff.LineDiff do
   @moduledoc """
-  Line-level diff between two sequences of lines.
+  Line-level diff between two sequences of lines via Myers diff.
 
-  The primary output is a list of **matched pairs**
-  `[{a_idx, b_idx}]` — indices (0-based) of lines that appear in
-  both inputs in the same relative order. Anything in `a` not in
-  that match is "deleted"; anything in `b` not in that match is
-  "added."
+  The primary output is a list of **matched pairs** `[{a_idx, b_idx}]`
+  — 0-based indices of lines that appear in both inputs in the same
+  relative order. Anything in `a` not in that set is "deleted";
+  anything in `b` not in that set is "added."
 
-  The LCS (longest common subsequence) is computed via dynamic
-  programming — O(N×M) time and space in the two input lengths.
-  For blame over typical source files (<10k lines), that's fine:
-  a 5000×5000 DP table is ~25M cells, completing in milliseconds
-  of BEAM time. Myers diff would give O((N+M)×D) where D is
-  edit distance, which is asymptotically better but significantly
-  more complex to implement correctly. We can swap in Myers
-  behind the same API if a real adopter profile shows LCS as
-  the blame bottleneck.
+  ## Algorithm: Myers diff
 
-  ## Why matched-pairs and not a traditional edit script
+  Myers (1986) finds the *shortest edit script* (SES) — the minimum
+  number of insertions and deletions that transforms `a` into `b`.
+  An SES corresponds to the *longest common subsequence* (LCS).
 
-  `Exgit.Blame` is the primary consumer. Blame asks: "for each
-  line in the NEW version, did it exist unchanged in the OLD
-  version, and if so, at what line number?" That's exactly what
-  matched pairs answer. A traditional unified-diff-style edit
-  script (hunks of +/-/context) is a derived representation;
-  blame would have to re-derive which-line-maps-to-which, which
-  matched-pairs already gives us directly.
+  ### Complexity
 
-  ## Whitespace and line-ending handling
+  * Time:  O((N + M) × D)  where D = |insertions| + |deletions|
+  * Space: O((N + M) × D)  for the backtracking trace
 
-  Lines are compared by exact byte equality. Whitespace changes
-  count as changes. Trailing-newline differences are preserved:
-  the caller is responsible for how they split. See
-  `Exgit.Blame`'s line-splitting helper for the canonical split.
+  For typical blame workloads where each commit edits a handful of
+  lines (small D), this is **orders of magnitude faster** than the
+  previous O(N × M) LCS DP:
+
+  | File size | LCS DP (D≈10) | Myers (D≈10) |
+  |-----------|---------------|-------------|
+  | 100 lines | ~100K         | ~2K         |
+  | 500 lines | ~2.5M         | ~10K        |
+  | 5000 lines| ~250M         | ~100K       |
+
+  ### The algorithm in brief
+
+  A *diagonal* k = x − y represents all positions (x, y) where we've
+  consumed x lines from A and y lines from B. Walking diagonally
+  (x++, y++ while A[x]==B[y]) is a *snake* — free matching. A single
+  horizontal step (x++) is a deletion; a vertical step (y++) is an
+  insertion; together they cost one edit.
+
+  **Forward phase:** for edit depth D = 0, 1, 2, …, explore every
+  diagonal k ∈ {−D, −D+2, …, D−2, D}. On each diagonal, choose the
+  greedy starting position (either V[k−1]+1 from the right or V[k+1]
+  from below), extend the snake as far as possible, and record the
+  furthest x. Save a snapshot of V at each D. Stop when some diagonal
+  reaches (n, m).
+
+  **Backtrack phase:** replay the snapshots in reverse, mirroring the
+  forward greedy choice exactly. At each level, locate the snake
+  (diagonal run of matched lines) and emit the matched pairs; recurse
+  with the position *before the edit* (not the snake start).
+
+  ### Tie-breaking convention
+
+  When V[k−1] == V[k+1], the forward algorithm prefers "right" (delete
+  from A). The backtrack mirrors this identically using the same
+  condition. Changing the tie-break in one place without the other
+  produces wrong results.
+
+  ## API contract (unchanged from LCS implementation)
+
+      iex> Exgit.Diff.LineDiff.matched_pairs(
+      ...>   ["a", "b", "c"],
+      ...>   ["a", "x", "c"]
+      ...> )
+      [{0, 0}, {2, 2}]
   """
 
   @type line_index :: non_neg_integer()
@@ -43,8 +71,8 @@ defmodule Exgit.Diff.LineDiff do
   Compute matched line pairs between `a_lines` and `b_lines`.
 
   Returns a list of `{a_index, b_index}` tuples, 0-based, in
-  increasing order of both indices. Each index appears in at
-  most one pair.
+  strictly increasing order of both indices. Each index appears in
+  at most one pair.
 
   ## Examples
 
@@ -70,30 +98,162 @@ defmodule Exgit.Diff.LineDiff do
   def matched_pairs(a_lines, b_lines) do
     a = List.to_tuple(a_lines)
     b = List.to_tuple(b_lines)
-
     n = tuple_size(a)
     m = tuple_size(b)
 
-    # Short-circuit: if both sequences are identical, skip DP
-    # entirely. This is the VERY common case for file-at-commit
-    # diff where a commit didn't touch the file at all (parent
-    # == current). For a 1000-line identical file this goes from
-    # ~150ms to ~50µs.
+    # Fast path: identical sequences are the dominant case in blame
+    # (most commits don't touch the file at all). O(N) scan.
     if n == m and identical?(a, b, 0, n) do
       for i <- 0..(n - 1), do: {i, i}
     else
-      # DP table stored as a tuple-of-tuples, row-major, 0-indexed.
-      # Row i is dp[i] — tuple of m+1 integers. This is O(1) read
-      # and beats the previous map implementation by ~50× on
-      # 300-line diffs (measured): map had log(N*M) per op +
-      # hashing overhead; tuple is a direct native read.
-      dp = build_lcs_table(a, b, n, m)
-
-      # Backtrack from (n, m) to (0, 0), emitting matched pairs
-      # wherever a[i-1] == b[j-1] AND the diagonal was chosen.
-      backtrack(a, b, dp, n, m, [])
+      trace = forward(a, n, b, m)
+      backtrack(trace, n, m)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Forward phase — collect V-snapshots
+  # ---------------------------------------------------------------------------
+  #
+  # Returns [v_0, v_1, ..., v_D] where v_d is the V map after processing
+  # all diagonals at edit depth d. Each v maps diagonal k → furthest x.
+  #
+  # The initial sentinel V[1]=0 is the standard Myers trick: at d=0, k=0,
+  # the condition k==−d is true, so we reach for V[k+1]=V[1]=0 and begin
+  # the first snake from (0,0). The sentinel is not saved in the trace.
+
+  defp forward(a, n, b, m) do
+    v = %{1 => 0}
+    do_forward(a, n, b, m, v, [], 0)
+  end
+
+  defp do_forward(a, n, b, m, v, trace, d) do
+    {new_v, done} = step_d(a, n, b, m, v, d)
+    # Prepend newest snapshot; reverse to chronological order on halt.
+    new_trace = [new_v | trace]
+
+    if done or d >= n + m do
+      Enum.reverse(new_trace)
+    else
+      do_forward(a, n, b, m, new_v, new_trace, d + 1)
+    end
+  end
+
+  # Process all diagonals for edit depth d. Returns {new_v, reached_end?}.
+  #
+  # Key invariant: all reads use the OUTER v (d−1 level snapshot),
+  # never the accumulating new_v. Diagonals at the same d are independent.
+  defp step_d(a, n, b, m, v, d) do
+    Enum.reduce(Range.new(-d, d, 2), {v, false}, fn k, {new_v, any_done} ->
+      x = choose_x(v, k, d)
+      y = x - k
+      {x, y} = snake(a, n, b, m, x, y)
+      {Map.put(new_v, k, x), any_done or (x >= n and y >= m)}
+    end)
+  end
+
+  # Starting x for diagonal k at depth d.
+  # "Down" (from k+1): insert from B — y advances, x stays.
+  # "Right" (from k−1): delete from A — x advances.
+  # Prefer down when it gives a strictly larger x; prefer right on tie.
+  # This tie-break is mirrored exactly in backtrack.
+  defp choose_x(v, k, d) do
+    cond do
+      k == -d -> Map.get(v, k + 1, 0)
+      k == d -> Map.get(v, k - 1, 0) + 1
+      Map.get(v, k - 1, 0) < Map.get(v, k + 1, 0) -> Map.get(v, k + 1, 0)
+      true -> Map.get(v, k - 1, 0) + 1
+    end
+  end
+
+  # Advance diagonally while A[x] == B[y].
+  defp snake(a, n, b, m, x, y) when x < n and y < m do
+    if elem(a, x) == elem(b, y),
+      do: snake(a, n, b, m, x + 1, y + 1),
+      else: {x, y}
+  end
+
+  defp snake(_a, _n, _b, _m, x, y), do: {x, y}
+
+  # ---------------------------------------------------------------------------
+  # Backtrack phase — extract matched pairs from the trace
+  # ---------------------------------------------------------------------------
+  #
+  # Walks from (n, m) back to (0, 0) through the V-snapshots in reverse,
+  # mirroring the forward greedy choice at each level to find which
+  # diagonal the edit came from.
+  #
+  # At each level d we:
+  #   1. Determine the edit direction (down/right) using trace[d−1].
+  #   2. Compute the snake start (position immediately after the edit).
+  #   3. Collect matched pairs for the snake from snake_start to (x, y).
+  #   4. Recurse with prev_pos — the position BEFORE the edit, which is
+  #      the endpoint of the previous level's snake on the source diagonal.
+  #      This is (px, px−k−1) for down and (px, px−k+1) for right, where
+  #      px = prev_v[k±1].
+  #
+  # NOT snake_start: that would stay on diagonal k, ignoring the edit.
+
+  defp backtrack(trace, n, m) do
+    d = length(trace) - 1
+    t = List.to_tuple(trace)
+    do_backtrack(t, d, n, m, [])
+  end
+
+  # Reached origin — return accumulated pairs sorted.
+  defp do_backtrack(_t, _d, 0, 0, pairs), do: Enum.sort(pairs)
+
+  # d=0: entire remaining path is the initial snake from (0,0) to (x, x).
+  # The snake length is x (same as y since we're on diagonal k=0).
+  defp do_backtrack(_t, 0, x, _y, pairs) do
+    prefix = for i <- 0..(x - 1), do: {i, i}
+    Enum.sort(pairs ++ prefix)
+  end
+
+  defp do_backtrack(t, d, x, y, pairs) do
+    k = x - y
+    prev_v = elem(t, d - 1)
+
+    if k == -d || (k != d && Map.get(prev_v, k - 1, 0) < Map.get(prev_v, k + 1, 0)) do
+      # Edit at depth d was a DOWN move (insert from B) from diagonal k+1.
+      # End of previous snake on diagonal k+1: (px, px − (k+1)).
+      # After the down move (y += 1): (px, px − k).  ← snake start.
+      # Snake runs from (px, px−k) to (x, y).
+      px = Map.get(prev_v, k + 1, 0)
+      snake_x = px
+      snake_y = px - k
+      snake_len = x - snake_x
+
+      new_pairs =
+        if snake_len > 0,
+          do: for(i <- 0..(snake_len - 1), do: {snake_x + i, snake_y + i}),
+          else: []
+
+      # Recurse to position BEFORE the down move: (px, px−k−1) on diagonal k+1.
+      do_backtrack(t, d - 1, px, px - k - 1, pairs ++ new_pairs)
+    else
+      # Edit at depth d was a RIGHT move (delete from A) from diagonal k−1.
+      # End of previous snake on diagonal k−1: (px, px − (k−1)).
+      # After the right move (x += 1): (px+1, px−k+1).  ← snake start.
+      # Snake runs from (px+1, px−k+1) to (x, y).
+      px = Map.get(prev_v, k - 1, 0)
+      snake_x = px + 1
+      snake_y = px - k + 1
+      snake_len = x - snake_x
+
+      new_pairs =
+        if snake_len > 0,
+          do: for(i <- 0..(snake_len - 1), do: {snake_x + i, snake_y + i}),
+          else: []
+
+      # Recurse to position BEFORE the right move: (px, px−k+1) on diagonal k−1.
+      do_backtrack(t, d - 1, px, px - k + 1, pairs ++ new_pairs)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
 
   defp identical?(_a, _b, i, n) when i >= n, do: true
 
@@ -101,85 +261,13 @@ defmodule Exgit.Diff.LineDiff do
     if elem(a, i) == elem(b, i), do: identical?(a, b, i + 1, n), else: false
   end
 
-  # Build the LCS length table as a tuple of (n+1) tuples, each
-  # of size (m+1). dp[i][j] accessed via `elem(elem(dp, i), j)`.
-  defp build_lcs_table(a, b, n, m) do
-    zero_row = build_row(m + 1)
-
-    # Row 0 is all zeros (DP base case: LCS with an empty prefix
-    # is 0). Rows 1..n are computed left-to-right, each row
-    # depending on the previous row + the row being built.
-    rows =
-      Enum.reduce(1..n, [zero_row], fn i, [prev | _] = acc ->
-        row = build_dp_row(a, b, prev, i, m)
-        [row | acc]
-      end)
-
-    rows |> Enum.reverse() |> List.to_tuple()
-  end
-
-  defp build_row(size) do
-    List.duplicate(0, size) |> List.to_tuple()
-  end
-
-  defp build_dp_row(a, b, prev_row, i, m) do
-    ai = elem(a, i - 1)
-    # Row j=0 is always 0. Build the row as a reverse-accumulator
-    # list to avoid Tuple.append's O(N) copy per cell — that made
-    # the full table build O(N^3) and dominated blame on
-    # thousand-line files. List cons is O(1).
-    build_dp_row_loop(b, prev_row, ai, 1, m, 0, [0])
-    |> Enum.reverse()
-    |> List.to_tuple()
-  end
-
-  defp build_dp_row_loop(_b, _prev_row, _ai, j, m, _last_left, acc) when j > m do
-    acc
-  end
-
-  defp build_dp_row_loop(b, prev_row, ai, j, m, last_left, acc) do
-    bj = elem(b, j - 1)
-
-    value =
-      if ai == bj do
-        elem(prev_row, j - 1) + 1
-      else
-        up = elem(prev_row, j)
-        if last_left >= up, do: last_left, else: up
-      end
-
-    build_dp_row_loop(b, prev_row, ai, j + 1, m, value, [value | acc])
-  end
-
-  defp backtrack(_a, _b, _dp, 0, _j, acc), do: acc
-  defp backtrack(_a, _b, _dp, _i, 0, acc), do: acc
-
-  defp backtrack(a, b, dp, i, j, acc) do
-    ai = elem(a, i - 1)
-    bj = elem(b, j - 1)
-
-    cond do
-      ai == bj ->
-        backtrack(a, b, dp, i - 1, j - 1, [{i - 1, j - 1} | acc])
-
-      dp_at(dp, i - 1, j) >= dp_at(dp, i, j - 1) ->
-        backtrack(a, b, dp, i - 1, j, acc)
-
-      true ->
-        backtrack(a, b, dp, i, j - 1, acc)
-    end
-  end
-
-  defp dp_at(dp, i, j) do
-    dp |> elem(i) |> elem(j)
-  end
+  # ---------------------------------------------------------------------------
+  # Convenience functions — unchanged API
+  # ---------------------------------------------------------------------------
 
   @doc """
-  Convenience: given matched pairs, return the list of
-  0-based indices in `b_lines` that are **new** (not carried
-  from `a_lines`).
-
-  Used by blame to attribute lines to the current commit.
+  Convenience: given matched pairs, return the list of 0-based
+  indices in `b_lines` that are **new** (not carried from `a_lines`).
   """
   @spec b_additions(matched_pairs(), non_neg_integer()) :: [line_index()]
   def b_additions(pairs, b_length) do
@@ -192,10 +280,8 @@ defmodule Exgit.Diff.LineDiff do
   end
 
   @doc """
-  Convenience: for each 0-based index in `b_lines` that was
-  carried from `a_lines`, return `{b_idx, a_idx}`.
-
-  Used by blame to propagate line attribution to the parent commit.
+  Convenience: for each 0-based index in `b_lines` that was carried
+  from `a_lines`, return `{b_idx, a_idx}`.
   """
   @spec b_carryovers(matched_pairs()) :: [{line_index(), line_index()}]
   def b_carryovers(pairs) do

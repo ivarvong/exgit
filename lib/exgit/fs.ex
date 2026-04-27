@@ -759,19 +759,25 @@ defmodule Exgit.FS do
   defp do_prefetch_history(repo, promisor, reference) do
     transport = promisor.transport
 
-    with {:ok, commit_sha} <- resolve_reference_to_sha(repo, reference),
-         {:ok, pack_bytes, _} <-
-           Exgit.Transport.fetch(transport, [commit_sha],
-             haves: [],
-             filter: "blob:none"
-           ),
-         true <- byte_size(pack_bytes) > 0 || {:error, :empty_pack},
-         {:ok, parsed} <- Exgit.Pack.Reader.parse(pack_bytes),
-         {:ok, new_promisor} <- Exgit.ObjectStore.Promisor.import_objects(promisor, parsed) do
-      {:ok, %{repo | object_store: new_promisor}}
-    else
-      false -> {:error, :empty_pack}
-      err -> err
+    with {:ok, commit_sha} <- resolve_reference_to_sha(repo, reference) do
+      fetch_opts = [haves: [], filter: "blob:none", object_store: promisor]
+
+      case Exgit.Transport.fetch(transport, [commit_sha], fetch_opts) do
+        {:ok, <<>>, %{store: new_promisor}} ->
+          {:ok, %{repo | object_store: new_promisor}}
+
+        {:ok, pack_bytes, _} when byte_size(pack_bytes) > 0 ->
+          with {:ok, parsed} <- Exgit.Pack.Reader.parse(pack_bytes),
+               {:ok, new_promisor} <- Exgit.ObjectStore.Promisor.import_objects(promisor, parsed) do
+            {:ok, %{repo | object_store: new_promisor}}
+          end
+
+        {:ok, _, _} ->
+          {:error, :empty_pack}
+
+        err ->
+          err
+      end
     end
   end
 

@@ -48,7 +48,13 @@ defmodule Exgit.IndexTest do
     test "reads an index created by git", %{base: base} do
       repo = Path.join(base, "repo")
       File.mkdir_p!(repo)
-      {_, 0} = System.cmd("git", ["init"], cd: repo, stderr_to_stdout: true)
+
+      {_, 0} =
+        System.cmd("git", ["init", "--initial-branch=main", "-q"],
+          cd: repo,
+          stderr_to_stdout: true
+        )
+
       file = Path.join(repo, "test.txt")
       File.write!(file, "content\n")
       {_, 0} = System.cmd("git", ["add", "test.txt"], cd: repo, stderr_to_stdout: true)
@@ -66,7 +72,12 @@ defmodule Exgit.IndexTest do
     test "reads index with multiple files", %{base: base} do
       repo = Path.join(base, "repo2")
       File.mkdir_p!(repo)
-      {_, 0} = System.cmd("git", ["init"], cd: repo, stderr_to_stdout: true)
+
+      {_, 0} =
+        System.cmd("git", ["init", "--initial-branch=main", "-q"],
+          cd: repo,
+          stderr_to_stdout: true
+        )
 
       File.write!(Path.join(repo, "a.txt"), "aaa\n")
       File.mkdir_p!(Path.join(repo, "sub"))
