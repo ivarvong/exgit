@@ -77,6 +77,12 @@ defmodule Exgit.Telemetry do
   ### Pack
 
     * `[:exgit, :pack, :parse]` — `%{byte_size, object_count}`
+    * `[:exgit, :pack, :stream_parse]` — span; metadata: `%{objects,
+      object_count, checksum}` on success, `%{objects, error}` on
+      failure. Fires when the HTTP transport's streaming parser path
+      runs — i.e., `Transport.fetch` was called with `object_store:`
+      in opts so pack bytes are decoded straight into the store
+      without buffering the full pack in memory.
 
   ### FS
 
@@ -151,6 +157,7 @@ defmodule Exgit.Telemetry do
       [:exgit, :transport, :fetch],
       [:exgit, :transport, :push],
       [:exgit, :pack, :parse],
+      [:exgit, :pack, :stream_parse],
       [:exgit, :object_store, :get],
       [:exgit, :object_store, :put],
       [:exgit, :object_store, :has?],
