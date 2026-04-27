@@ -53,7 +53,7 @@ defmodule Exgit.Object.CommitTest do
     test "matches git commit-tree" do
       tmp = System.tmp_dir!()
       repo = Path.join(tmp, "exgit_commit_test_#{System.unique_integer([:positive])}")
-      System.cmd("git", ["init", "--bare", repo])
+      System.cmd("git", ["init", "--bare", "--initial-branch=main", "-q", repo])
 
       blob_data = "hello\n"
       {_, 0} = cmd_with_stdin("git", ["hash-object", "-w", "--stdin"], blob_data, cd: repo)

@@ -70,7 +70,7 @@ defmodule Exgit.Object.TreeTest do
 
       tmp = System.tmp_dir!()
       repo = Path.join(tmp, "exgit_tree_test_#{System.unique_integer([:positive])}")
-      System.cmd("git", ["init", "--bare", repo])
+      System.cmd("git", ["init", "--bare", "--initial-branch=main", "-q", repo])
 
       {_, 0} = cmd_with_stdin("git", ["hash-object", "-w", "--stdin"], blob_data, cd: repo)
 
