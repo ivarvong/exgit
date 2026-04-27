@@ -29,7 +29,7 @@ defmodule Exgit.Repository do
   """
 
   @enforce_keys [:object_store, :ref_store]
-  defstruct [:object_store, :ref_store, :config, :path, mode: :eager]
+  defstruct [:object_store, :ref_store, :config, :path, mode: :eager, blob_cache: %{}]
 
   @type mode :: :eager | :lazy
 
@@ -38,7 +38,8 @@ defmodule Exgit.Repository do
           ref_store: term(),
           config: Exgit.Config.t() | nil,
           path: Path.t() | nil,
-          mode: mode()
+          mode: mode(),
+          blob_cache: %{binary() => binary()}
         }
 
   @spec new(term(), term(), keyword()) :: t()

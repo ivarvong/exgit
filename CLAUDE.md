@@ -68,6 +68,19 @@ Dialyzer classes that showed up in this codebase:
   `ObjectStore` protocol callbacks.
 - **ObjectStore protocol**: `put/2` returns `{:ok, sha, new_store}` — always
   thread `new_store` forward. Same for `open_write/close_write`.
+- **RepoRegistry keys are `{url, credential_hash}`**: never `url` alone.
+  Different credentials for the same URL must get isolated handles —
+  sharing a cache across privilege boundaries is a security defect.
+- **`blob_cache` lives on the struct**: callers own it, callers control
+  its lifetime. Don't add a process or ETS table for it.
+
+## RepoHandle task monitoring
+
+`fetch_once/3` spawns tasks with `Task.Supervisor.async_nolink`. The
+task is monitored (not linked) so a crash reaches the handle as
+`{:DOWN, ref, ...}` — the handle fails all waiters cleanly instead of
+leaving them blocked. Never use `start_child` (fire-and-forget) for
+tasks whose results must be delivered to waiters.
 
 ## Test tags
 

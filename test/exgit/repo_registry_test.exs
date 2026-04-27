@@ -144,6 +144,62 @@ defmodule Exgit.RepoRegistryTest do
     end
   end
 
+  describe "credential scoping" do
+    test "same URL with different credentials gets different handles" do
+      repo = FakeTransport.Clone.build_fake_repo()
+      url = "fake://cred-test"
+
+      # Register two handles manually with different credential hashes.
+      key_a = {url, "hash-token-a"}
+      key_b = {url, "hash-token-b"}
+
+      via_a = {:via, Registry, {Exgit.RepoRegistry.Registry, key_a}}
+      via_b = {:via, Registry, {Exgit.RepoRegistry.Registry, key_b}}
+
+      {:ok, handle_a} = RepoHandle.start_link(repo, name: via_a)
+      {:ok, handle_b} = RepoHandle.start_link(repo, name: via_b)
+
+      assert handle_a != handle_b
+
+      # lookup with no auth → "anonymous" key → finds neither
+      assert :error = RepoRegistry.lookup(url)
+
+      RepoHandle.stop(handle_a)
+      RepoHandle.stop(handle_b)
+    end
+
+    test "same URL with no credentials always gets the anonymous handle" do
+      repo = FakeTransport.Clone.build_fake_repo()
+      url = "fake://anon-test"
+
+      key = {url, "anonymous"}
+      via = {:via, Registry, {Exgit.RepoRegistry.Registry, key}}
+      {:ok, handle} = RepoHandle.start_link(repo, name: via)
+
+      # lookup/1 with no opts should find the anonymous handle.
+      assert {:ok, ^handle} = RepoRegistry.lookup(url)
+
+      # lookup/2 with explicit nil auth should also find it.
+      assert {:ok, ^handle} = RepoRegistry.lookup(url, auth: nil)
+
+      RepoHandle.stop(handle)
+    end
+
+    test "credential hash is stable — same token always maps to same key" do
+      token = "ghp_test1234567890"
+      auth = {:bearer, token}
+      # Two calls with the same credential should produce the same hash.
+      assert RepoRegistry.lookup("u", auth: auth) == RepoRegistry.lookup("u", auth: auth)
+    end
+
+    test "stop/2 with non-matching credentials is a no-op" do
+      # stop/2 generates a credential hash; if no handle is registered
+      # under that hash, it is silently ignored.
+      :ok = RepoRegistry.stop("https://example.com/no-handle", auth: {:bearer, "tok"})
+      :ok = RepoRegistry.stop("https://example.com/no-handle")
+    end
+  end
+
   describe "manual handle registration (simulating a successful clone)" do
     # We can't easily mock the private clone_for_registry/2 without a
     # module-attribute swap or a dependency-inversion refactor. Instead,
@@ -155,7 +211,9 @@ defmodule Exgit.RepoRegistryTest do
       repo = FakeTransport.Clone.build_fake_repo()
       url = "fake://test-handle-lookup"
 
-      via = {:via, Registry, {Exgit.RepoRegistry.Registry, url}}
+      # Registry key is now {url, credential_hash}; anonymous == "anonymous".
+      key = {url, "anonymous"}
+      via = {:via, Registry, {Exgit.RepoRegistry.Registry, key}}
       {:ok, handle} = RepoHandle.start_link(repo, name: via)
 
       assert {:ok, ^handle} = RepoRegistry.lookup(url)

@@ -298,6 +298,77 @@ defmodule Exgit.RepoHandleTest do
     end
   end
 
+  describe "fetch_once/3 task crash — liveness" do
+    test "killed task fails all waiters instead of blocking them forever", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+      parent = self()
+
+      # A fetch fn that signals the test and then blocks indefinitely
+      # so we can kill the task process while callers are waiting.
+      crash_fn = fn repo ->
+        send(parent, :task_started)
+
+        receive do
+          :never -> {:ok, repo}
+        end
+      end
+
+      # Three concurrent waiters.
+      waiters =
+        for _ <- 1..3 do
+          Task.async(fn -> RepoHandle.fetch_once(handle, :killable, crash_fn) end)
+        end
+
+      # Wait until the task is actually running, then kill it.
+      assert_receive :task_started, 2_000
+
+      # Find and kill the task process. The handle's monitor fires and
+      # must fan out :fetch_task_crashed to all waiters promptly —
+      # without this fix, they would block until their 300s timeout.
+      children = Task.Supervisor.children(Exgit.TaskSupervisor)
+      Enum.each(children, &Process.exit(&1, :kill))
+
+      # All three waiters must receive the crash error, not block.
+      results = Task.await_many(waiters, 3_000)
+
+      assert Enum.all?(results, fn
+               {:error, {:fetch_task_crashed, _}} -> true
+               _ -> false
+             end),
+             "Expected all waiters to receive :fetch_task_crashed, got: #{inspect(results)}"
+
+      RepoHandle.stop(handle)
+    end
+
+    test "a subsequent fetch_once for the same key works after a crash", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+      parent = self()
+
+      # First fetch: crashes.
+      crash_fn = fn repo ->
+        send(parent, :task_started)
+
+        receive do
+          :never -> {:ok, repo}
+        end
+      end
+
+      waiter = Task.async(fn -> RepoHandle.fetch_once(handle, :retry_key, crash_fn) end)
+      assert_receive :task_started, 2_000
+
+      children = Task.Supervisor.children(Exgit.TaskSupervisor)
+      Enum.each(children, &Process.exit(&1, :kill))
+
+      assert {:error, {:fetch_task_crashed, _}} = Task.await(waiter, 3_000)
+
+      # Second fetch for same key should work normally.
+      ok_fn = fn r -> {:ok, r} end
+      assert {:ok, _} = RepoHandle.fetch_once(handle, :retry_key, ok_fn, 5_000)
+
+      RepoHandle.stop(handle)
+    end
+  end
+
   describe "read performance" do
     test "get/1 does not send a message to the handle", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)

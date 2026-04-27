@@ -152,6 +152,55 @@ defmodule Exgit.CloneModesTest do
       assert repo.mode == :lazy
     end
 
+    test "prefetch(blobs: true, warm: true) populates blob_cache on the struct" do
+      {:ok, repo} = Exgit.clone(seed_transport(), lazy: true)
+      {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true, warm: true)
+
+      # blob_cache is a plain map on the struct — no hidden state.
+      assert is_map(repo.blob_cache)
+      assert map_size(repo.blob_cache) > 0
+
+      # Every value is a binary (raw blob content).
+      assert Enum.all?(repo.blob_cache, fn {sha, data} ->
+               is_binary(sha) and is_binary(data)
+             end)
+    end
+
+    test "prefetch without warm: true leaves blob_cache empty" do
+      {:ok, repo} = Exgit.clone(seed_transport(), lazy: true)
+      {:ok, repo} = Exgit.FS.prefetch(repo, "HEAD", blobs: true)
+
+      assert repo.blob_cache == %{}
+    end
+
+    test "grep uses blob_cache when populated — correct results unchanged" do
+      {:ok, repo_cold} = Exgit.clone(seed_transport(), lazy: true)
+      {:ok, repo_cold} = Exgit.FS.prefetch(repo_cold, "HEAD", blobs: true)
+
+      {:ok, repo_warm} = Exgit.clone(seed_transport(), lazy: true)
+      {:ok, repo_warm} = Exgit.FS.prefetch(repo_warm, "HEAD", blobs: true, warm: true)
+
+      cold_hits =
+        Exgit.FS.grep(repo_cold, "HEAD", "hello") |> Enum.map(& &1.line_number) |> Enum.sort()
+
+      warm_hits =
+        Exgit.FS.grep(repo_warm, "HEAD", "hello") |> Enum.map(& &1.line_number) |> Enum.sort()
+
+      assert cold_hits == warm_hits,
+             "blob_cache produced different grep results: #{inspect(cold_hits)} vs #{inspect(warm_hits)}"
+    end
+
+    test "warm_budget limits blob_cache size" do
+      {:ok, repo} = Exgit.clone(seed_transport(), lazy: true)
+      # Budget of 1 byte — should result in an empty or partial cache.
+      {:ok, repo_tiny} = Exgit.FS.prefetch(repo, "HEAD", blobs: true, warm: true, warm_budget: 1)
+
+      {:ok, repo_full} = Exgit.FS.prefetch(repo, "HEAD", blobs: true, warm: true)
+
+      # Tiny budget skips blobs (each blob is > 1 byte).
+      assert map_size(repo_tiny.blob_cache) < map_size(repo_full.blob_cache)
+    end
+
     test "FS.walk works after materialize/2" do
       {:ok, repo} = Exgit.clone(seed_transport(), lazy: true)
       {:ok, repo} = Repository.materialize(repo, "HEAD")

@@ -261,11 +261,16 @@ defmodule Exgit.RepoHandle do
 
     true = :ets.insert(table, {:repo, repo})
 
-    # `in_flight`: %{key => %{task_ref: ref, waiters: [from, ...]}}
-    # Entries are created when the first fetch_once for a key
-    # arrives; removed when the task completes and all waiters
-    # have been replied to.
-    {:ok, %{table: table, in_flight: %{}}}
+    # `in_flight`: %{key => {task_ref, [from, ...]}}
+    #   key       — caller-supplied dedup key
+    #   task_ref  — the monitor ref from Task.Supervisor.async_nolink;
+    #               used to match {:DOWN, ref, ...} messages when the
+    #               task crashes
+    #   waiters   — GenServer `from` values to reply to on completion
+    #
+    # `task_refs`: %{task_ref => key}
+    #   Reverse map for O(1) lookup in handle_info(:DOWN, ...).
+    {:ok, %{table: table, in_flight: %{}, task_refs: %{}}}
   end
 
   @impl true
@@ -297,40 +302,50 @@ defmodule Exgit.RepoHandle do
   def handle_call({:fetch_once, key, fetch_fn}, from, state) do
     case Map.get(state.in_flight, key) do
       nil ->
-        # No pending fetch. Spawn a task to run the fetch outside
-        # the GenServer so we stay responsive to other reads /
-        # updates. We'll reply to `from` (and any waiters that
-        # register before the task finishes) when it completes.
-        handle_pid = self()
-
-        _ =
-          Task.Supervisor.start_child(Exgit.TaskSupervisor, fn ->
+        # No pending fetch for this key. Spawn the fetch outside
+        # the GenServer so the handle stays responsive to ETS reads
+        # while the (potentially slow) network call runs.
+        #
+        # We use async_nolink so the task runs under the shared
+        # TaskSupervisor (restarted on crash there, not here) and
+        # we are NOT linked to it — a crash in the task must NOT
+        # kill the handle. The monitor gives us the :DOWN message
+        # if the task process is killed before it can return,
+        # letting us fail all waiters cleanly instead of leaving
+        # them blocked until their GenServer call timeout fires.
+        task =
+          Task.Supervisor.async_nolink(Exgit.TaskSupervisor, fn ->
             [{:repo, repo}] = :ets.lookup(state.table, :repo)
-            result = safe_fetch(fetch_fn, repo)
-            send(handle_pid, {:fetch_once_done, key, result})
+            safe_fetch(fetch_fn, repo)
           end)
 
-        entry = %{waiters: [from]}
-        {:noreply, %{state | in_flight: Map.put(state.in_flight, key, entry)}}
+        in_flight = Map.put(state.in_flight, key, {task.ref, [from]})
+        task_refs = Map.put(state.task_refs, task.ref, key)
+        {:noreply, %{state | in_flight: in_flight, task_refs: task_refs}}
 
-      %{waiters: waiters} = entry ->
-        # Already in-flight for this key. Add to waiters.
-        new_entry = %{entry | waiters: [from | waiters]}
-        {:noreply, %{state | in_flight: Map.put(state.in_flight, key, new_entry)}}
+      {_ref, _waiters} ->
+        # Already in-flight. Register as a waiter; we'll be replied
+        # to when the running task finishes (or fails).
+        in_flight = Map.update!(state.in_flight, key, fn {ref, ws} -> {ref, [from | ws]} end)
+        {:noreply, %{state | in_flight: in_flight}}
     end
   end
 
   @impl true
-  def handle_info({:fetch_once_done, key, result}, state) do
-    case Map.pop(state.in_flight, key) do
-      {nil, _state} ->
-        # Shouldn't happen — we removed the entry out from under
-        # ourselves somehow. Log and continue.
+  # Task completed successfully.
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    # Demonitor first to flush the pending :DOWN message that
+    # async_nolink sends when the task process exits normally.
+    Process.demonitor(ref, [:flush])
+
+    case Map.pop(state.task_refs, ref) do
+      {nil, _} ->
+        # Stale or unrelated monitor message — ignore.
         {:noreply, state}
 
-      {%{waiters: waiters}, remaining} ->
-        # Commit the result to ETS if it succeeded, then reply to
-        # all waiters with the same return value.
+      {key, task_refs} ->
+        {{_ref, waiters}, in_flight} = Map.pop(state.in_flight, key)
+
         reply_value =
           case result do
             {:ok, %Repository{} = new_repo} ->
@@ -345,7 +360,26 @@ defmodule Exgit.RepoHandle do
           GenServer.reply(from, reply_value)
         end
 
-        {:noreply, %{state | in_flight: remaining}}
+        {:noreply, %{state | in_flight: in_flight, task_refs: task_refs}}
+    end
+  end
+
+  # Task process was killed before it could return a value.
+  # Fail all waiters immediately so they don't block until timeout.
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Map.pop(state.task_refs, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {key, task_refs} ->
+        {{_ref, waiters}, in_flight} = Map.pop(state.in_flight, key)
+        error = {:error, {:fetch_task_crashed, reason}}
+
+        for from <- Enum.reverse(waiters) do
+          GenServer.reply(from, error)
+        end
+
+        {:noreply, %{state | in_flight: in_flight, task_refs: task_refs}}
     end
   end
 
