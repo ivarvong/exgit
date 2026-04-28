@@ -18,9 +18,13 @@ defmodule Exgit.ErrorHandlingTest do
     end
 
     test "clone to a path we cannot write into returns {:error, _}, not MatchError" do
-      # /proc is typically read-only on Linux; on macOS we use a nonexistent
-      # parent to force mkdir_p to fail.
-      dest = "/this/path/should/not/exist/exgit_target"
+      # Place a regular file at the base path, then try to clone into a subdir
+      # of it. mkdir under a regular file fails even as root, making this
+      # reliable across privilege levels and OSes.
+      base = Path.join(System.tmp_dir!(), "exgit_not_a_dir_#{System.unique_integer([:positive])}")
+      File.write!(base, "not a directory")
+      on_exit(fn -> File.rm(base) end)
+      dest = Path.join(base, "repo")
 
       t = Exgit.Transport.File.new(Path.join(System.tmp_dir!(), "nonexistent_source"))
 
