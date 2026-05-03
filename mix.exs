@@ -82,6 +82,20 @@ defmodule Exgit.MixProject do
       # Telemetry: BEAM-wide standard for instrumentation. Emits events
       # consumers can attach to. Zero cost when no handler is attached.
       {:telemetry, "~> 1.0"},
+      # Optional vfs integration: `Exgit.Workspace` ships a
+      # `VFS.Mountable` defimpl when `:vfs` is loaded. Pinned to a SHA
+      # because vfs has no hex release yet. `optional: true` means:
+      #   - downstream consumers don't have to install :vfs to use exgit
+      #   - if they DO add :vfs, Mix orders our build after vfs's so the
+      #     defimpl compiles in and protocol consolidation picks it up.
+      # We deliberately do NOT scope this to :dev/:test only — that would
+      # remove vfs from our dep graph in :prod, breaking compile-ordering
+      # guarantees in downstream consumer builds. Requires Elixir ~> 1.18;
+      # the 1.17 CI tier skips the integration via `Code.ensure_loaded?`.
+      {:vfs,
+       github: "ivarvong/vfs",
+       ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69",
+       optional: true},
       {:stream_data, "~> 1.0", only: [:test, :dev]},
       # Optional dev-only OpenTelemetry bridge: auto-converts :telemetry
       # events into OTel spans. Only loaded in dev/test; production users

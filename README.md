@@ -163,6 +163,59 @@ end
 # removed  old_file.ex
 ```
 
+### Working with the workspace (agent loop)
+
+`Exgit.Workspace` is a working tree on top of a ref. Reads pass
+through to the ref until a write happens; each write produces a new
+in-memory tree SHA, so every state of the workspace is a real git
+tree object — snapshots are 20-byte values, branching is free,
+commits are an O(1) hash-and-store.
+
+```elixir
+ws = Exgit.Workspace.open(repo, "main")
+
+{:ok, ws} = Exgit.Workspace.write(ws, "lib/foo.ex", new_source)
+{:ok, ws} = Exgit.Workspace.rm(ws, "lib/old.ex")
+
+{:ok, content, ws} = Exgit.Workspace.read(ws, "lib/foo.ex")
+{:ok, [{:modified, "lib/foo.ex"}, {:deleted, "lib/old.ex"}], ws} =
+  Exgit.Workspace.diff(ws)
+
+{:ok, commit_sha, ws} =
+  Exgit.Workspace.commit(ws,
+    message: "agent: refactor",
+    author: %{name: "agent", email: "agent@example.com"},
+    update_ref: "refs/heads/agent-turn-1")
+
+# Snapshot is an opaque value — persist it and replay later
+saved = Exgit.Workspace.snapshot(ws)
+ws = Exgit.Workspace.restore(ws, saved)
+```
+
+The struct is a plain value, so branching the agent's state for
+parallel exploration is just `ws_b = ws_a` — both diverge
+independently from there.
+
+### Mounting through `:vfs`
+
+If you depend on [`:vfs`](https://github.com/ivarvong/vfs), an
+`Exgit.Workspace` ships a `VFS.Mountable` defimpl so it composes
+with other backends (in-memory scratch, postgres, S3) under one
+mount table. Capabilities: `[:read, :write, :lazy]`.
+
+```elixir
+fs =
+  VFS.new()
+  |> VFS.mount("/repo", Exgit.Workspace.open(repo, "main"))
+  |> VFS.mount("/scratch", VFS.Memory.new())
+
+{:ok, content, fs} = VFS.read_file(fs, "/repo/lib/foo.ex")
+{:ok, fs} = VFS.write_file(fs, "/repo/lib/foo.ex", new_source)
+```
+
+`:vfs` is an optional dependency; `Exgit.Workspace` is fully
+usable without it.
+
 ## Performance
 
 Every hot path emits [`:telemetry`](https://hexdocs.pm/telemetry/)

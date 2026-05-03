@@ -1241,6 +1241,84 @@ defmodule Exgit.FS do
     {:ok, sha, %{repo | object_store: store}}
   end
 
+  @doc """
+  Remove the entry at `path` from the tree at `reference`. Returns
+  `{:ok, new_tree_sha, repo}` — the new tree omits the entry; existing
+  blob/tree objects are left untouched (git is content-addressed; orphan
+  objects are GC'd separately).
+
+  ## Options
+
+    * `:recursive` — when `true`, removing a directory also removes its
+      contents. Default `false`; removing a directory without
+      `:recursive` returns `{:error, :eisdir}`.
+
+  Errors:
+
+    * `{:error, :not_found}` — `path` does not exist in the tree
+    * `{:error, :eisdir}` — `path` is a directory and `:recursive` is
+      not set
+    * `{:error, :cannot_rm_root}` — `path` is empty or `"/"`
+
+  Mirrors `write_path/5`'s tree-rewrite shape so a workspace can chain
+  `rm_path` and `write_path` calls to assemble multi-file edits before
+  committing.
+  """
+  @spec rm_path(Repository.t(), ref(), path(), keyword()) ::
+          {:ok, binary(), Repository.t()} | {:error, term()}
+  def rm_path(%Repository{} = repo, reference, path, opts \\ []) do
+    recursive = Keyword.get(opts, :recursive, false)
+    segments = normalize_path(path)
+
+    if segments == [] do
+      {:error, :cannot_rm_root}
+    else
+      with {:ok, tree_sha, repo} <- resolve_tree(repo, reference) do
+        remove_entry_from_tree(repo, tree_sha, segments, recursive)
+      end
+    end
+  end
+
+  defp remove_entry_from_tree(repo, tree_sha, [name], recursive) do
+    with {:ok, %Tree{entries: entries}, repo} <- fetch_object(repo, tree_sha) do
+      case Enum.find(entries, fn {_, n, _} -> n == name end) do
+        nil ->
+          {:error, :not_found}
+
+        {"40000", _, _} when not recursive ->
+          {:error, :eisdir}
+
+        _ ->
+          new_entries = Enum.reject(entries, fn {_, n, _} -> n == name end)
+          new_tree = Tree.new(new_entries)
+          {:ok, sha, store} = ObjectStore.put(repo.object_store, new_tree)
+          {:ok, sha, %{repo | object_store: store}}
+      end
+    end
+  end
+
+  defp remove_entry_from_tree(repo, tree_sha, [dir | rest], recursive) do
+    with {:ok, %Tree{entries: entries}, repo} <- fetch_object(repo, tree_sha) do
+      case Enum.find(entries, fn {m, n, _} -> n == dir and m == "40000" end) do
+        nil ->
+          {:error, :not_found}
+
+        {_, _, child_sha} ->
+          case remove_entry_from_tree(repo, child_sha, rest, recursive) do
+            {:ok, new_child_sha, repo} ->
+              other_entries = Enum.reject(entries, fn {_, n, _} -> n == dir end)
+              new_entries = other_entries ++ [{"40000", dir, new_child_sha}]
+              new_tree = Tree.new(new_entries)
+              {:ok, sha, store} = ObjectStore.put(repo.object_store, new_tree)
+              {:ok, sha, %{repo | object_store: store}}
+
+            {:error, _} = err ->
+              err
+          end
+      end
+    end
+  end
+
   # ----------------------------------------------------------------------
   # Internal: object fetch that threads the repo for Promisor-backed stores
   # ----------------------------------------------------------------------
