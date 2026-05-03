@@ -93,9 +93,7 @@ defmodule Exgit.MixProject do
       # guarantees in downstream consumer builds. Requires Elixir ~> 1.18;
       # the 1.17 CI tier skips the integration via `Code.ensure_loaded?`.
       {:vfs,
-       github: "ivarvong/vfs",
-       ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69",
-       optional: true},
+       github: "ivarvong/vfs", ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69", optional: true},
       {:stream_data, "~> 1.0", only: [:test, :dev]},
       # Optional dev-only OpenTelemetry bridge: auto-converts :telemetry
       # events into OTel spans. Only loaded in dev/test; production users
