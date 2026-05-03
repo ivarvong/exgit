@@ -1319,6 +1319,206 @@ defmodule Exgit.FS do
     end
   end
 
+  @doc """
+  Three-way path-level merge of two trees against a common base.
+
+  Returns `{:ok, merged_tree_sha, conflicts, repo}`:
+
+    * Non-conflicting changes from `ours` and `theirs` are both applied
+      to `base` to produce `merged_tree_sha`.
+    * `conflicts` is the list of paths where both sides modified the
+      same file in incompatible ways.
+
+  ## Conflict types
+
+    * `{:both_modified, path}` — both sides changed an existing file's
+      content (or mode) to different values.
+    * `{:both_added, path}` — both sides added a path that didn't exist
+      in `base`, with different blob SHAs.
+    * `{:modify_delete, path}` — one side modified, the other deleted.
+
+  Mode-only changes, type changes (blob ↔ tree), and submodule changes
+  are treated as modifications for conflict purposes in v1.
+
+  ## Strategies (`:strategy` opt)
+
+    * `:abort` (default) — if any conflict, return `merged_tree_sha == base`
+      (no changes applied) along with the conflict list. Callers can
+      treat this as "abort the merge."
+    * `:ours` — resolve every conflict by keeping `ours`'s version.
+    * `:theirs` — resolve every conflict by keeping `theirs`'s version.
+
+  Path-level only — does NOT do text-level conflict resolution. For
+  agent loops this is the right shape: agents rewrite files, they
+  don't patch hunks; structured `:both_modified` lets the agent
+  re-read both versions and write a fresh resolution.
+  """
+  @spec merge_trees(Repository.t(), binary(), binary(), binary(), keyword()) ::
+          {:ok, binary(), [merge_conflict()], Repository.t()} | {:error, term()}
+  def merge_trees(%Repository{} = repo, base_sha, ours_sha, theirs_sha, opts \\ []) do
+    strategy = Keyword.get(opts, :strategy, :abort)
+
+    with {:ok, ours_changes} <- Exgit.Diff.trees(repo, base_sha, ours_sha),
+         {:ok, theirs_changes} <- Exgit.Diff.trees(repo, base_sha, theirs_sha) do
+      ours_by_path = Map.new(ours_changes, fn c -> {c.path, c} end)
+      theirs_by_path = Map.new(theirs_changes, fn c -> {c.path, c} end)
+
+      paths =
+        ours_by_path
+        |> Map.keys()
+        |> Kernel.++(Map.keys(theirs_by_path))
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      {clean_ops, conflicts} = classify_merge_paths(paths, ours_by_path, theirs_by_path)
+
+      case apply_strategy(strategy, clean_ops, conflicts, ours_by_path, theirs_by_path) do
+        {:apply, ops} ->
+          case apply_merge_ops(repo, base_sha, ops) do
+            {:ok, merged, repo} -> {:ok, merged, conflicts, repo}
+            {:error, _} = err -> err
+          end
+
+        :abort ->
+          {:ok, base_sha, conflicts, repo}
+      end
+    end
+  end
+
+  @typedoc """
+  A merge conflict reported by `merge_trees/5`. `path` is the file
+  path within the merged tree.
+  """
+  @type merge_conflict ::
+          {:both_modified, String.t()}
+          | {:both_added, String.t()}
+          | {:modify_delete, String.t()}
+
+  defp classify_merge_paths(paths, ours, theirs) do
+    Enum.reduce(paths, {[], []}, fn path, {ops, conflicts} ->
+      o = Map.get(ours, path)
+      t = Map.get(theirs, path)
+
+      case classify_pair(path, o, t) do
+        :no_op -> {ops, conflicts}
+        {:op, op} -> {[op | ops], conflicts}
+        {:conflict, c} -> {ops, [c | conflicts]}
+      end
+    end)
+    |> then(fn {ops, conflicts} -> {Enum.reverse(ops), Enum.reverse(conflicts)} end)
+  end
+
+  # Side-only changes (other side untouched): apply.
+  defp classify_pair(path, %{op: :added, new_mode: m, new_sha: s}, nil),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, nil, %{op: :added, new_mode: m, new_sha: s}),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, %{op: :modified, new_mode: m, new_sha: s}, nil),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, nil, %{op: :modified, new_mode: m, new_sha: s}),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, %{op: :removed}, nil),
+    do: {:op, {:rm, path}}
+
+  defp classify_pair(path, nil, %{op: :removed}),
+    do: {:op, {:rm, path}}
+
+  # Both-side changes.
+  defp classify_pair(
+         path,
+         %{op: o_op, new_sha: o_sha, new_mode: o_mode},
+         %{op: t_op, new_sha: t_sha, new_mode: t_mode}
+       )
+       when o_op in [:added, :modified] and t_op in [:added, :modified] do
+    cond do
+      # Same content + same mode: both sides agree → apply once.
+      o_sha == t_sha and o_mode == t_mode -> {:op, {:put, path, o_mode, o_sha}}
+      o_op == :added and t_op == :added -> {:conflict, {:both_added, path}}
+      true -> {:conflict, {:both_modified, path}}
+    end
+  end
+
+  # Both deleted: not a no-op against base — base still has the entry.
+  # Apply the rm.
+  defp classify_pair(path, %{op: :removed}, %{op: :removed}), do: {:op, {:rm, path}}
+
+  defp classify_pair(path, %{op: :removed}, %{op: t_op})
+       when t_op in [:added, :modified, :mode_changed, :type_changed, :submodule_change],
+       do: {:conflict, {:modify_delete, path}}
+
+  defp classify_pair(path, %{op: o_op}, %{op: :removed})
+       when o_op in [:added, :modified, :mode_changed, :type_changed, :submodule_change],
+       do: {:conflict, {:modify_delete, path}}
+
+  # Mode/type/submodule changes lump in with :modified semantics.
+  defp classify_pair(path, %{new_mode: m, new_sha: s}, nil),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, nil, %{new_mode: m, new_sha: s}),
+    do: {:op, {:put, path, m, s}}
+
+  defp classify_pair(path, %{new_sha: o_sha}, %{new_sha: t_sha}) do
+    if o_sha == t_sha,
+      do: :no_op,
+      else: {:conflict, {:both_modified, path}}
+  end
+
+  defp apply_strategy(:abort, _ops, [_ | _], _, _), do: :abort
+
+  defp apply_strategy(:abort, ops, [], _, _), do: {:apply, ops}
+
+  defp apply_strategy(:ours, ops, conflicts, ours_by_path, _theirs_by_path) do
+    {:apply, ops ++ Enum.map(conflicts, &resolve_with(&1, ours_by_path))}
+  end
+
+  defp apply_strategy(:theirs, ops, conflicts, _ours_by_path, theirs_by_path) do
+    {:apply, ops ++ Enum.map(conflicts, &resolve_with(&1, theirs_by_path))}
+  end
+
+  defp resolve_with({_kind, path}, by_path) do
+    case Map.fetch!(by_path, path) do
+      %{op: :removed} -> {:rm, path}
+      %{new_mode: m, new_sha: s} -> {:put, path, m, s}
+    end
+  end
+
+  defp apply_merge_ops(repo, tree_sha, ops) do
+    Enum.reduce_while(ops, {:ok, tree_sha, repo}, fn
+      {:put, path, mode, blob_sha}, {:ok, tree, repo} ->
+        case write_blob_into_tree_at_path(repo, tree, path, mode, blob_sha) do
+          {:ok, new_tree, repo} -> {:cont, {:ok, new_tree, repo}}
+          {:error, _} = err -> {:halt, err}
+        end
+
+      {:rm, path}, {:ok, tree, repo} ->
+        case rm_path(repo, tree, path, recursive: true) do
+          {:ok, new_tree, repo} -> {:cont, {:ok, new_tree, repo}}
+          # If a remove targets a path that already isn't in the merged
+          # tree (e.g. base→ours diff said removed, base→theirs diff
+          # also said removed → we already classified that as :no_op
+          # so this shouldn't fire, but defensive), it's a no-op.
+          {:error, :not_found} -> {:cont, {:ok, tree, repo}}
+          {:error, _} = err -> {:halt, err}
+        end
+    end)
+  end
+
+  # Internal helper used by merge_trees. Inserts an existing blob_sha
+  # into a tree at a given path with a given mode, without round-
+  # tripping through `Blob.new` + `ObjectStore.put` (the blob is
+  # already in the store; we only need to rewrite the parent trees).
+  # Reuses the same `insert_blob_into_tree` recursion as `write_path/5`.
+  defp write_blob_into_tree_at_path(repo, tree_sha, path, mode, blob_sha) do
+    case normalize_path(path) do
+      [] -> {:error, :cannot_write_root}
+      segments -> insert_blob_into_tree(repo, tree_sha, segments, mode, blob_sha)
+    end
+  end
+
   # ----------------------------------------------------------------------
   # Internal: object fetch that threads the repo for Promisor-backed stores
   # ----------------------------------------------------------------------

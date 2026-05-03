@@ -238,6 +238,248 @@ defmodule Exgit.Workspace do
   end
 
   # ──────────────────────────────────────────────────────────────────
+  # Move / revert
+  # ──────────────────────────────────────────────────────────────────
+
+  @doc """
+  Move (rename) `from` to `to`. Preserves the file mode.
+
+  Refuses to move directories in v1 — `from` must be a file. Refuses
+  to overwrite an existing directory at `to`.
+  """
+  @spec move(t(), String.t(), String.t()) :: {:ok, t()} | {:error, term()}
+  def move(%__MODULE__{} = ws, from, to) when is_binary(from) and is_binary(to) do
+    case FS.read_path(ws.repo, effective_ref(ws), from) do
+      {:ok, {mode, %Blob{data: data}}, repo} ->
+        ws = %{ws | repo: repo}
+
+        with :ok <- guard_not_directory(ws, to),
+             {:ok, ws} <- do_write(ws, to, data, mode: mode) do
+          rm(ws, from)
+        end
+
+      {:error, :not_a_blob} ->
+        {:error, :cannot_move_directory}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc """
+  Revert edits to `path` — restore it to its content in `base_ref`.
+
+  Three cases:
+
+    * Path exists in base and head differs → write base's content back.
+    * Path doesn't exist in base, exists in head (agent added it) → rm
+      from head.
+    * Path doesn't exist in either → no-op.
+
+  A pristine workspace is a no-op (nothing to revert).
+  """
+  @spec revert(t(), String.t()) :: {:ok, t()} | {:error, term()}
+  def revert(%__MODULE__{head_tree: nil} = ws, _path), do: {:ok, ws}
+
+  def revert(%__MODULE__{} = ws, path) do
+    case FS.read_path(ws.repo, ws.base_ref, path) do
+      {:ok, {mode, %Blob{data: data}}, repo} ->
+        ws = %{ws | repo: repo}
+        do_write(ws, path, data, mode: mode)
+
+      {:error, :not_found} ->
+        case FS.rm_path(ws.repo, effective_ref(ws), path) do
+          {:ok, new_tree, repo} ->
+            {:ok, %{ws | repo: repo, head_tree: new_tree}}
+
+          {:error, :not_found} ->
+            {:ok, ws}
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp do_write(%__MODULE__{} = ws, path, content, opts) do
+    case FS.write_path(ws.repo, effective_ref(ws), path, content, opts) do
+      {:ok, new_tree, repo} -> {:ok, %{ws | repo: repo, head_tree: new_tree}}
+      {:error, _} = err -> err
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
+  # Merge
+  # ──────────────────────────────────────────────────────────────────
+
+  @typedoc """
+  A conflict reported by `merge/3`.
+  """
+  @type merge_conflict :: FS.merge_conflict()
+
+  @doc """
+  Merge another tree-shaped state into this workspace.
+
+  `source` accepts:
+
+    * `:pristine` — no-op (source has no changes).
+    * another `%Exgit.Workspace{}` — typical agent-loop pattern.
+      Objects reachable from the source's working tree are imported
+      into this workspace's repo before merging, so two workspaces
+      forked from a common ancestor can re-converge even though
+      each has accumulated its own object-store state.
+    * a 20-byte tree or commit SHA — assumed to be resolvable in
+      this workspace's repo (no auto-import).
+    * a ref name like `"refs/heads/feature"` — resolves to its tree
+      in this workspace's repo.
+
+  The merge is **path-level, three-way**: the merge base is the
+  workspace's `base_ref`'s tree by default. Override with the
+  `:base` option (snapshot/ref/sha; must be resolvable in this
+  workspace's repo).
+
+  Strategies (`:strategy` opt):
+
+    * `:abort` (default) — if any conflict, return
+      `{:conflict, conflicts, ws}` with the workspace's `head_tree`
+      unchanged. Repo cache may have grown from diff resolution and
+      object import; that growth threads back. Agents can re-read
+      both versions and decide.
+    * `:ours` / `:theirs` — auto-resolve conflicts with the named
+      side; return `{:ok, ws}` plus the conflict list reported but
+      already resolved.
+
+  Non-conflicting changes from `source` apply only when there are
+  no conflicts at all under `:abort` (atomic).
+  """
+  @spec merge(t(), :pristine | t() | String.t() | binary(), keyword()) ::
+          {:ok, t()}
+          | {:conflict, [merge_conflict()], t()}
+          | {:error, term()}
+  def merge(ws, source, opts \\ [])
+
+  def merge(%__MODULE__{} = ws, :pristine, _opts), do: {:ok, ws}
+
+  def merge(%__MODULE__{} = target, %__MODULE__{} = source, opts) do
+    source_tree = source.head_tree || nil
+
+    case source_tree do
+      nil ->
+        # source is pristine — its working tree IS its base_ref.
+        # Resolve in the source's repo, then proceed.
+        with {:ok, src_tree, _} <- resolve_ref_to_tree(source.repo, source.base_ref),
+             {:ok, target} <- import_objects_from(target, source, src_tree) do
+          do_merge(target, src_tree, opts)
+        end
+
+      tree_sha ->
+        with {:ok, target} <- import_objects_from(target, source, tree_sha) do
+          do_merge(target, tree_sha, opts)
+        end
+    end
+  end
+
+  def merge(%__MODULE__{} = ws, source, opts) when is_binary(source) do
+    case resolve_to_tree(ws.repo, source) do
+      {:ok, source_tree, repo} -> do_merge(%{ws | repo: repo}, source_tree, opts)
+      {:error, _} = err -> err
+    end
+  end
+
+  defp do_merge(%__MODULE__{} = ws, source_tree, opts) do
+    strategy = Keyword.get(opts, :strategy, :abort)
+
+    with {:ok, base_tree, repo} <- resolve_merge_base(ws.repo, ws, opts),
+         ours_tree = ws.head_tree || base_tree,
+         {:ok, merged, conflicts, repo} <-
+           FS.merge_trees(repo, base_tree, ours_tree, source_tree, strategy: strategy) do
+      ws = %{ws | repo: repo}
+
+      cond do
+        conflicts == [] ->
+          {:ok, advance_head(ws, merged, base_tree)}
+
+        strategy == :abort ->
+          {:conflict, conflicts, ws}
+
+        true ->
+          {:ok, advance_head(ws, merged, base_tree)}
+      end
+    end
+  end
+
+  # Copy every object reachable from `source_tree` from `source.repo`
+  # into `target.repo`. For Memory stores this is cheap; for Promisor
+  # stores it walks through the resident cache (any non-resident
+  # objects must already be fetched on the source side, or the merge
+  # will fail when fetching them through the target's transport).
+  defp import_objects_from(target, source, source_tree) do
+    case copy_object(target.repo, source.repo, source_tree) do
+      {:ok, repo} -> {:ok, %{target | repo: repo}}
+      {:error, _} = err -> err
+    end
+  end
+
+  defp copy_object(target_repo, source_repo, sha) do
+    if ObjectStore.has?(target_repo.object_store, sha) do
+      {:ok, target_repo}
+    else
+      case ObjectStore.get(source_repo.object_store, sha) do
+        {:ok, %Exgit.Object.Tree{entries: entries} = tree} ->
+          {:ok, _new_sha, store} = ObjectStore.put(target_repo.object_store, tree)
+          target_repo = %{target_repo | object_store: store}
+
+          # Recurse into entries: blobs and subtrees both need copying.
+          Enum.reduce_while(entries, {:ok, target_repo}, fn {_mode, _name, entry_sha},
+                                                            {:ok, repo} ->
+            case copy_object(repo, source_repo, entry_sha) do
+              {:ok, repo} -> {:cont, {:ok, repo}}
+              {:error, _} = err -> {:halt, err}
+            end
+          end)
+
+        {:ok, %Exgit.Object.Blob{} = blob} ->
+          {:ok, _new_sha, store} = ObjectStore.put(target_repo.object_store, blob)
+          {:ok, %{target_repo | object_store: store}}
+
+        {:ok, other} ->
+          # Commits / tags from a working-tree merge shouldn't surface,
+          # but if they do, copy through.
+          {:ok, _new_sha, store} = ObjectStore.put(target_repo.object_store, other)
+          {:ok, %{target_repo | object_store: store}}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+  end
+
+  defp advance_head(ws, merged_tree, base_tree) do
+    if merged_tree == base_tree,
+      do: %{ws | head_tree: nil},
+      else: %{ws | head_tree: merged_tree}
+  end
+
+  defp resolve_merge_base(repo, ws, opts) do
+    case Keyword.fetch(opts, :base) do
+      {:ok, :pristine} -> resolve_ref_to_tree(repo, ws.base_ref)
+      {:ok, b} when is_binary(b) -> resolve_to_tree(repo, b)
+      :error -> resolve_ref_to_tree(repo, ws.base_ref)
+    end
+  end
+
+  defp resolve_to_tree(repo, ref_or_sha) when is_binary(ref_or_sha) do
+    if byte_size(ref_or_sha) == 20 do
+      resolve_sha_to_tree(repo, ref_or_sha)
+    else
+      resolve_ref_to_tree(repo, ref_or_sha)
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────────
   # Diff
   # ──────────────────────────────────────────────────────────────────
 
@@ -245,17 +487,100 @@ defmodule Exgit.Workspace do
   Compare the workspace's working state against `base_ref`, returning
   a list of `{:added | :modified | :deleted, path}` entries.
 
-  A pristine workspace returns `{:ok, [], ws}` immediately.
+  A pristine workspace returns `{:ok, [], ws}` immediately. For richer
+  output (content of changed paths) or comparison against a different
+  target, use `diff/2`.
   """
   @spec diff(t()) :: {:ok, [change()], t()} | {:error, term()}
-  def diff(%__MODULE__{head_tree: nil} = ws), do: {:ok, [], ws}
+  def diff(%__MODULE__{} = ws), do: diff(ws, [])
 
-  def diff(%__MODULE__{} = ws) do
-    with {:ok, base_tree, repo} <- resolve_ref_to_tree(ws.repo, ws.base_ref),
-         {:ok, changes} <- Diff.trees(repo, base_tree, ws.head_tree) do
-      {:ok, simplify_changes(changes), %{ws | repo: repo}}
+  @doc """
+  Like `diff/1`, with options:
+
+    * `:against` — compare against this state instead of `base_ref`.
+      Accepts `:pristine` (alias for `base_ref`), a 20-byte tree/commit
+      SHA, or a ref name. Useful for `Workspace.diff(ws, against:
+      saved_snapshot)` to see what's changed since a checkpoint.
+
+    * `:content` (default `false`) — when `true`, return rich entries
+      `%{op:, path:, before:, after:}` where `:before` and `:after`
+      are the blob bytes (`nil` for added/deleted respectively, and
+      `nil` for non-blob operands like type changes).
+  """
+  @spec diff(t(), keyword()) ::
+          {:ok, [change()] | [content_change()], t()} | {:error, term()}
+  def diff(%__MODULE__{head_tree: nil} = ws, opts) do
+    if Keyword.has_key?(opts, :against),
+      do: do_diff(ws, opts),
+      else: {:ok, [], ws}
+  end
+
+  def diff(%__MODULE__{} = ws, opts), do: do_diff(ws, opts)
+
+  defp do_diff(%__MODULE__{} = ws, opts) do
+    against = Keyword.get(opts, :against, :base_ref)
+    content? = Keyword.get(opts, :content, false)
+
+    with {:ok, against_tree, repo} <- resolve_diff_target(ws.repo, against, ws.base_ref),
+         {:ok, current_tree, repo} <- resolve_current_tree(repo, ws),
+         {:ok, changes} <- Diff.trees(repo, against_tree, current_tree) do
+      ws = %{ws | repo: repo}
+
+      if content?,
+        do: enrich_with_content(changes, ws),
+        else: {:ok, simplify_changes(changes), ws}
     end
   end
+
+  defp resolve_diff_target(repo, :base_ref, base_ref), do: resolve_ref_to_tree(repo, base_ref)
+  defp resolve_diff_target(repo, :pristine, base_ref), do: resolve_ref_to_tree(repo, base_ref)
+
+  defp resolve_diff_target(repo, target, _base_ref) when is_binary(target),
+    do: resolve_to_tree(repo, target)
+
+  defp resolve_current_tree(repo, %__MODULE__{head_tree: nil, base_ref: ref}),
+    do: resolve_ref_to_tree(repo, ref)
+
+  defp resolve_current_tree(repo, %__MODULE__{head_tree: tree}), do: {:ok, tree, repo}
+
+  defp enrich_with_content(changes, ws) do
+    enriched = Enum.map(changes, &enrich_change(&1, ws))
+    {:ok, enriched, ws}
+  end
+
+  defp enrich_change(%{op: op, path: path} = c, ws) when op in [:added, :removed, :modified] do
+    {before_sha, after_sha} =
+      case op do
+        :added -> {nil, c.new_sha}
+        :removed -> {c.old_sha, nil}
+        :modified -> {c.old_sha, c.new_sha}
+      end
+
+    %{
+      op: simplify_op(op),
+      path: path,
+      before: fetch_blob_bytes(ws, before_sha),
+      after: fetch_blob_bytes(ws, after_sha)
+    }
+  end
+
+  # Mode/type/submodule changes — content semantics ambiguous.
+  # Surface as :modified with nil content.
+  defp enrich_change(%{path: path}, _ws),
+    do: %{op: :modified, path: path, before: nil, after: nil}
+
+  defp fetch_blob_bytes(_ws, nil), do: nil
+
+  defp fetch_blob_bytes(ws, sha) when is_binary(sha) do
+    case ObjectStore.get(ws.repo.object_store, sha) do
+      {:ok, %Blob{data: data}} -> data
+      # Non-blob (tree/etc) — content not meaningful at file level.
+      _ -> nil
+    end
+  end
+
+  defp simplify_op(:removed), do: :deleted
+  defp simplify_op(other), do: other
 
   defp simplify_changes(changes) do
     Enum.map(changes, fn
@@ -266,6 +591,44 @@ defmodule Exgit.Workspace do
       %{op: :type_changed, path: p} -> {:modified, p}
       %{op: :submodule_change, path: p} -> {:modified, p}
     end)
+  end
+
+  @typedoc """
+  Rich change entry returned by `diff/2` with `content: true`.
+  `:before` is `nil` for added paths; `:after` is `nil` for deleted
+  paths; both are `nil` for non-blob operations.
+  """
+  @type content_change :: %{
+          op: :added | :modified | :deleted,
+          path: String.t(),
+          before: binary() | nil,
+          after: binary() | nil
+        }
+
+  # ──────────────────────────────────────────────────────────────────
+  # Walk convenience
+  # ──────────────────────────────────────────────────────────────────
+
+  @doc """
+  Materialize the workspace and return a walk stream in one call.
+
+  `Workspace.walk/1` requires the underlying repo to be `:eager` —
+  on a lazy partial-clone repo it raises. This helper materializes
+  first (one network round-trip prefetching reachable trees and
+  blobs) and then returns the walk stream, threading the
+  materialized workspace back so cache growth is captured.
+
+      {:ok, stream, ws} = Exgit.Workspace.materialized_walk(ws)
+      stream |> Stream.take(10) |> Enum.to_list()
+
+  Idempotent on already-eager repos.
+  """
+  @spec materialized_walk(t()) :: {:ok, Enumerable.t(), t()} | {:error, term()}
+  def materialized_walk(%__MODULE__{} = ws) do
+    case materialize(ws) do
+      {:ok, ws} -> {:ok, walk(ws), ws}
+      {:error, _} = err -> err
+    end
   end
 
   # ──────────────────────────────────────────────────────────────────

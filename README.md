@@ -175,26 +175,62 @@ commits are an O(1) hash-and-store.
 ws = Exgit.Workspace.open(repo, "main")
 
 {:ok, ws} = Exgit.Workspace.write(ws, "lib/foo.ex", new_source)
-{:ok, ws} = Exgit.Workspace.rm(ws, "lib/old.ex")
+{:ok, ws} = Exgit.Workspace.move(ws, "lib/old.ex", "lib/legacy.ex")
+{:ok, ws} = Exgit.Workspace.rm(ws, "lib/dead.ex")
 
 {:ok, content, ws} = Exgit.Workspace.read(ws, "lib/foo.ex")
-{:ok, [{:modified, "lib/foo.ex"}, {:deleted, "lib/old.ex"}], ws} =
-  Exgit.Workspace.diff(ws)
+
+# Diff: paths only (default) or rich entries with content
+{:ok, [{:modified, "lib/foo.ex"}, ...], ws} = Exgit.Workspace.diff(ws)
+{:ok, [%{op: :modified, path: "lib/foo.ex", before: <<...>>, after: <<...>>}], ws}
+  = Exgit.Workspace.diff(ws, content: true)
+
+# Diff against a saved checkpoint, not just base_ref
+checkpoint = Exgit.Workspace.snapshot(ws)
+{:ok, ws} = Exgit.Workspace.write(ws, "lib/foo.ex", another_revision)
+{:ok, [{:modified, "lib/foo.ex"}], ws} =
+  Exgit.Workspace.diff(ws, against: checkpoint)
+
+# Undo edits to a single file (revert to base content)
+{:ok, ws} = Exgit.Workspace.revert(ws, "lib/foo.ex")
 
 {:ok, commit_sha, ws} =
   Exgit.Workspace.commit(ws,
     message: "agent: refactor",
     author: %{name: "agent", email: "agent@example.com"},
     update_ref: "refs/heads/agent-turn-1")
-
-# Snapshot is an opaque value — persist it and replay later
-saved = Exgit.Workspace.snapshot(ws)
-ws = Exgit.Workspace.restore(ws, saved)
 ```
 
 The struct is a plain value, so branching the agent's state for
 parallel exploration is just `ws_b = ws_a` — both diverge
-independently from there.
+independently from there. Reconverging is `merge/3`:
+
+```elixir
+ws_a = ws
+ws_b = ws
+
+{:ok, ws_a} = Exgit.Workspace.write(ws_a, "lib/foo.ex", "approach a")
+{:ok, ws_b} = Exgit.Workspace.write(ws_b, "lib/bar.ex", "approach b")
+
+# Path-level three-way merge. Non-overlapping changes apply cleanly.
+case Exgit.Workspace.merge(ws_a, ws_b) do
+  {:ok, ws_merged} ->
+    Exgit.Workspace.commit(ws_merged, message: "combined", author: ...)
+
+  {:conflict, conflicts, ^ws_a} ->
+    # Both wrote the same path differently. Re-read both versions
+    # and write a fresh resolution — OR pass strategy: :ours / :theirs.
+    handle(conflicts)
+end
+```
+
+For lazy partial-clone repos, walking the working tree needs
+`materialize` first; `materialized_walk/1` does both in one call.
+
+```elixir
+{:ok, stream, ws} = Exgit.Workspace.materialized_walk(ws)
+stream |> Stream.take(10) |> Enum.to_list()
+```
 
 ### Mounting through `:vfs`
 
