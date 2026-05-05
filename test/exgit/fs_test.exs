@@ -1035,4 +1035,138 @@ defmodule Exgit.FsTest do
       assert blob.data == "new\n"
     end
   end
+
+  describe "merge_trees/5" do
+    # Build a base, an "ours" with non-overlapping changes, and a
+    # "theirs" with non-overlapping changes — should merge cleanly.
+    setup %{repo: repo, shas: shas} do
+      {:ok, base_tree, _} = FS.read_path(repo, "HEAD", "README.md")
+      _ = base_tree
+
+      # ours: modifies src/a.ex
+      {:ok, ours, repo} = FS.write_path(repo, "HEAD", "src/a.ex", "ours version\n")
+
+      # theirs: modifies src/b.ex
+      {:ok, theirs, repo} = FS.write_path(repo, "HEAD", "src/b.ex", "theirs version\n")
+
+      {:ok, repo: repo, base: shas.root, ours: ours, theirs: theirs}
+    end
+
+    test "non-overlapping changes merge cleanly", ctx do
+      assert {:ok, merged, [], repo} =
+               FS.merge_trees(ctx.repo, ctx.base, ctx.ours, ctx.theirs)
+
+      # Both sides' changes apply
+      assert {:ok, {_, a}, _} = FS.read_path(repo, merged, "src/a.ex")
+      assert a.data == "ours version\n"
+      assert {:ok, {_, b}, _} = FS.read_path(repo, merged, "src/b.ex")
+      assert b.data == "theirs version\n"
+
+      # Untouched files preserved
+      assert {:ok, {_, r}, _} = FS.read_path(repo, merged, "README.md")
+      assert r.data == "hello\n"
+    end
+
+    test "both sides modify same path → :both_modified conflict", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.write_path(repo, base, "README.md", "ours\n")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "README.md", "theirs\n")
+
+      assert {:ok, ^base, [{:both_modified, "README.md"}], _repo} =
+               FS.merge_trees(repo, base, ours, theirs)
+    end
+
+    test "both sides add same path with different content → :both_added", %{
+      repo: repo,
+      base: base
+    } do
+      {:ok, ours, repo} = FS.write_path(repo, base, "NEW.md", "ours")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "NEW.md", "theirs")
+
+      assert {:ok, ^base, [{:both_added, "NEW.md"}], _} =
+               FS.merge_trees(repo, base, ours, theirs)
+    end
+
+    test "both sides add same path with same content → no conflict", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.write_path(repo, base, "SAME.md", "identical")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "SAME.md", "identical")
+
+      assert {:ok, merged, [], repo} = FS.merge_trees(repo, base, ours, theirs)
+      assert {:ok, {_, blob}, _} = FS.read_path(repo, merged, "SAME.md")
+      assert blob.data == "identical"
+    end
+
+    test "modify on one side, delete on the other → :modify_delete", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.write_path(repo, base, "README.md", "edited")
+      {:ok, theirs, repo} = FS.rm_path(repo, base, "README.md")
+
+      assert {:ok, ^base, [{:modify_delete, "README.md"}], _} =
+               FS.merge_trees(repo, base, ours, theirs)
+    end
+
+    test "both sides delete same path → no conflict", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.rm_path(repo, base, "README.md")
+      {:ok, theirs, repo} = FS.rm_path(repo, base, "README.md")
+
+      assert {:ok, merged, [], repo} = FS.merge_trees(repo, base, ours, theirs)
+      assert {:error, :not_found} = FS.read_path(repo, merged, "README.md")
+    end
+
+    test ":abort returns base unchanged on conflict, but conflicts listed", %{
+      repo: repo,
+      base: base
+    } do
+      {:ok, ours, repo} = FS.write_path(repo, base, "README.md", "ours")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "README.md", "theirs")
+
+      assert {:ok, ^base, conflicts, _} =
+               FS.merge_trees(repo, base, ours, theirs, strategy: :abort)
+
+      assert conflicts == [{:both_modified, "README.md"}]
+    end
+
+    test ":ours strategy resolves conflicts to ours's version", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.write_path(repo, base, "README.md", "ours")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "README.md", "theirs")
+
+      assert {:ok, merged, [{:both_modified, "README.md"}], repo} =
+               FS.merge_trees(repo, base, ours, theirs, strategy: :ours)
+
+      assert {:ok, {_, blob}, _} = FS.read_path(repo, merged, "README.md")
+      assert blob.data == "ours"
+    end
+
+    test ":theirs strategy resolves conflicts to theirs's version", %{repo: repo, base: base} do
+      {:ok, ours, repo} = FS.write_path(repo, base, "README.md", "ours")
+      {:ok, theirs, repo} = FS.write_path(repo, base, "README.md", "theirs")
+
+      assert {:ok, merged, [{:both_modified, "README.md"}], repo} =
+               FS.merge_trees(repo, base, ours, theirs, strategy: :theirs)
+
+      assert {:ok, {_, blob}, _} = FS.read_path(repo, merged, "README.md")
+      assert blob.data == "theirs"
+    end
+
+    test "mixed clean changes and conflicts: :ours resolves overlap, applies non-overlap", %{
+      repo: repo,
+      base: base
+    } do
+      {:ok, ours, repo} = FS.write_path(repo, base, "src/a.ex", "ours-a")
+      {:ok, ours, repo} = FS.write_path(repo, ours, "README.md", "ours-readme")
+
+      {:ok, theirs, repo} = FS.write_path(repo, base, "src/b.ex", "theirs-b")
+      {:ok, theirs, repo} = FS.write_path(repo, theirs, "README.md", "theirs-readme")
+
+      assert {:ok, merged, [{:both_modified, "README.md"}], repo} =
+               FS.merge_trees(repo, base, ours, theirs, strategy: :ours)
+
+      assert {:ok, {_, a}, _} = FS.read_path(repo, merged, "src/a.ex")
+      assert a.data == "ours-a"
+
+      assert {:ok, {_, b}, _} = FS.read_path(repo, merged, "src/b.ex")
+      assert b.data == "theirs-b"
+
+      assert {:ok, {_, r}, _} = FS.read_path(repo, merged, "README.md")
+      assert r.data == "ours-readme"
+    end
+  end
 end
