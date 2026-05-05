@@ -67,6 +67,14 @@ defmodule Exgit.MixProject do
   end
 
   def application do
+    # Do NOT add :vfs (or any other optional integration) here. vfs is a
+    # compile-time-optional integration: we use its protocol module via
+    # `defimpl VFS.Mountable, for: Exgit.Workspace` when it is present,
+    # but exgit must NOT declare :vfs as a runtime application — vfs
+    # itself depends on exgit (in dev/test), and listing it here would
+    # deadlock `:application_controller` at boot for any consumer that
+    # bundles both libs. The corresponding `runtime: false` flag on the
+    # :vfs entry in `deps/0` is what keeps Mix from auto-injecting it.
     [
       extra_applications: [:logger, :crypto],
       mod: {Exgit.Application, []}
@@ -84,16 +92,37 @@ defmodule Exgit.MixProject do
       {:telemetry, "~> 1.0"},
       # Optional vfs integration: `Exgit.Workspace` ships a
       # `VFS.Mountable` defimpl when `:vfs` is loaded. Pinned to a SHA
-      # because vfs has no hex release yet. `optional: true` means:
-      #   - downstream consumers don't have to install :vfs to use exgit
-      #   - if they DO add :vfs, Mix orders our build after vfs's so the
-      #     defimpl compiles in and protocol consolidation picks it up.
+      # because vfs has no hex release yet.
+      #
+      # `optional: true` means downstream consumers don't have to install
+      # :vfs to use exgit; if they DO add :vfs, Mix orders our build after
+      # vfs's so the defimpl compiles in and protocol consolidation picks
+      # it up.
+      #
+      # `runtime: false` is load-bearing. Without it, Mix auto-includes
+      # :vfs in exgit's generated `applications` list (optional deps are
+      # still added as application edges; `optional_applications` only
+      # tells `:application_controller` it's OK if the app is absent — it
+      # does NOT break the dependency edge when present). vfs in turn
+      # depends on exgit (for its own integration tests), so any build
+      # that bundles both — e.g. an agent app pulling in both libs —
+      # creates a cycle in `:application_controller` that deadlocks at
+      # boot. We use vfs's protocol module at COMPILE time (to define
+      # `defimpl VFS.Mountable, for: Exgit.Workspace`); there is no vfs
+      # supervision tree we depend on at runtime, so `runtime: false` is
+      # not a workaround — it's an accurate description of the
+      # relationship. Same shape as Phoenix and its optional templating
+      # adapters.
+      #
       # We deliberately do NOT scope this to :dev/:test only — that would
       # remove vfs from our dep graph in :prod, breaking compile-ordering
       # guarantees in downstream consumer builds. Requires Elixir ~> 1.18;
       # the 1.17 CI tier skips the integration via `Code.ensure_loaded?`.
       {:vfs,
-       github: "ivarvong/vfs", ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69", optional: true},
+       github: "ivarvong/vfs",
+       ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69",
+       optional: true,
+       runtime: false},
       {:stream_data, "~> 1.0", only: [:test, :dev]},
       # Optional dev-only OpenTelemetry bridge: auto-converts :telemetry
       # events into OTel spans. Only loaded in dev/test; production users
@@ -112,6 +141,16 @@ defmodule Exgit.MixProject do
     [
       plt_core_path: "priv/plts/core",
       plt_local_path: "priv/plts/project",
+      # `:vfs` is `runtime: false` in deps/0 so it stays out of our
+      # generated `applications` list (see comment on the :vfs dep for
+      # why). Side effect: Dialyxir's default PLT closure follows
+      # `applications`, so without this hint vfs's beams are absent
+      # from the PLT and `lib/exgit/workspace/vfs.ex` lights up with
+      # spurious `unknown_function` warnings for `VFS.Error.new/2`,
+      # `VFS.Path.normalize/1`, etc. Adding it here adds the beams to
+      # the PLT only — it does not reintroduce a runtime application
+      # edge.
+      plt_add_apps: [:vfs],
       flags: [:unmatched_returns, :error_handling, :extra_return, :missing_return]
     ]
   end
