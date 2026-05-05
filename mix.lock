@@ -26,4 +26,5 @@
   "stream_data": {:hex, :stream_data, "1.3.0", "bde37905530aff386dea1ddd86ecbf00e6642dc074ceffc10b7d4e41dfd6aac9", [:mix], [], "hexpm", "3cc552e286e817dca43c98044c706eec9318083a1480c52ae2688b08e2936e3c"},
   "telemetry": {:hex, :telemetry, "1.4.1", "ab6de178e2b29b58e8256b92b382ea3f590a47152ca3651ea857a6cae05ac423", [:rebar3], [], "hexpm", "2172e05a27531d3d31dd9782841065c50dd5c3c7699d95266b2edd54c2dafa1c"},
   "tls_certificate_check": {:hex, :tls_certificate_check, "1.32.1", "f90f9647668f7af804ec63c4e67f3799931166caf8264b81f37c1d863a36ae1d", [:rebar3], [{:ssl_verify_fun, "~> 1.1", [hex: :ssl_verify_fun, repo: "hexpm", optional: false]}], "hexpm", "e78a157966456b500a87a2fc29cffcd6dcfb5a26348c8372a2c5c0a8e5797f51"},
+  "vfs": {:git, "https://github.com/ivarvong/vfs.git", "32d2ab618ec12c16fe4f675b5ee8b563c660dd69", [ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69"]},
 }

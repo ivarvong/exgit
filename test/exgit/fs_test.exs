@@ -983,4 +983,56 @@ defmodule Exgit.FsTest do
       assert b.data =~ "defmodule B"
     end
   end
+
+  describe "rm_path/4" do
+    test "removes a top-level file", %{repo: repo} do
+      assert {:ok, tree_sha, repo2} = FS.rm_path(repo, "HEAD", "README.md")
+      assert {:error, :not_found} = FS.read_path(repo2, tree_sha, "README.md")
+
+      assert {:ok, {_, blob}, _} = FS.read_path(repo2, tree_sha, "src/a.ex")
+      assert blob.data =~ "defmodule A"
+    end
+
+    test "removes a nested file, leaving siblings intact", %{repo: repo} do
+      assert {:ok, tree_sha, repo2} = FS.rm_path(repo, "HEAD", "src/a.ex")
+      assert {:error, :not_found} = FS.read_path(repo2, tree_sha, "src/a.ex")
+
+      assert {:ok, {_, b}, _} = FS.read_path(repo2, tree_sha, "src/b.ex")
+      assert b.data =~ "defmodule B"
+
+      assert {:ok, {_, c}, _} = FS.read_path(repo2, tree_sha, "src/nested/c.ex")
+      assert c.data =~ "defmodule C"
+    end
+
+    test "removing a directory without :recursive returns :eisdir", %{repo: repo} do
+      assert {:error, :eisdir} = FS.rm_path(repo, "HEAD", "src")
+    end
+
+    test "removing a directory with :recursive removes all contents", %{repo: repo} do
+      assert {:ok, tree_sha, repo2} = FS.rm_path(repo, "HEAD", "src", recursive: true)
+      assert {:error, :not_found} = FS.read_path(repo2, tree_sha, "src/a.ex")
+      assert {:error, :not_found} = FS.read_path(repo2, tree_sha, "src/nested/c.ex")
+
+      assert {:ok, {_, readme}, _} = FS.read_path(repo2, tree_sha, "README.md")
+      assert readme.data == "hello\n"
+    end
+
+    test "missing path returns :not_found", %{repo: repo} do
+      assert {:error, :not_found} = FS.rm_path(repo, "HEAD", "does/not/exist")
+    end
+
+    test "rm of root path is rejected", %{repo: repo} do
+      assert {:error, :cannot_rm_root} = FS.rm_path(repo, "HEAD", "")
+      assert {:error, :cannot_rm_root} = FS.rm_path(repo, "HEAD", "/")
+    end
+
+    test "rm followed by write yields a tree without the rm'd entry", %{repo: repo} do
+      {:ok, t1, repo2} = FS.rm_path(repo, "HEAD", "README.md")
+      {:ok, t2, repo3} = FS.write_path(repo2, t1, "NOTES.md", "new\n")
+
+      assert {:error, :not_found} = FS.read_path(repo3, t2, "README.md")
+      assert {:ok, {_, blob}, _} = FS.read_path(repo3, t2, "NOTES.md")
+      assert blob.data == "new\n"
+    end
+  end
 end

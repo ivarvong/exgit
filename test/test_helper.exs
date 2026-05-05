@@ -48,4 +48,15 @@ exclude =
   ]
   |> Enum.uniq()
 
+# vfs ships VFS.ConformanceCase under test/support, which isn't on the
+# load path of consumers — only its own test env. Until vfs publishes
+# the harness in lib/, load it directly from the dep so our
+# `use VFS.ConformanceCase` works. Skip silently if the file is missing
+# (e.g. Elixir 1.17 CI tier where :vfs doesn't resolve).
+conformance = Path.join([__DIR__, "..", "deps", "vfs", "test", "support", "conformance_case.ex"])
+
+if File.exists?(conformance) and Code.ensure_loaded?(VFS.Mountable) do
+  Code.require_file(conformance)
+end
+
 ExUnit.start(exclude: exclude)
