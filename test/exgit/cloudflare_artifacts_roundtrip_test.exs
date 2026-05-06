@@ -20,7 +20,8 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
   across runs.
 
   Tagged `:cloudflare`. Run with `mix test --include cloudflare`.
-  The real-git verification is also tagged `:real_git`.
+  Test 2 shells out to the `git` binary; opting into `:cloudflare`
+  implies `git` is on PATH.
   """
 
   use ExUnit.Case, async: false
@@ -94,7 +95,6 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
     assert fetched_blob.data == content
   end
 
-  @tag :real_git
   test "exgit-pushed commit is readable by real git clone + fsck" do
     branch = unique_branch()
     branch_name = String.trim_leading(branch, "refs/heads/")

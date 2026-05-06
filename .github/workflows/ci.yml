@@ -148,3 +148,14 @@ jobs:
           GITHUB_PRIVATE_TOKEN: ${{ secrets.GITHUB_PRIVATE_TOKEN }}
         run: mix test --warnings-as-errors --only github_private
         continue-on-error: true
+
+      - name: Run Cloudflare Artifacts smoketest (live network, secrets)
+        # Push-to-main only — needs a long-lived repo-scoped artifact
+        # token that isn't available on fork-based PR runs. Exercises
+        # the full push → clone → fsck round-trip against a persistent
+        # `ci` repo on Cloudflare Artifacts.
+        if: matrix.primary && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          CF_ARTIFACT_REMOTE: ${{ secrets.CF_ARTIFACT_REMOTE }}
+          CF_ARTIFACT_TOKEN: ${{ secrets.CF_ARTIFACT_TOKEN }}
+        run: mix test --warnings-as-errors --only cloudflare
