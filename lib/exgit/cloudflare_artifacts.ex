@@ -19,9 +19,9 @@ defmodule Exgit.CloudflareArtifacts do
   and a default user-agent already set:
 
       client = Exgit.CloudflareArtifacts.new(
-        account_id: "abc123",
+        account_id: System.fetch_env!("CF_ACCOUNT_ID"),
         namespace: "default",
-        api_token: System.fetch_env!("CF_ARTIFACT_API_TOKEN")
+        api_token: System.fetch_env!("CF_API_TOKEN")
       )
 
   Any extra options (e.g. `:plug` for testing, `:retry`, `:receive_timeout`)

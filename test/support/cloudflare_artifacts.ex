@@ -18,10 +18,12 @@ defmodule Exgit.Test.CloudflareArtifacts do
   Uses a Cloudflare API token to create a fresh repo, mint git
   tokens, exercise the wire protocol, and tear everything down.
 
-    * `CF_ARTIFACT_ACCOUNT_ID` — Cloudflare account ID.
-    * `CF_ARTIFACT_API_TOKEN`  — Cloudflare API token with
-      `Artifacts > Edit` permission.
-    * `CF_ARTIFACT_NAMESPACE`  — optional, defaults to `"default"`.
+    * `CF_ACCOUNT_ID`         — Cloudflare account ID. Generic
+      Cloudflare credential, not artifact-specific.
+    * `CF_API_TOKEN`          — Cloudflare API token with
+      `Artifacts > Edit` permission. Generic.
+    * `CF_ARTIFACT_NAMESPACE` — optional, defaults to `"default"`.
+      Artifact-specific.
   """
 
   # --- Long-lived mode ---
@@ -42,16 +44,16 @@ defmodule Exgit.Test.CloudflareArtifacts do
   # --- Full-lifecycle mode ---
 
   def api_available? do
-    System.get_env("CF_ARTIFACT_ACCOUNT_ID") not in [nil, ""] and
-      System.get_env("CF_ARTIFACT_API_TOKEN") not in [nil, ""]
+    System.get_env("CF_ACCOUNT_ID") not in [nil, ""] and
+      System.get_env("CF_API_TOKEN") not in [nil, ""]
   end
 
   def account_id do
-    System.get_env("CF_ARTIFACT_ACCOUNT_ID") || raise "CF_ARTIFACT_ACCOUNT_ID not set"
+    System.get_env("CF_ACCOUNT_ID") || raise "CF_ACCOUNT_ID not set"
   end
 
   def api_token do
-    System.get_env("CF_ARTIFACT_API_TOKEN") || raise "CF_ARTIFACT_API_TOKEN not set"
+    System.get_env("CF_API_TOKEN") || raise "CF_API_TOKEN not set"
   end
 
   def namespace, do: System.get_env("CF_ARTIFACT_NAMESPACE") || "default"

@@ -18,14 +18,14 @@ defmodule Exgit.CloudflareArtifactsLifecycleTest do
     9. Delete the repo. Cleanup is also wrapped in `on_exit` so a
        failure mid-test still releases the repo.
 
-  Requires `CF_ARTIFACT_ACCOUNT_ID` and `CF_ARTIFACT_API_TOKEN`.
-  Optionally `CF_ARTIFACT_NAMESPACE` (defaults to `"default"`).
+  Requires `CF_ACCOUNT_ID` and `CF_API_TOKEN`. Optionally
+  `CF_ARTIFACT_NAMESPACE` (defaults to `"default"`).
 
   Tagged `:cloudflare_api` (distinct from `:cloudflare`, which gates
   the existing wire-protocol roundtrip test against a long-lived
   repo). Run locally with `mix test --include cloudflare_api`.
   `test_helper.exs` excludes this tag automatically when
-  `CF_ARTIFACT_ACCOUNT_ID` / `CF_ARTIFACT_API_TOKEN` aren't set.
+  `CF_ACCOUNT_ID` / `CF_API_TOKEN` aren't set.
   """
 
   use ExUnit.Case, async: false
