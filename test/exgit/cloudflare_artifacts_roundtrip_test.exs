@@ -2,9 +2,9 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
   @moduledoc """
   Live smoketest against Cloudflare Artifacts.
 
-  Creates an ephemeral repo via the Artifacts REST API, pushes an
-  exgit-built commit over the git smart-HTTP endpoint using the
-  repo-scoped token returned by `create_repo`, then verifies the data
+  Pushes an exgit-built commit over the git smart-HTTP endpoint to a
+  long-lived persistent repo (URL + token injected via
+  `CF_ARTIFACT_REMOTE` and `CF_ARTIFACT_TOKEN`), then verifies the data
   two ways:
 
     1. **exgit ↔ exgit** — lazy-clone via `Exgit.clone`, read the blob
@@ -16,14 +16,11 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
        (not just exgit-flavoured), and that a third-party client can
        read them.
 
+  Each test uses a unique branch name; the underlying repo is shared
+  across runs.
+
   Tagged `:cloudflare`. Run with `mix test --include cloudflare`.
   The real-git verification is also tagged `:real_git`.
-
-  Secrets (loaded by `test_helper.exs`):
-
-    * `CF_API_TOKEN`  — Cloudflare API token with `Artifacts Read` and
-      `Artifacts Write` permissions.
-    * `CF_ACCOUNT_ID` — owning account.
   """
 
   use ExUnit.Case, async: false
@@ -34,21 +31,10 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
   alias Exgit.{ObjectStore, RefStore, Repository, Transport}
   alias Exgit.Test.{CloudflareArtifacts, RealGit}
 
-  setup_all do
-    name = CloudflareArtifacts.unique_name("exgit-rt")
-    {:ok, repo_info} = CloudflareArtifacts.create_repo!(name, default_branch: "main")
-    on_exit(fn -> _ = CloudflareArtifacts.delete_repo!(name) end)
-
-    %{
-      repo_name: name,
-      remote: repo_info.remote,
-      token: repo_info.token,
-      default_branch: repo_info.default_branch
-    }
-  end
-
-  defp transport(remote, token) do
-    Transport.HTTP.new(remote, auth: ArtifactsCreds.auth(token))
+  defp transport do
+    Transport.HTTP.new(CloudflareArtifacts.remote(),
+      auth: ArtifactsCreds.auth(CloudflareArtifacts.token())
+    )
   end
 
   defp unique_branch do
@@ -56,7 +42,7 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
     "refs/heads/exgit-rt-#{System.system_time(:millisecond)}-#{suffix}"
   end
 
-  # Build a single-file commit. Returns {repo, commit_sha, content}.
+  # Build a single-file commit. Returns {repo, commit_sha}.
   defp build_commit(branch, filename, content) do
     store = ObjectStore.Memory.new()
     {:ok, blob_sha, store} = ObjectStore.put(store, Blob.new(content))
@@ -90,12 +76,12 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
     base
   end
 
-  test "exgit push → exgit clone roundtrips a random blob", ctx do
+  test "exgit push → exgit clone roundtrips a random blob" do
     branch = unique_branch()
     content = :crypto.strong_rand_bytes(4096)
     {repo, commit_sha} = build_commit(branch, "fixture.bin", content)
 
-    t = transport(ctx.remote, ctx.token)
+    t = transport()
 
     assert {:ok, _} = Exgit.push(repo, t, refspecs: [branch])
 
@@ -109,13 +95,13 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
   end
 
   @tag :real_git
-  test "exgit-pushed commit is readable by real git clone + fsck", ctx do
+  test "exgit-pushed commit is readable by real git clone + fsck" do
     branch = unique_branch()
     branch_name = String.trim_leading(branch, "refs/heads/")
     content = "Pushed by exgit at #{System.system_time(:millisecond)}\n"
     {repo, _commit_sha} = build_commit(branch, "hello.txt", content)
 
-    assert {:ok, _} = Exgit.push(repo, transport(ctx.remote, ctx.token), refspecs: [branch])
+    assert {:ok, _} = Exgit.push(repo, transport(), refspecs: [branch])
 
     clone_dir = tmp_dir!("exgit_cf_clone")
 
@@ -125,13 +111,13 @@ defmodule Exgit.CloudflareArtifactsRoundtripTest do
           "git",
           [
             "-c",
-            "http.extraheader=Authorization: Bearer #{ctx.token}",
+            "http.extraheader=Authorization: Bearer #{CloudflareArtifacts.token()}",
             "clone",
             "--branch",
             branch_name,
             "--depth",
             "1",
-            ctx.remote,
+            CloudflareArtifacts.remote(),
             clone_dir
           ],
           stderr_to_stdout: true
