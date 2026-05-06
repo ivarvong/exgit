@@ -124,6 +124,9 @@ defmodule Exgit.MixProject do
        optional: true,
        runtime: false},
       {:stream_data, "~> 1.0", only: [:test, :dev]},
+      # Test-only: localhost HTTP server for stubbing the Cloudflare
+      # Artifacts REST API in `test/exgit/cloudflare_artifacts_test.exs`.
+      {:bypass, "~> 2.1", only: :test},
       # Optional dev-only OpenTelemetry bridge: auto-converts :telemetry
       # events into OTel spans. Only loaded in dev/test; production users
       # can wire their own handlers.
