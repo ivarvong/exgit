@@ -159,3 +159,34 @@ jobs:
           CF_ARTIFACT_REMOTE: ${{ secrets.CF_ARTIFACT_REMOTE }}
           CF_ARTIFACT_TOKEN: ${{ secrets.CF_ARTIFACT_TOKEN }}
         run: mix test --warnings-as-errors --only cloudflare
+
+  consumer-smoke:
+    name: Consumer install smoke (package + use)
+    runs-on: ubuntu-24.04
+    # Separate from the `test` job on purpose: this builds the package
+    # exactly as it ships to Hex, depends on it from a throwaway project
+    # compiled in :prod, and uses the public API end-to-end. It catches
+    # missing `files:` entries and compile-time coupling to dev/test/
+    # optional deps — neither of which the in-repo suite can see.
+    # Live network (clones a public repo); runs on every push and PR.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir / OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          version-type: loose
+
+      - name: Install local Hex & rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Consumer-install smoke (clones elixir-ai-tools/just_bash)
+        run: bash scripts/consumer_smoke.sh

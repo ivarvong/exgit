@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — credential redaction + ref bounds
+
+- **Telemetry no longer leaks URL-embedded credentials.** A token
+  embedded in a remote URL (`https://token@host/…`, as git clients
+  commonly accept) is now redacted to `***` before the URL enters any
+  `:telemetry` span metadata (`ls_refs`, `fetch`, `push`) or the
+  `[:exgit, :security, :ref_rejected]` event. Previously such a token
+  could reach telemetry exporters / log aggregators. Prefer the
+  `:auth` field regardless — it was already redacted.
+- **`ls-refs` responses are capped at 1,000,000 refs.** A hostile or
+  broken server can no longer stream unbounded refs into client
+  memory; the transport stream halts once the cap trips. Real repos
+  (linux, esp-idf) sit far below this.
+
+### Notes
+
+- The optional `:vfs` integration depends on the pre-1.0 `vfs`
+  package (`~> 0.1.0`), which itself depends on exgit. The cycle is
+  handled with `runtime: false` + a compile-time `Code.ensure_loaded?`
+  guard, but treat the integration as pre-release and pin `vfs` if you
+  rely on it.
+
+### Added — size-aware reads
+
+- **`Exgit.FS.size/3`** — byte size of a blob at a path *without*
+  materializing its content. The size-aware companion to
+  `read_path/4`: gate on it before pulling a blob into memory.
+  O(1) for the in-memory store; on-disk loose objects inflate only
+  the header. Resolving the path may fetch trees (small) on a lazy
+  clone, but never the blob — an un-fetched blob returns
+  `{:error, :not_local}` instead of triggering a possibly-multi-GB
+  fetch. Directories return `{:error, :not_a_blob}`.
+- **`Exgit.ObjectStore.object_size/2`** — new protocol callback
+  backing the above. Memory keeps a parallel `sha => size` index
+  (no extra decompression); `Promisor` answers from cache or
+  returns `{:error, :not_local}` without fetching.
+
 ### Added — observability + workload bench
 
 - **`Exgit.Profiler`** — structured trace of `:telemetry` span

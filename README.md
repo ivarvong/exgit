@@ -370,7 +370,9 @@ changes require a major-version bump.
 
 Functions annotated `@doc experimental: true` — currently
 `FS.prefetch/3` and `Repository.materialize/2` — are explicitly
-exempt from SemVer guarantees until marked stable. The `:lazy` and
+exempt from SemVer guarantees until marked stable. The whole
+`Exgit.Index` module is likewise experimental (see its `@moduledoc`)
+and may change in any release. The `:lazy` and
 `:filter` options on `Exgit.clone/2` are also experimental: the
 threading contract (`{:ok, result, repo}` shape) may evolve before
 v1.0.
