@@ -171,10 +171,15 @@ defmodule Exgit.Transport.HTTP do
 
   def capabilities_cached(%__MODULE__{capabilities_cache: cached} = t), do: {cached, t}
 
+  # Backstop cap on refs accepted from a single ls-refs response. Real repos
+  # top out in the tens of thousands (linux, esp-idf); this bound exists only
+  # to stop a hostile server from streaming unbounded refs into client memory.
+  @max_refs 1_000_000
+
   def ls_refs(%__MODULE__{} = t, opts \\ []) do
     Exgit.Telemetry.span(
       [:exgit, :transport, :ls_refs],
-      %{transport: :http, url: t.url},
+      %{transport: :http, url: redact_url(t.url)},
       fn ->
         case do_ls_refs(t, opts) do
           {:ok, refs, meta} = result ->
@@ -213,15 +218,23 @@ defmodule Exgit.Transport.HTTP do
     # without ever materializing the full response body or the list of
     # decoded packets. For repos with tens of thousands of refs (esp-idf,
     # linux), this keeps the transport's memory bound flat in ref count.
-    init_acc = {[], %{peeled: %{}}}
+    # Map-shaped accumulator (not a tuple) so the streaming loop's
+    # `%{error: e}` halt check fires the moment the ref cap trips.
+    init_acc = %{refs: [], meta: %{peeled: %{}}, count: 0, error: nil}
+    # Redact before it reaches `keep_ref?`'s security telemetry, which
+    # echoes the source URL.
+    source_url = redact_url(t.url)
 
     handle_packet = fn
-      {:data, line}, acc -> parse_ls_refs_line(line, t.url, acc)
+      {:data, line}, acc -> parse_ls_refs_line(line, source_url, acc)
       _, acc -> acc
     end
 
     case stream_upload_pack(t, body, init_acc, handle_packet) do
-      {:ok, {refs_rev, meta}} ->
+      {:ok, %{error: reason}} when not is_nil(reason) ->
+        {:error, reason}
+
+      {:ok, %{refs: refs_rev, meta: meta}} ->
         meta =
           if map_size(meta.peeled) == 0, do: Map.delete(meta, :peeled), else: meta
 
@@ -244,29 +257,51 @@ defmodule Exgit.Transport.HTTP do
   # Hostile ref names are rejected here via `Exgit.RefName.valid?/1`;
   # rejections emit `[:exgit, :security, :ref_rejected]` telemetry
   # and drop the entry entirely.
-  defp parse_ls_refs_line(line, source_url, {refs, meta}) do
+  # Once the ref cap trips, short-circuit: the stream loop halts on
+  # `acc.error`, but packets already decoded from the current chunk still
+  # flow through this fold, so ignore them.
+  defp parse_ls_refs_line(_line, _source_url, %{error: reason} = acc) when not is_nil(reason),
+    do: acc
+
+  defp parse_ls_refs_line(line, source_url, acc) do
     line = String.trim_trailing(line, "\n")
 
     case String.split(line, " ", parts: 3) do
       [hex_sha, ref, attrs] when byte_size(hex_sha) == 40 ->
         with {:ok, sha} <- Base.decode16(hex_sha, case: :mixed),
              true <- keep_ref?(ref, source_url) do
-          attrs_map = parse_ls_refs_attrs(attrs)
-          add_ref(refs, meta, ref, sha, attrs_map)
+          add_ref(acc, ref, sha, parse_ls_refs_attrs(attrs))
         else
-          _ -> {refs, meta}
+          _ -> acc
         end
 
       [hex_sha, ref] when byte_size(hex_sha) == 40 ->
         with {:ok, sha} <- Base.decode16(hex_sha, case: :mixed),
              true <- keep_ref?(ref, source_url) do
-          add_ref(refs, meta, ref, sha, %{})
+          add_ref(acc, ref, sha, %{})
         else
-          _ -> {refs, meta}
+          _ -> acc
         end
 
       _ ->
-        {refs, meta}
+        acc
+    end
+  end
+
+  # Strip credentials from a URL before it enters telemetry metadata or a
+  # security event. exgit's own API carries auth in the `:auth` field, but
+  # callers commonly embed a token in the URL (`https://token@host/…`) the
+  # way git does — and that must never reach a telemetry exporter, log
+  # aggregator, or OTel span.
+  # The `is_binary/1` guard is load-bearing for Dialyzer: `URI.parse/1`
+  # accepts `URI.t() | binary()`, so without it Dialyzer widens `url`'s
+  # inferred type to include `%URI{}`, and the `userinfo == nil` branch
+  # (which returns `url` unchanged) then appears to return a struct.
+  @spec redact_url(String.t()) :: String.t()
+  defp redact_url(url) when is_binary(url) do
+    case URI.parse(url).userinfo do
+      nil -> url
+      userinfo -> String.replace(url, userinfo <> "@", "***@", global: false)
     end
   end
 
@@ -284,10 +319,12 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
-  # Add an entry to `refs` and lift any attributes into `meta`.
-  # HEAD's `symref-target` becomes `meta.head`; annotated tags'
-  # `peeled` target becomes `meta.peeled[tag_name]`.
-  defp add_ref(refs, meta, ref, sha, attrs) do
+  # Add an entry to the accumulator and lift any attributes into `meta`.
+  # HEAD's `symref-target` becomes `meta.head`; annotated tags' `peeled`
+  # target becomes `meta.peeled[tag_name]`. Past `@max_refs` we stop
+  # appending and set `acc.error` so the transport stream loop halts —
+  # a hostile server can't grow the ref list without bound.
+  defp add_ref(%{refs: refs, meta: meta, count: count} = acc, ref, sha, attrs) do
     meta =
       case Map.get(attrs, :symref_target) do
         nil -> meta
@@ -304,7 +341,11 @@ defmodule Exgit.Transport.HTTP do
         peeled_sha -> put_in(meta, [:peeled, ref], peeled_sha)
       end
 
-    {[{ref, sha} | refs], meta}
+    if count + 1 > @max_refs do
+      %{acc | meta: meta, error: {:too_many_refs, @max_refs}}
+    else
+      %{acc | refs: [{ref, sha} | refs], meta: meta, count: count + 1}
+    end
   end
 
   defp parse_ls_refs_attrs(attrs) do
@@ -330,7 +371,7 @@ defmodule Exgit.Transport.HTTP do
   def fetch(%__MODULE__{} = t, wants, opts \\ []) do
     Exgit.Telemetry.span(
       [:exgit, :transport, :fetch],
-      %{transport: :http, url: t.url, wants_count: length(wants)},
+      %{transport: :http, url: redact_url(t.url), wants_count: length(wants)},
       fn ->
         case do_fetch(t, wants, opts) do
           {:ok, pack_bytes, summary} = result ->
@@ -581,7 +622,7 @@ defmodule Exgit.Transport.HTTP do
       [:exgit, :transport, :push],
       %{
         transport: :http,
-        url: t.url,
+        url: redact_url(t.url),
         update_count: length(updates),
         pack_bytes: byte_size(pack_bytes)
       },
@@ -780,7 +821,7 @@ defmodule Exgit.Transport.HTTP do
         captured =
           if room > 0 do
             take = min(room, byte_size(chunk))
-            <<head::binary-size(take), _::binary>> = chunk
+            <<head::binary-size(^take), _::binary>> = chunk
             <<state.error_body::binary, head::binary>>
           else
             state.error_body
