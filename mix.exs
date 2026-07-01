@@ -9,10 +9,10 @@ defmodule Exgit.MixProject do
       app: :exgit,
       version: @version,
       elixir: "~> 1.17",
-      # The library doesn't use any 1.19-only features; pinning the
+      # The library doesn't use any post-1.17 features; pinning the
       # lower bound at 1.17 keeps it installable for older consumers.
-      # CI matrix tests both 1.17 (minimum-supported) and 1.19
-      # (primary + stricter type checks).
+      # CI matrix tests 1.20/OTP 29 (primary, all quality gates),
+      # 1.19/OTP 28, and 1.17/OTP 27 (minimum-supported).
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -53,14 +53,15 @@ defmodule Exgit.MixProject do
       links: %{
         "GitHub" => @source_url
       },
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE CHANGELOG.md SECURITY.md)
+      files:
+        ~w(lib docs/PERFORMANCE.md .formatter.exs mix.exs README.md LICENSE CHANGELOG.md SECURITY.md)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "SECURITY.md"],
+      extras: ["README.md", "CHANGELOG.md", "SECURITY.md", "docs/PERFORMANCE.md"],
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]
@@ -91,8 +92,7 @@ defmodule Exgit.MixProject do
       # consumers can attach to. Zero cost when no handler is attached.
       {:telemetry, "~> 1.0"},
       # Optional vfs integration: `Exgit.Workspace` ships a
-      # `VFS.Mountable` defimpl when `:vfs` is loaded. Pinned to a SHA
-      # because vfs has no hex release yet.
+      # `VFS.Mountable` defimpl when `:vfs` is loaded.
       #
       # `optional: true` means downstream consumers don't have to install
       # :vfs to use exgit; if they DO add :vfs, Mix orders our build after
@@ -118,11 +118,7 @@ defmodule Exgit.MixProject do
       # remove vfs from our dep graph in :prod, breaking compile-ordering
       # guarantees in downstream consumer builds. Requires Elixir ~> 1.18;
       # the 1.17 CI tier skips the integration via `Code.ensure_loaded?`.
-      {:vfs,
-       github: "ivarvong/vfs",
-       ref: "32d2ab618ec12c16fe4f675b5ee8b563c660dd69",
-       optional: true,
-       runtime: false},
+      {:vfs, "~> 0.1.0", optional: true, runtime: false},
       {:stream_data, "~> 1.0", only: [:test, :dev]},
       # Test-only: localhost HTTP server for stubbing the Cloudflare
       # Artifacts REST API in `test/exgit/cloudflare_artifacts_test.exs`.
@@ -136,7 +132,9 @@ defmodule Exgit.MixProject do
       {:opentelemetry_exporter, "~> 1.8", only: [:dev, :test]},
       # Dev-only static analysis. Not runtime deps.
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false},
-      {:credo, "~> 1.7", only: [:dev], runtime: false}
+      {:credo, "~> 1.7", only: [:dev], runtime: false},
+      # Doc generation for HexDocs (`mix docs` / `mix hex.publish`).
+      {:ex_doc, "~> 0.34", only: [:dev], runtime: false}
     ]
   end
 

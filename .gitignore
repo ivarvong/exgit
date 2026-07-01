@@ -25,6 +25,10 @@ ex_git-*.tar
 # Temporary files, for example, from tests.
 /tmp/
 
+# Local scratch: internal notes, third-party product critiques, repro
+# scripts. Never published to GitHub or hex.
+/scratch/
+
 # Environment / secrets. Never commit.
 .env
 .env.*
@@ -33,3 +37,6 @@ ex_git-*.tar
 # mix dialyzer --plt; never commit them.
 priv/plts/
 
+
+# hex.build package artifact
+/exgit-*.tar

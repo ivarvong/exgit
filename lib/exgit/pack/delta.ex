@@ -64,7 +64,7 @@ defmodule Exgit.Pack.Delta do
         {:error, :insert_exceeds_result_size}
 
       true ->
-        <<data::binary-size(byte), more::binary>> = rest
+        <<data::binary-size(^byte), more::binary>> = rest
         apply_instructions(more, base, remaining - byte, [data | acc])
     end
   end

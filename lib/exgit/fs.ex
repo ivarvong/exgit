@@ -32,7 +32,11 @@ defmodule Exgit.FS do
 
   @type ref :: String.t() | binary()
   @type path :: String.t()
-  @type stat :: %{type: :blob | :tree, mode: String.t(), size: non_neg_integer() | nil}
+  @type stat :: %{
+          type: :blob | :tree | :submodule,
+          mode: String.t(),
+          size: non_neg_integer() | nil
+        }
 
   @doc """
   Read the blob at `path`. Returns `{:ok, {mode, %Blob{}}, repo}` or
@@ -41,23 +45,26 @@ defmodule Exgit.FS do
 
   ## Options
 
-    * `:resolve_lfs_pointers` (default `false`) — when `true`, blobs
-      detected as git-lfs pointer files are returned as
+    * `:detect_lfs_pointers` (default `false`) — when `true`, blobs
+      that parse as git-lfs pointer files are returned as
       `{:ok, {mode, {:lfs_pointer, info}}, repo}` instead of
       `{:ok, {mode, %Blob{}}, repo}`. `info` is a map with
       `:oid`, `:size`, and `:raw` (the original pointer bytes).
 
-      An agent reading blobs without this flag against an
-      LFS-using repo will silently receive ~130-byte pointer
-      text as if it were file content — a correctness cliff.
-      See `Exgit.LFS` for detection details.
+      Detection only — the actual LFS content is never fetched
+      (that requires a separate batch-API protocol against the LFS
+      server). Callers that need the real bytes can hand `info.raw`
+      to an LFS client. An agent reading blobs without this flag
+      against an LFS-using repo will silently receive ~130-byte
+      pointer text as if it were file content — a correctness
+      cliff. See `Exgit.LFS` for detection details.
 
   """
   @spec read_path(Repository.t(), ref(), path(), keyword()) ::
           {:ok, {String.t(), Blob.t() | {:lfs_pointer, Exgit.LFS.pointer_info()}}, Repository.t()}
-          | {:error, :not_found | :not_a_blob | term()}
+          | {:error, :not_found | :not_a_blob | :submodule | term()}
   def read_path(%Repository{} = repo, reference, path, opts \\ []) do
-    resolve_lfs? = Keyword.get(opts, :resolve_lfs_pointers, false)
+    detect_lfs? = Keyword.get(opts, :detect_lfs_pointers, false)
 
     Exgit.Telemetry.span(
       [:exgit, :fs, :read_path],
@@ -65,17 +72,26 @@ defmodule Exgit.FS do
       fn ->
         with {:ok, tree_sha, repo} <- resolve_tree(repo, reference),
              {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, normalize_path(path)),
+             :ok <- reject_gitlink(mode),
              {:ok, obj, repo} <- fetch_object(repo, sha) do
-          wrap_blob(obj, mode, repo, resolve_lfs?)
+          wrap_blob(obj, mode, repo, detect_lfs?)
         end
       end
     )
   end
 
+  # A gitlink's SHA names a commit in the submodule's own repository —
+  # it can never be fetched from this repo's store, so fail before
+  # `fetch_object` attempts a doomed lookup (or, on a lazy clone, a
+  # doomed network fetch). Mirrors `size/3`.
+  defp reject_gitlink(mode) do
+    if gitlink_mode?(mode), do: {:error, :submodule}, else: :ok
+  end
+
   # Post-process a fetched object into the `read_path` return shape.
   # Split out so the main `with` chain stays flat; credo flags the
   # in-line nested `case + if + case` otherwise.
-  defp wrap_blob(%Blob{data: data} = b, mode, repo, true = _resolve_lfs?) do
+  defp wrap_blob(%Blob{data: data} = b, mode, repo, true = _detect_lfs?) do
     case Exgit.LFS.parse(data) do
       {:ok, info} -> {:ok, {mode, {:lfs_pointer, info}}, repo}
       {:error, _} -> {:ok, {mode, b}, repo}
@@ -246,6 +262,10 @@ defmodule Exgit.FS do
 
   @doc """
   Stat the path. Returns `{:ok, stat, repo}`.
+
+  Gitlink (submodule) entries stat as `%{type: :submodule, size: nil}`
+  without fetching anything — the entry's SHA lives in the submodule's
+  own repository.
   """
   @spec stat(Repository.t(), ref(), path()) :: {:ok, stat(), Repository.t()} | {:error, term()}
   def stat(%Repository{} = repo, reference, path) do
@@ -257,17 +277,77 @@ defmodule Exgit.FS do
           {:ok, %{type: :tree, mode: "40000", size: nil}, repo}
 
         _ ->
-          with {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, segments),
-               {:ok, obj, repo} <- fetch_object(repo, sha) do
-            case obj do
-              %Blob{data: d} -> {:ok, %{type: :blob, mode: mode, size: byte_size(d)}, repo}
-              %Tree{} -> {:ok, %{type: :tree, mode: mode, size: nil}, repo}
-              _ -> {:error, :unknown_type}
-            end
+          with {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, segments) do
+            stat_entry(repo, mode, sha)
           end
       end
     end
   end
+
+  @doc """
+  Size in bytes of the blob at `path` — WITHOUT reading its content.
+
+  The size-aware companion to `read_path/4`: use it to decide whether a
+  blob is too large to pull into memory *before* you pull it. For the
+  in-memory store this is O(1) (the size is indexed, not recomputed);
+  for on-disk loose objects it inflates only the header.
+
+  Resolving the path may fetch *tree* objects (small) on a lazy clone,
+  but the blob itself is never fetched. For a lazy/partial clone whose
+  blob has not been materialized yet, returns `{:error, :not_local}`
+  rather than triggering a possibly-multi-GB fetch — call `read_path/4`
+  when you actually want the bytes. Directories return
+  `{:error, :not_a_blob}`. Gitlink (submodule) entries return
+  `{:error, :submodule}` — the entry's SHA names a commit in the
+  submodule's own repository, so it has no size here and no amount
+  of prefetching will make it local.
+
+      {:ok, size, repo} = Exgit.FS.size(repo, "HEAD", "go.mod")
+
+  """
+  @spec size(Repository.t(), ref(), path()) ::
+          {:ok, non_neg_integer(), Repository.t()} | {:error, term()}
+  def size(%Repository{} = repo, reference, path) do
+    with {:ok, tree_sha, repo} <- resolve_tree(repo, reference),
+         {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, normalize_path(path)) do
+      cond do
+        dir_mode?(mode) ->
+          {:error, :not_a_blob}
+
+        gitlink_mode?(mode) ->
+          {:error, :submodule}
+
+        true ->
+          case ObjectStore.object_size(repo.object_store, sha) do
+            {:ok, size} -> {:ok, size, repo}
+            {:error, _} = err -> err
+          end
+      end
+    end
+  end
+
+  # Stat one resolved tree entry. Gitlinks short-circuit before any
+  # object lookup — the commit they name is never in this repo's store.
+  defp stat_entry(repo, mode, sha) do
+    if gitlink_mode?(mode) do
+      {:ok, %{type: :submodule, mode: mode, size: nil}, repo}
+    else
+      with {:ok, obj, repo} <- fetch_object(repo, sha) do
+        case obj do
+          %Blob{data: d} -> {:ok, %{type: :blob, mode: mode, size: byte_size(d)}, repo}
+          %Tree{} -> {:ok, %{type: :tree, mode: mode, size: nil}, repo}
+          _ -> {:error, :unknown_type}
+        end
+      end
+    end
+  end
+
+  defp dir_mode?("40000"), do: true
+  defp dir_mode?("040000"), do: true
+  defp dir_mode?(_), do: false
+
+  defp gitlink_mode?("160000"), do: true
+  defp gitlink_mode?(_), do: false
 
   @doc """
   Return true if the path exists under the given reference.
@@ -862,19 +942,22 @@ defmodule Exgit.FS do
   end
 
   @doc """
-  Glob paths matching `pattern`. Streaming; does not grow the cache.
+  List the file paths matching `pattern`, like `Path.wildcard/1`.
+
+  Walks the tree lazily (pure `ObjectStore.get/2`, does not grow the
+  cache) and returns the sorted list of matching paths. Unlike
+  `walk/2` and `grep/4` this is not a stream — sorting requires
+  collecting every match, so the whole tree is traversed before the
+  call returns. An unmatched pattern returns `[]`.
   """
-  @spec glob(Repository.t(), ref(), String.t()) :: {:ok, [String.t()]}
+  @spec glob(Repository.t(), ref(), String.t()) :: [String.t()]
   def glob(%Repository{} = repo, reference, pattern) do
     regex = compile_glob(pattern)
 
-    paths =
-      walk(repo, reference)
-      |> Stream.map(&elem(&1, 0))
-      |> Stream.filter(&Regex.match?(regex, &1))
-      |> Enum.sort()
-
-    {:ok, paths}
+    walk(repo, reference)
+    |> Stream.map(&elem(&1, 0))
+    |> Stream.filter(&Regex.match?(regex, &1))
+    |> Enum.sort()
   end
 
   @type grep_match :: %{

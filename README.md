@@ -338,11 +338,14 @@ What's in place:
   eviction for long-running agent loops.
 - **Protocol v2 `symrefs`** — `Exgit.clone/2` picks the server's
   actual HEAD target instead of guessing main/master.
-- **399 tests, 29 properties, 0 failures** across default, slow,
-  real_git, and live-integration tiers.
-- **CI gates**: Elixir 1.17 / OTP 27 on ubuntu-24.04 with
-  warnings-as-errors, Credo, Dialyzer, format check, partial-clone
-  roundtrip against GitHub.
+- **870 tests (52 properties), 0 failures** across the default,
+  slow, and real_git tiers; live-integration and authenticated
+  tiers run in CI on top.
+- **CI gates**: three-tier matrix on ubuntu-24.04 — Elixir 1.20 /
+  OTP 29 (primary: warnings-as-errors, Credo, Dialyzer, format
+  check, partial-clone roundtrip against GitHub), plus 1.19 / OTP 28
+  and 1.17 / OTP 27 (minimum-supported) compile-and-test tiers, and
+  a consumer-install smoke test of the built hex package.
 
 See [CHANGELOG.md](./CHANGELOG.md) for details and
 [SECURITY.md](./SECURITY.md) for the threat model.
@@ -370,7 +373,9 @@ changes require a major-version bump.
 
 Functions annotated `@doc experimental: true` — currently
 `FS.prefetch/3` and `Repository.materialize/2` — are explicitly
-exempt from SemVer guarantees until marked stable. The `:lazy` and
+exempt from SemVer guarantees until marked stable. The whole
+`Exgit.Index` module is likewise experimental (see its `@moduledoc`)
+and may change in any release. The `:lazy` and
 `:filter` options on `Exgit.clone/2` are also experimental: the
 threading contract (`{:ok, result, repo}` shape) may evolve before
 v1.0.

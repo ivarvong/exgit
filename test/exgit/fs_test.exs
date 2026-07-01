@@ -119,7 +119,7 @@ defmodule Exgit.FsTest do
     end
   end
 
-  describe "read_path/4 with resolve_lfs_pointers" do
+  describe "read_path/4 with detect_lfs_pointers" do
     # Build a repo containing:
     #   /real.bin       (200 bytes random — looks like a real binary)
     #   /pointed.bin    (a valid LFS pointer file, as if `git lfs`
@@ -128,7 +128,7 @@ defmodule Exgit.FsTest do
     #
     # and verify:
     #   1. Default behavior (no flag) returns %Blob{} in all cases.
-    #   2. With resolve_lfs_pointers: true, pointed.bin surfaces as
+    #   2. With detect_lfs_pointers: true, pointed.bin surfaces as
     #      {:lfs_pointer, info}; real.bin and README.md stay as blobs.
     setup do
       store = ObjectStore.Memory.new()
@@ -202,7 +202,7 @@ defmodule Exgit.FsTest do
 
     test "with flag, pointer file surfaces as {:lfs_pointer, info}", %{repo: repo} do
       assert {:ok, {"100644", {:lfs_pointer, info}}, _} =
-               FS.read_path(repo, "HEAD", "pointed.bin", resolve_lfs_pointers: true)
+               FS.read_path(repo, "HEAD", "pointed.bin", detect_lfs_pointers: true)
 
       assert info.oid ==
                "sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393"
@@ -214,14 +214,14 @@ defmodule Exgit.FsTest do
     test "with flag, normal binary blob stays as %Blob{}", %{repo: repo} do
       # A 200-byte random blob must NOT be mistaken for a pointer.
       assert {:ok, {"100644", %Blob{} = blob}, _} =
-               FS.read_path(repo, "HEAD", "real.bin", resolve_lfs_pointers: true)
+               FS.read_path(repo, "HEAD", "real.bin", detect_lfs_pointers: true)
 
       assert byte_size(blob.data) == 200
     end
 
     test "with flag, plain text blob stays as %Blob{}", %{repo: repo} do
       assert {:ok, {"100644", %Blob{data: "# Project\n"}}, _} =
-               FS.read_path(repo, "HEAD", "README.md", resolve_lfs_pointers: true)
+               FS.read_path(repo, "HEAD", "README.md", detect_lfs_pointers: true)
     end
   end
 
@@ -293,43 +293,33 @@ defmodule Exgit.FsTest do
 
   describe "glob/3" do
     test "matches *.md in the root", %{repo: repo} do
-      assert {:ok, ["README.md"]} = FS.glob(repo, "HEAD", "*.md")
+      assert FS.glob(repo, "HEAD", "*.md") == ["README.md"]
     end
 
-    test "matches **/*.ex across subdirs", %{repo: repo} do
-      {:ok, paths} = FS.glob(repo, "HEAD", "**/*.ex")
-
-      assert Enum.sort(paths) == ["src/a.ex", "src/b.ex", "src/nested/c.ex"]
+    test "matches **/*.ex across subdirs, sorted", %{repo: repo} do
+      assert FS.glob(repo, "HEAD", "**/*.ex") == ["src/a.ex", "src/b.ex", "src/nested/c.ex"]
     end
 
     test "matches src/*.ex (one level)", %{repo: repo} do
-      {:ok, paths} = FS.glob(repo, "HEAD", "src/*.ex")
-      assert Enum.sort(paths) == ["src/a.ex", "src/b.ex"]
+      assert FS.glob(repo, "HEAD", "src/*.ex") == ["src/a.ex", "src/b.ex"]
     end
 
     test "brace expansion: **/*.{md,ex} matches both extensions", %{repo: repo} do
-      {:ok, paths} = FS.glob(repo, "HEAD", "**/*.{md,ex}")
-
-      assert Enum.sort(paths) ==
+      assert FS.glob(repo, "HEAD", "**/*.{md,ex}") ==
                ["README.md", "src/a.ex", "src/b.ex", "src/nested/c.ex"]
     end
 
     test "brace with a single option is equivalent to the literal", %{repo: repo} do
-      {:ok, a} = FS.glob(repo, "HEAD", "**/*.{ex}")
-      {:ok, b} = FS.glob(repo, "HEAD", "**/*.ex")
-      assert Enum.sort(a) == Enum.sort(b)
+      assert FS.glob(repo, "HEAD", "**/*.{ex}") == FS.glob(repo, "HEAD", "**/*.ex")
     end
 
     test "brace expansion at different positions in the pattern", %{repo: repo} do
       # {src,lib}/*.ex — no `lib/` exists, so only src hits match.
-      {:ok, paths} = FS.glob(repo, "HEAD", "{src,lib}/*.ex")
-      assert Enum.sort(paths) == ["src/a.ex", "src/b.ex"]
+      assert FS.glob(repo, "HEAD", "{src,lib}/*.ex") == ["src/a.ex", "src/b.ex"]
     end
 
     test "brace expansion with three options", %{repo: repo} do
-      {:ok, paths} = FS.glob(repo, "HEAD", "**/*.{md,ex,missing}")
-
-      assert Enum.sort(paths) ==
+      assert FS.glob(repo, "HEAD", "**/*.{md,ex,missing}") ==
                ["README.md", "src/a.ex", "src/b.ex", "src/nested/c.ex"]
     end
 
@@ -337,15 +327,13 @@ defmodule Exgit.FsTest do
       # `foo{,bar}` matches either `foo` or `foobar`. We exercise the
       # parse path; the fixture has no files matching either literal,
       # so we expect an empty result — but no crash.
-      {:ok, paths} = FS.glob(repo, "HEAD", "README{,.bak}.md")
-      assert paths == ["README.md"]
+      assert FS.glob(repo, "HEAD", "README{,.bak}.md") == ["README.md"]
     end
 
     test "unmatched opening brace is treated as a literal character", %{repo: repo} do
       # `{` without a closing `}` isn't a valid alternation — we treat
       # it as a literal (matches against a nonexistent file).
-      {:ok, paths} = FS.glob(repo, "HEAD", "README{.md")
-      assert paths == []
+      assert FS.glob(repo, "HEAD", "README{.md") == []
     end
   end
 

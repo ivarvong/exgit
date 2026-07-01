@@ -70,6 +70,53 @@ defmodule Exgit.ObjectStore.DiskTest do
     end
   end
 
+  describe "object_size" do
+    test "reads the size from the loose header without materializing", %{store: store} do
+      data = String.duplicate("z", 300_000)
+      {:ok, sha} = Disk.put_object(store, Blob.new(data))
+
+      assert Disk.object_size(store, sha) == {:ok, byte_size(data)}
+    end
+
+    test "returns not_found for a missing object", %{store: store} do
+      assert {:error, :not_found} = Disk.object_size(store, :crypto.hash(:sha, "absent"))
+    end
+
+    test "returns zlib_error for a corrupt loose object", %{store: store, path: path} do
+      sha = :crypto.hash(:sha, "corrupt")
+      write_loose_bytes(path, sha, "definitely not zlib data")
+
+      assert {:error, :zlib_error} = Disk.object_size(store, sha)
+    end
+
+    test "returns malformed_object_header for a truncated loose object", %{
+      store: store,
+      path: path
+    } do
+      # Valid deflate stream cut off before the header's NUL appears.
+      sha = :crypto.hash(:sha, "truncated")
+      compressed = :zlib.compress("blob 1234\0" <> String.duplicate("y", 1234))
+      write_loose_bytes(path, sha, binary_part(compressed, 0, 2))
+
+      assert {:error, :malformed_object_header} = Disk.object_size(store, sha)
+    end
+
+    test "rejects a header with no NUL inside the scan budget", %{store: store, path: path} do
+      sha = :crypto.hash(:sha, "no-nul")
+      write_loose_bytes(path, sha, :zlib.compress(String.duplicate("a", 4096)))
+
+      assert {:error, :malformed_object_header} = Disk.object_size(store, sha)
+    end
+  end
+
+  defp write_loose_bytes(path, sha, bytes) do
+    hex = Base.encode16(sha, case: :lower)
+    <<prefix::binary-size(2), rest::binary>> = hex
+    dir = Path.join([path, "objects", prefix])
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, rest), bytes)
+  end
+
   describe "delete" do
     test "removes the object", %{store: store} do
       blob = Blob.new("to delete")

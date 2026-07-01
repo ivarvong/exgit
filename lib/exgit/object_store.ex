@@ -1,4 +1,16 @@
 defprotocol Exgit.ObjectStore do
+  @moduledoc """
+  Storage protocol for git objects, keyed by binary SHA-1.
+
+  Implemented by `Exgit.ObjectStore.Memory` (in-heap),
+  `Exgit.ObjectStore.Disk` (git's on-disk layout), and
+  `Exgit.ObjectStore.Promisor` (lazy, fetch-on-demand).
+
+  Stores are pure values: every write (`put/2`, `import_objects/2`,
+  `close_write/2`) returns the updated store, which the caller must
+  thread forward. Reads never mutate.
+  """
+
   @spec get(t, binary()) :: {:ok, Exgit.Object.t()} | {:error, term()}
   def get(store, sha)
 
@@ -7,6 +19,27 @@ defprotocol Exgit.ObjectStore do
 
   @spec has?(t, binary()) :: boolean()
   def has?(store, sha)
+
+  @doc """
+  Uncompressed byte size of an object WITHOUT materializing its content.
+
+  The point is a constant-memory size check: callers can decide whether a
+  blob is too large to read before paying to inflate it into the heap.
+
+  Returns `{:ok, byte_count}` when the store can answer, or:
+
+    * `{:error, :not_found}` — the object is genuinely absent from the
+      store.
+    * `{:error, :not_local}` — a meaningful, non-fatal result for lazy
+      stores (`Promisor`): it means "knowing this size requires a network
+      fetch", so the caller can opt in rather than have a multi-GB fetch
+      triggered behind a size check.
+    * `{:error, term()}` — store-specific failure (e.g. a corrupt loose
+      object on disk).
+  """
+  @spec object_size(t, binary()) ::
+          {:ok, non_neg_integer()} | {:error, :not_found | :not_local | term()}
+  def object_size(store, sha)
 
   @spec import_objects(t, [{atom(), binary(), binary()}]) :: {:ok, t}
   def import_objects(store, raw_objects)

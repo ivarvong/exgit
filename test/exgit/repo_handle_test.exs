@@ -38,9 +38,9 @@ defmodule Exgit.RepoHandleTest do
   end
 
   describe "lifecycle" do
-    test "start_link + get", %{repo: repo} do
+    test "start_link + fetch!", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)
-      assert %Repository{} = RepoHandle.get(handle)
+      assert %Repository{} = RepoHandle.fetch!(handle)
       RepoHandle.stop(handle)
     end
 
@@ -50,7 +50,7 @@ defmodule Exgit.RepoHandleTest do
       RepoHandle.stop(handle)
     end
 
-    test "get/1 on dead handle raises" do
+    test "fetch!/1 on dead handle raises" do
       # Spawn a handle and kill it.
       {:ok, handle} =
         RepoHandle.start_link(%Repository{
@@ -63,7 +63,7 @@ defmodule Exgit.RepoHandleTest do
       RepoHandle.stop(handle)
       refute Process.alive?(handle)
 
-      assert_raise ArgumentError, fn -> RepoHandle.get(handle) end
+      assert_raise ArgumentError, fn -> RepoHandle.fetch!(handle) end
     end
 
     test "fetch/1 on dead handle returns {:error, _}" do
@@ -83,8 +83,8 @@ defmodule Exgit.RepoHandleTest do
       name = :"test_named_handle_#{System.unique_integer([:positive])}"
       {:ok, pid} = RepoHandle.start_link(repo, name: name)
 
-      assert %Repository{} = RepoHandle.get(name)
-      assert RepoHandle.get(name) == RepoHandle.get(pid)
+      assert %Repository{} = RepoHandle.fetch!(name)
+      assert RepoHandle.fetch!(name) == RepoHandle.fetch!(pid)
 
       RepoHandle.stop(name)
     end
@@ -117,7 +117,7 @@ defmodule Exgit.RepoHandleTest do
           %{r | object_store: store}
         end)
 
-      new_repo = RepoHandle.get(handle)
+      new_repo = RepoHandle.fetch!(handle)
       # Store has 5 objects now (blob + tree + commit + new blob = 4, plus... wait)
       # Originally 3 objects (blob, tree, commit). After update, 4.
       assert map_size(new_repo.object_store.objects) == 4
@@ -134,18 +134,18 @@ defmodule Exgit.RepoHandleTest do
           {:ok, %{r | object_store: store}}
         end)
 
-      assert map_size(RepoHandle.get(handle).object_store.objects) == 4
+      assert map_size(RepoHandle.fetch!(handle).object_store.objects) == 4
       RepoHandle.stop(handle)
     end
 
     test "fun returning {:error, _} leaves handle unchanged", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)
-      snapshot_before = RepoHandle.get(handle)
+      snapshot_before = RepoHandle.fetch!(handle)
 
       result = RepoHandle.update(handle, fn _r -> {:error, :test_error} end)
       assert result == {:error, :test_error}
 
-      assert RepoHandle.get(handle) == snapshot_before
+      assert RepoHandle.fetch!(handle) == snapshot_before
       RepoHandle.stop(handle)
     end
 
@@ -170,7 +170,7 @@ defmodule Exgit.RepoHandleTest do
       Enum.each(tasks, &Task.await/1)
 
       # Initial 3 (commit+tree+blob) + n new blobs.
-      assert map_size(RepoHandle.get(handle).object_store.objects) == 3 + n_tasks
+      assert map_size(RepoHandle.fetch!(handle).object_store.objects) == 3 + n_tasks
       RepoHandle.stop(handle)
     end
   end
@@ -185,13 +185,13 @@ defmodule Exgit.RepoHandleTest do
 
       :ok = RepoHandle.put(handle, new_repo)
 
-      stored = RepoHandle.get(handle)
+      stored = RepoHandle.fetch!(handle)
       assert map_size(stored.object_store.objects) == 4
       RepoHandle.stop(handle)
     end
   end
 
-  describe "fetch_once/3 dedup" do
+  describe "fetch_once/4 dedup" do
     test "serializes concurrent fetches for the same key", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)
 
@@ -267,6 +267,44 @@ defmodule Exgit.RepoHandleTest do
       RepoHandle.stop(handle)
     end
 
+    test "fetch fn that exits errors promptly instead of hanging", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      # The 1s call timeout makes the test fail fast if the caller
+      # would otherwise hang until the default 300s timeout.
+      assert {:error, {:fetch_crashed, _}} =
+               RepoHandle.fetch_once(handle, :exit_key, fn _repo -> exit(:boom) end, 1_000)
+
+      # The in_flight entry is cleared: a subsequent fetch_once for
+      # the SAME key re-runs the fetch and succeeds.
+      assert {:ok, %Repository{}} =
+               RepoHandle.fetch_once(handle, :exit_key, fn r -> {:ok, r} end, 1_000)
+
+      RepoHandle.stop(handle)
+    end
+
+    test "killed fetch task errors promptly instead of hanging", %{repo: repo} do
+      {:ok, handle} = RepoHandle.start_link(repo)
+
+      # A brutal kill can't be caught inside the task, so this
+      # exercises the monitor path: the handle sees :DOWN and
+      # replies to waiters instead of leaking the in_flight entry.
+      kill_fn = fn _repo -> Process.exit(self(), :kill) end
+
+      # Reason is :killed, or :noproc when the task dies before the
+      # handle's monitor attaches — both go through the :DOWN path.
+      assert {:error, {:fetch_crashed, reason}} =
+               RepoHandle.fetch_once(handle, :kill_key, kill_fn, 1_000)
+
+      assert reason in [:killed, :noproc]
+
+      # The entry is cleared: the same key fetches again and succeeds.
+      assert {:ok, %Repository{}} =
+               RepoHandle.fetch_once(handle, :kill_key, fn r -> {:ok, r} end, 1_000)
+
+      RepoHandle.stop(handle)
+    end
+
     test "handle stays responsive to reads during a slow fetch", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)
 
@@ -284,7 +322,7 @@ defmodule Exgit.RepoHandleTest do
       start = System.monotonic_time()
 
       for _ <- 1..100 do
-        _ = RepoHandle.get(handle)
+        _ = RepoHandle.fetch!(handle)
       end
 
       us =
@@ -299,15 +337,15 @@ defmodule Exgit.RepoHandleTest do
   end
 
   describe "read performance" do
-    test "get/1 does not send a message to the handle", %{repo: repo} do
+    test "fetch!/1 does not send a message to the handle", %{repo: repo} do
       {:ok, handle} = RepoHandle.start_link(repo)
 
       # Capture the process's message queue length before and after
-      # many get/1 calls. If get/1 used GenServer.call, the handle
-      # would receive N :sys messages — but it's not the test pid's
-      # queue that grows, it's the handle's. Instead we check that
-      # get/1 returns fast even while the handle is busy in a
-      # slow update.
+      # many fetch!/1 calls. If fetch!/1 used GenServer.call, the
+      # handle would receive N :sys messages — but it's not the test
+      # pid's queue that grows, it's the handle's. Instead we check
+      # that fetch!/1 returns fast even while the handle is busy in
+      # a slow update.
       slow_update_task =
         Task.async(fn ->
           RepoHandle.update(
@@ -326,7 +364,7 @@ defmodule Exgit.RepoHandleTest do
       start = System.monotonic_time()
 
       for _ <- 1..100 do
-        _ = RepoHandle.get(handle)
+        _ = RepoHandle.fetch!(handle)
       end
 
       reads_us =
@@ -336,7 +374,7 @@ defmodule Exgit.RepoHandleTest do
       # If reads went through the GenServer they'd block behind the
       # 200ms sleep and this would be ~200ms.
       assert reads_us < 10_000,
-             "100 get/1 calls took #{reads_us}µs — likely blocked on GenServer, indicating a regression"
+             "100 fetch!/1 calls took #{reads_us}µs — likely blocked on GenServer, indicating a regression"
 
       Task.await(slow_update_task)
       RepoHandle.stop(handle)

@@ -43,6 +43,10 @@ defmodule Exgit.Telemetry do
       - `hit?: false` when it had to go to the network
       - omitted for stores that don't track this distinction
     * `[:exgit, :object_store, :put]` — `%{store, sha}`
+    * `[:exgit, :object_store, :object_size]` — `%{store, sha, hit?}`
+      - `hit?: false` covers both `{:error, :not_found}` and
+        `{:error, :not_local}` (a `Promisor` never fetches for a
+        size probe)
     * `[:exgit, :object_store, :has?]` — `%{store, sha, present?}`
     * `[:exgit, :object_store, :fetch_and_cache]` — `%{sha,
       object_count, cache_bytes}` (stop event only)

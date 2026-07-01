@@ -58,6 +58,51 @@ defmodule Exgit.Object.TreeTest do
     end
   end
 
+  describe "canonical_mode/1 with zero-padded modes" do
+    test "padded modes canonicalize to their file type, not to a blob mode" do
+      # Regression: these used to fall through to the exec-bit coercion
+      # and come back as "100644"/"100755", turning dirs into files.
+      assert Tree.canonical_mode("040000") == "40000"
+      assert Tree.canonical_mode("0120000") == "120000"
+      assert Tree.canonical_mode("0160000") == "160000"
+      assert Tree.canonical_mode("0100644") == "100644"
+      assert Tree.canonical_mode("0100755") == "100755"
+    end
+
+    test "strict mode still raises on zero-padded modes" do
+      assert_raise ArgumentError, fn -> Tree.canonical_mode("040000", true) end
+    end
+
+    test "new/1 with padded modes matches canonical modes, round-trips, stable SHA" do
+      sha = :binary.copy(<<0xAB>>, 20)
+
+      padded =
+        Tree.new([
+          {"040000", "dir", sha},
+          {"0120000", "link", sha},
+          {"0160000", "sub", sha},
+          {"0100644", "file", sha}
+        ])
+
+      canonical =
+        Tree.new([
+          {"40000", "dir", sha},
+          {"120000", "link", sha},
+          {"160000", "sub", sha},
+          {"100644", "file", sha}
+        ])
+
+      assert padded.entries == canonical.entries
+
+      encoded = padded |> Tree.encode() |> IO.iodata_to_binary()
+      assert {:ok, decoded} = Tree.decode(encoded)
+      assert decoded.entries == padded.entries
+
+      # Pinned against `git mktree --missing` fed the same four entries.
+      assert Tree.sha_hex(padded) == "93a9f977c0cdaecda57e0ec64d9a5adba8f92e1c"
+    end
+  end
+
   describe "sha/1" do
     @tag :git_cross_check
     test "matches git mktree" do

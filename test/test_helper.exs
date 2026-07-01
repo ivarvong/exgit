@@ -38,7 +38,7 @@ exclude =
   if Exgit.Test.CloudflareArtifacts.api_available?() do
     exclude
   else
-    [{:cloudflare_api, true} | exclude]
+    [{:cloudflare_api, true}, {:cloudflare_perf, true} | exclude]
   end
 
 # Live-network tiers are excluded by default; opt in via
@@ -50,6 +50,7 @@ exclude =
     {:integration, true},
     {:cloudflare, true},
     {:cloudflare_api, true},
+    {:cloudflare_perf, true},
     {:github_private, true},
     {:github_private_write, true}
     | exclude

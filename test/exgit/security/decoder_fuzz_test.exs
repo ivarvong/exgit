@@ -66,8 +66,7 @@ defmodule Exgit.Security.DecoderFuzzTest do
   describe "Blob.decode/1 never raises" do
     property "on random bytes" do
       check all(bytes <- random_bytes(), max_runs: @max_runs) do
-        result = Blob.decode(bytes)
-        assert match?({:ok, %Blob{}}, result) or match?({:error, _}, result)
+        assert {:ok, %Blob{}} = Blob.decode(bytes)
       end
     end
   end

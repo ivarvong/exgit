@@ -53,8 +53,8 @@ defmodule Exgit.Pack.Index do
     crc_size = total_objects * 4
     offset_size = total_objects * 4
 
-    <<shas::binary-size(sha_size), crcs::binary-size(crc_size), offsets::binary-size(offset_size),
-      rest::binary>> = rest
+    <<shas::binary-size(^sha_size), crcs::binary-size(^crc_size),
+      offsets::binary-size(^offset_size), rest::binary>> = rest
 
     {large_offset_table, rest} = extract_large_offsets(offsets, total_objects, rest)
 
@@ -63,7 +63,7 @@ defmodule Exgit.Pack.Index do
 
     # Verify index checksum
     idx_body_size = byte_size(data) - 20
-    <<idx_body::binary-size(idx_body_size), claimed_checksum::binary-size(20)>> = data
+    <<idx_body::binary-size(^idx_body_size), claimed_checksum::binary-size(20)>> = data
 
     if :crypto.hash(:sha, idx_body) != claimed_checksum do
       {:error, :index_checksum_mismatch}
@@ -118,8 +118,8 @@ defmodule Exgit.Pack.Index do
     crc_size = total * 4
     offset_size = total * 4
 
-    <<shas::binary-size(sha_size), crcs::binary-size(crc_size), offsets::binary-size(offset_size),
-      after_offsets::binary>> = rest
+    <<shas::binary-size(^sha_size), crcs::binary-size(^crc_size),
+      offsets::binary-size(^offset_size), after_offsets::binary>> = rest
 
     # Large-offset table comes next in the file. We keep the whole tail
     # as a subbinary; `offset_at/2` only slices into it when a lookup
@@ -237,7 +237,7 @@ defmodule Exgit.Pack.Index do
 
       large_count ->
         large_size = large_count * 8
-        <<large::binary-size(large_size), rest::binary>> = rest
+        <<large::binary-size(^large_size), rest::binary>> = rest
         {large, rest}
     end
   end

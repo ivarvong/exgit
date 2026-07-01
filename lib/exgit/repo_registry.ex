@@ -296,7 +296,13 @@ defmodule Exgit.RepoRegistry do
       Registry.unregister(@registry_name, url)
     end
 
-    {:noreply, %{state | urls: MapSet.difference(state.urls, MapSet.new(dead_urls))}}
+    # Fold with `MapSet.delete/2` rather than `MapSet.difference/2`. `state`
+    # is an untyped GenServer map, so `state.urls` reads as `any()`, which
+    # trips a MapSet opacity warning through `difference` (but not through
+    # `delete`, as the `MapSet.delete` calls elsewhere in this module show).
+    # The dead set is tiny (an exit-path cleanup), so the fold is cheap.
+    urls = Enum.reduce(dead_urls, state.urls, fn url, acc -> MapSet.delete(acc, url) end)
+    {:noreply, %{state | urls: urls}}
   end
 
   ## Internal

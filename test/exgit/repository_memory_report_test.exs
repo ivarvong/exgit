@@ -2,9 +2,10 @@ defmodule Exgit.RepositoryMemoryReportTest do
   @moduledoc """
   Tests `Exgit.Repository.memory_report/1` across the object-store
   backends we actually ship: `Memory` and `Promisor`. `Disk` and
-  user-defined stores get a degraded report (placeholders); we
-  assert that the shape is consistent across all backends so
-  callers can depend on the keys existing.
+  user-defined stores are not introspected, so their counts and
+  `:cache_bytes` are `:unknown`; we assert that the shape is
+  consistent across all backends so callers can depend on the keys
+  existing.
   """
 
   use ExUnit.Case, async: true
@@ -112,6 +113,36 @@ defmodule Exgit.RepositoryMemoryReportTest do
     end
   end
 
+  describe "on a Disk-backed repo" do
+    # Disk is not introspected: counts and cache_bytes must be
+    # :unknown, never a fake 0 that monitoring could mistake for
+    # an empty repo.
+    setup do
+      store = ObjectStore.Disk.new("/nonexistent/objects")
+      repo = Repository.new(store, Exgit.RefStore.Memory.new())
+      {:ok, repo: repo}
+    end
+
+    test "reports :unknown counts and cache_bytes", %{repo: repo} do
+      report = Repository.memory_report(repo)
+
+      assert report.object_count == :unknown
+      assert report.cache_bytes == :unknown
+      assert report.commit_count == :unknown
+      assert report.tree_count == :unknown
+      assert report.blob_count == :unknown
+      assert report.tag_count == :unknown
+    end
+
+    test "still reports backend, mode, and max_cache_bytes", %{repo: repo} do
+      report = Repository.memory_report(repo)
+
+      assert report.backend == ObjectStore.Disk
+      assert report.mode == :eager
+      assert report.max_cache_bytes == :infinity
+    end
+  end
+
   describe "shape invariants" do
     test "report always has the same keys regardless of backend" do
       # Memory-backed
@@ -127,7 +158,12 @@ defmodule Exgit.RepositoryMemoryReportTest do
 
       promisor_keys = empty_promisor |> Repository.memory_report() |> Map.keys() |> Enum.sort()
 
+      # Disk-backed (not introspected)
+      disk = Repository.new(ObjectStore.Disk.new("/nonexistent"), Exgit.RefStore.Memory.new())
+      disk_keys = disk |> Repository.memory_report() |> Map.keys() |> Enum.sort()
+
       assert memory_keys == promisor_keys
+      assert memory_keys == disk_keys
     end
   end
 end

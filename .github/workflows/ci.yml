@@ -20,13 +20,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Primary target: newest stable Elixir (1.19.x) on newest OTP (28.x).
-          # `erlef/setup-beam` resolves "1.19" to the latest 1.19.y.z that has
-          # an OTP-28 build on hex.pm. Owns the quality gates (format,
-          # credo, dialyzer, integration).
+          # Primary target: newest stable Elixir (1.20.x) on newest OTP (29.x).
+          # `erlef/setup-beam` resolves "1.20" to the latest 1.20.y.z that has
+          # an OTP-29 build. Owns the quality gates (format, credo, dialyzer,
+          # integration). Elixir 1.20 supports OTP 27-29.
+          - elixir: "1.20"
+            otp: "29"
+            primary: true
+          # Previous stable line — a compile + test smoke to catch regressions
+          # against 1.19/OTP-28. Quality gates run once, on the primary.
           - elixir: "1.19"
             otp: "28"
-            primary: true
+            primary: false
           # Minimum-supported version — matches the `elixir: "~> 1.17"`
           # constraint in mix.exs. If we ever need a 1.18+ feature,
           # bump both the constraint and this matrix entry. Compile +
@@ -159,3 +164,34 @@ jobs:
           CF_ARTIFACT_REMOTE: ${{ secrets.CF_ARTIFACT_REMOTE }}
           CF_ARTIFACT_TOKEN: ${{ secrets.CF_ARTIFACT_TOKEN }}
         run: mix test --warnings-as-errors --only cloudflare
+
+  consumer-smoke:
+    name: Consumer install smoke (package + use)
+    runs-on: ubuntu-24.04
+    # Separate from the `test` job on purpose: this builds the package
+    # exactly as it ships to Hex, depends on it from a throwaway project
+    # compiled in :prod, and uses the public API end-to-end. It catches
+    # missing `files:` entries and compile-time coupling to dev/test/
+    # optional deps — neither of which the in-repo suite can see.
+    # Live network (clones a public repo); runs on every push and PR.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir / OTP
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+          version-type: loose
+
+      - name: Install local Hex & rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Fetch dependencies
+        run: mix deps.get
+
+      - name: Consumer-install smoke (clones elixir-ai-tools/just_bash)
+        run: bash scripts/consumer_smoke.sh

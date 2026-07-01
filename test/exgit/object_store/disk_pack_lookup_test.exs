@@ -39,6 +39,26 @@ defmodule Exgit.ObjectStore.DiskPackLookupTest do
       end
     end
 
+    test "object_size/2 reports the inflated size of a packed object", %{
+      root: root,
+      store: store
+    } do
+      blobs = [Blob.new("a"), Blob.new("bb"), Blob.new("ccc")]
+      pack = Writer.build(blobs)
+
+      pack_path = Path.join(root, "objects/pack/pack-size.pack")
+      idx_path = Path.join(root, "objects/pack/pack-size.idx")
+      File.write!(pack_path, pack)
+
+      entries = pack_entries(pack, blobs)
+      pack_checksum = binary_part(pack, byte_size(pack) - 20, 20)
+      File.write!(idx_path, Index.write(entries, pack_checksum))
+
+      for blob <- blobs do
+        assert ObjectStore.object_size(store, Blob.sha(blob)) == {:ok, byte_size(blob.data)}
+      end
+    end
+
     @tag :slow
     test "repeated lookups into a single pack scale sub-linearly in pack size", %{
       root: root,
@@ -116,7 +136,7 @@ defmodule Exgit.ObjectStore.DiskPackLookupTest do
   end
 
   defp describe_entry(pack, offset, blob) do
-    <<_::binary-size(offset), from_here::binary>> = pack
+    <<_::binary-size(^offset), from_here::binary>> = pack
     {_type_code, _size, after_header} = Exgit.Pack.Common.decode_type_size_varint(from_here)
     header_len = byte_size(from_here) - byte_size(after_header)
 

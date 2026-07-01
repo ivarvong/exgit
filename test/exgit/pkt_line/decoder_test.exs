@@ -84,13 +84,13 @@ defmodule Exgit.PktLine.DecoderTest do
     end
 
     test "malformed length returns error" do
-      assert {:error, {:malformed_length, "ZZZZ"}} =
+      assert {:error, {:malformed_pkt_line, "ZZZZ"}} =
                Decoder.feed(Decoder.new(), "ZZZZpayload")
     end
 
     test "length below header size returns error" do
       # 0003 claims 3 bytes — less than the 4-byte header.
-      assert {:error, {:malformed_length, "0003"}} =
+      assert {:error, {:malformed_pkt_line, "0003"}} =
                Decoder.feed(Decoder.new(), "0003")
     end
   end
@@ -140,7 +140,7 @@ defmodule Exgit.PktLine.DecoderTest do
 
   defp chunk_and_feed(bytes, [size | rest], original, decoder, acc) do
     n = min(size, byte_size(bytes))
-    <<chunk::binary-size(n), tail::binary>> = bytes
+    <<chunk::binary-size(^n), tail::binary>> = bytes
     {:ok, decoder, pkts} = Decoder.feed(decoder, chunk)
     chunk_and_feed(tail, rest, original, decoder, Enum.reverse(pkts) ++ acc)
   end

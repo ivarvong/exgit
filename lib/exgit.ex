@@ -21,6 +21,34 @@ defmodule Exgit do
 
   alias Exgit.{Config, ObjectStore, Pack, RefStore, Repository, Transport}
 
+  @typedoc """
+  A remote endpoint for `clone/2`, `fetch/3`, and `push/3`.
+
+  Either a URL string (`"https://..."` or `"file://..."`), one of the
+  built-in transport structs (`Exgit.Transport.File`,
+  `Exgit.Transport.HTTP`), or any struct implementing the
+  `Exgit.Transport` protocol.
+  """
+  @type remote :: String.t() | Transport.File.t() | Transport.HTTP.t() | struct()
+
+  @doc """
+  Create an empty bare repository.
+
+      {:ok, repo} = Exgit.init()
+      {:ok, repo} = Exgit.init(path: "/tmp/repo.git")
+
+  ## Options
+
+    * `:path` — create the repo on disk at this path, backed by
+      `ObjectStore.Disk`/`RefStore.Disk`. Default: in-memory
+      (lost on process exit).
+
+  ## Returns
+
+  `{:ok, %Repository{}}` with `HEAD` pointing at `refs/heads/main`.
+  When `:path` is set and any directory or file write fails, returns
+  `{:error, {:init_failed, reason}}` with the underlying posix reason.
+  """
   @spec init(keyword()) :: {:ok, Repository.t()} | {:error, term()}
   def init(opts \\ []) do
     case Keyword.get(opts, :path) do
@@ -29,6 +57,22 @@ defmodule Exgit do
     end
   end
 
+  @doc """
+  Open an existing on-disk repository.
+
+      {:ok, repo} = Exgit.open("/tmp/repo.git")
+
+  `path` must point at a git directory — a bare repo or a `.git`
+  directory — containing a `HEAD` file and an `objects` directory.
+  The repo's `config` file is read when present; a missing or
+  unparseable config falls back to an empty `Exgit.Config`.
+
+  ## Returns
+
+  `{:ok, %Repository{}}` backed by `ObjectStore.Disk`/`RefStore.Disk`,
+  or `{:error, {:not_a_repository, reason}}` when the path doesn't
+  look like a git directory.
+  """
   @spec open(Path.t(), keyword()) :: {:ok, Repository.t()} | {:error, term()}
   def open(path, _opts \\ []) do
     head_path = Path.join(path, "HEAD")
@@ -114,8 +158,7 @@ defmodule Exgit do
   `Exgit.Repository.materialize/2` to convert `:lazy` → `:eager`
   after reading what you need.
   """
-  @spec clone(String.t() | Transport.File.t() | Transport.HTTP.t(), keyword()) ::
-          {:ok, Repository.t()} | {:error, term()}
+  @spec clone(remote(), keyword()) :: {:ok, Repository.t()} | {:error, term()}
   def clone(source, opts \\ []) do
     cond do
       disk_partial_clone?(opts) ->
@@ -239,7 +282,6 @@ defmodule Exgit do
 
       spec ->
         case Exgit.Filter.encode(spec) do
-          :none -> {:ok, :none}
           {:ok, wire} -> {:ok, wire}
           {:error, _} = err -> err
         end
@@ -314,7 +356,30 @@ defmodule Exgit do
     end
   end
 
-  @spec fetch(Repository.t(), String.t() | term(), keyword()) ::
+  @doc """
+  Fetch updates from a remote into an existing repository.
+
+      {:ok, repo} = Exgit.fetch(repo, "https://github.com/user/repo")
+
+  Lists the remote's refs, fetches any objects reachable from them,
+  and records remote-tracking refs under `refs/remotes/<remote>/`
+  (for branches) and `refs/tags/` (for tags). Local branches and
+  `HEAD` are never moved.
+
+  ## Options
+
+    * `:remote` — remote name to record tracking refs under.
+      Default: `"origin"`.
+
+    * `:prefix` — ref prefixes to list on the remote.
+      Default: `["refs/heads/", "refs/tags/"]`.
+
+  ## Returns
+
+  `{:ok, %Repository{}}` with the updated object and ref stores, or
+  `{:error, reason}` when listing refs or fetching the pack fails.
+  """
+  @spec fetch(Repository.t(), remote(), keyword()) ::
           {:ok, Repository.t()} | {:error, term()}
   def fetch(%Repository{} = repo, source, opts \\ []) do
     transport = to_transport(source, opts)
@@ -335,23 +400,57 @@ defmodule Exgit do
       ref to the same name on the remote (creating it if absent).
     * `{:delete, "refs/heads/branch"}` — delete the ref on the remote.
 
+  When `:refspecs` is omitted, the repo's current branch — `HEAD`'s
+  symref target — is pushed. If `HEAD` is not a symbolic ref (e.g.
+  detached or unset), the push fails with `{:error, :no_refspecs}`.
+
+  ## Errors
+
+    * `{:error, :no_refspecs}` — `:refspecs` omitted and `HEAD`
+      doesn't point at a branch.
+    * `{:error, {:local_ref_not_found, name}}` — a named refspec
+      doesn't resolve in the local ref store. The whole push fails;
+      nothing is sent to the remote. (Deleting a ref the remote
+      doesn't have remains a silent no-op.)
+
   Returns `{:ok, %{ref_results: [...]}}` on success.
   """
-  @spec push(Repository.t(), String.t() | term(), keyword()) ::
+  @spec push(Repository.t(), remote(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def push(%Repository{} = repo, dest, opts \\ []) do
     transport = to_transport(dest, opts)
-    refspecs = Keyword.get(opts, :refspecs, ["refs/heads/main"])
 
-    ref_names = Enum.map(refspecs, &refspec_ref_name/1)
-    remote_refs = load_remote_refs_for_push(transport, ref_names)
-    {updates, objects} = plan_push_updates(refspecs, repo, remote_refs)
+    with {:ok, refspecs} <- push_refspecs(repo, opts) do
+      ref_names = Enum.map(refspecs, &refspec_ref_name/1)
+      remote_refs = load_remote_refs_for_push(transport, ref_names)
 
-    if updates == [] do
-      {:ok, %{ref_results: []}}
-    else
-      pack = build_push_pack(updates, objects)
-      Transport.push(transport, Enum.reverse(updates), pack, [])
+      case plan_push_updates(refspecs, repo, remote_refs) do
+        {:ok, [], _objects} ->
+          {:ok, %{ref_results: []}}
+
+        {:ok, updates, objects} ->
+          pack = build_push_pack(updates, objects)
+          Transport.push(transport, Enum.reverse(updates), pack, [])
+
+        {:error, _} = err ->
+          err
+      end
+    end
+  end
+
+  # When the caller doesn't name refspecs, push the current branch —
+  # HEAD's symref target. A detached or unset HEAD leaves nothing
+  # sensible to push, so the caller must name refspecs explicitly.
+  defp push_refspecs(repo, opts) do
+    case Keyword.fetch(opts, :refspecs) do
+      {:ok, refspecs} ->
+        {:ok, refspecs}
+
+      :error ->
+        case RefStore.read(repo.ref_store, "HEAD") do
+          {:ok, {:symbolic, ref_name}} -> {:ok, [ref_name]}
+          _ -> {:error, :no_refspecs}
+        end
     end
   end
 
@@ -366,7 +465,7 @@ defmodule Exgit do
   end
 
   defp plan_push_updates(refspecs, repo, remote_refs) do
-    Enum.reduce(refspecs, {[], []}, fn refspec, {upd, objs} ->
+    Enum.reduce_while(refspecs, {:ok, [], []}, fn refspec, {:ok, upd, objs} ->
       case plan_push(refspec, repo, remote_refs) do
         {:update, ref_name, old_sha, new_sha, sha_for_objects} ->
           new_objs =
@@ -374,10 +473,13 @@ defmodule Exgit do
               do: collect_push_objects(repo.object_store, sha_for_objects, remote_refs),
               else: []
 
-          {[{ref_name, old_sha, new_sha} | upd], objs ++ new_objs}
+          {:cont, {:ok, [{ref_name, old_sha, new_sha} | upd], objs ++ new_objs}}
 
         :skip ->
-          {upd, objs}
+          {:cont, {:ok, upd, objs}}
+
+        {:error, _} = err ->
+          {:halt, err}
       end
     end)
   end
@@ -421,7 +523,7 @@ defmodule Exgit do
         {:update, ref_name, old_sha, sha, sha}
 
       _ ->
-        :skip
+        {:error, {:local_ref_not_found, ref_name}}
     end
   end
 
@@ -431,7 +533,7 @@ defmodule Exgit do
   # URL string that we can map to the built-in File/HTTP transports.
   defp to_transport(url, opts) when is_binary(url) do
     if String.starts_with?(url, "file://") do
-      path = String.trim_leading(url, "file://")
+      path = String.replace_prefix(url, "file://", "")
       Transport.File.new(path)
     else
       Transport.HTTP.new(url, opts)
@@ -461,6 +563,8 @@ defmodule Exgit do
          config: config,
          path: path
        )}
+    else
+      {:error, reason} -> {:error, {:init_failed, reason}}
     end
   end
 
@@ -519,7 +623,7 @@ defmodule Exgit do
           remote_ref =
             cond do
               String.starts_with?(ref, "refs/heads/") ->
-                branch = String.trim_leading(ref, "refs/heads/")
+                branch = String.replace_prefix(ref, "refs/heads/", "")
                 "refs/remotes/#{remote_name}/#{branch}"
 
               String.starts_with?(ref, "refs/tags/") ->
@@ -585,7 +689,7 @@ defmodule Exgit do
   end
 
   defp collect_push_objects(store, sha, remote_refs) do
-    remote_shas = MapSet.new(Map.values(remote_refs))
+    remote_shas = Map.new(Map.values(remote_refs), &{&1, true})
     collect_reachable(store, [sha], remote_shas)
   end
 
@@ -593,17 +697,28 @@ defmodule Exgit do
   # `seen` accumulator so shared subtrees are visited exactly once, and
   # is bounded by O(heap) rather than O(stack) so it handles deep
   # histories (millions of commits) without stack overflow.
+  # `seen` is a plain map used as a membership set (`sha => true`) rather
+  # than a `MapSet`. MapSet is an opaque type, and threading it through this
+  # self-recursive accumulator — whose base clause binds `_seen` as a
+  # wildcard — trips a Dialyzer opacity false-positive. A plain map is
+  # semantically identical here (set of seen shas), not opaque, and a touch
+  # faster.
+  @typep seen_set :: %{optional(binary()) => true}
+
+  @spec collect_reachable(ObjectStore.t(), [binary()], seen_set()) :: [Exgit.Object.t()]
   defp collect_reachable(store, initial_shas, seen) do
     do_collect_reachable(store, initial_shas, seen, [])
   end
 
+  @spec do_collect_reachable(ObjectStore.t(), [binary()], seen_set(), [Exgit.Object.t()]) ::
+          [Exgit.Object.t()]
   defp do_collect_reachable(_store, [], _seen, acc), do: Enum.reverse(acc)
 
   defp do_collect_reachable(store, [sha | rest], seen, acc) do
-    if MapSet.member?(seen, sha) do
+    if Map.has_key?(seen, sha) do
       do_collect_reachable(store, rest, seen, acc)
     else
-      seen = MapSet.put(seen, sha)
+      seen = Map.put(seen, sha, true)
 
       case ObjectStore.get(store, sha) do
         {:ok, obj} ->

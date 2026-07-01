@@ -80,7 +80,7 @@ defmodule Exgit.Object.TreeRoundtripTest do
 
       # Strip the "tree <size>\0" header.
       {pos, 1} = :binary.match(inflated, <<0>>)
-      <<_header::binary-size(pos), 0, content::binary>> = inflated
+      <<_header::binary-size(^pos), 0, content::binary>> = inflated
 
       {:ok, tree} = Exgit.Object.Tree.decode(content)
       assert IO.iodata_to_binary(Exgit.Object.Tree.encode(tree)) == content

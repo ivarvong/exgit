@@ -144,7 +144,7 @@ defmodule Exgit.ObjectStore.DiskPreadTest do
   end
 
   defp describe_entry(pack, offset, blob) do
-    <<_::binary-size(offset), from_here::binary>> = pack
+    <<_::binary-size(^offset), from_here::binary>> = pack
     {_type_code, _size, after_header} = Exgit.Pack.Common.decode_type_size_varint(from_here)
     header_len = byte_size(from_here) - byte_size(after_header)
 

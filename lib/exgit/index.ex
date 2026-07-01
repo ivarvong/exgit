@@ -127,7 +127,7 @@ defmodule Exgit.Index do
   # remote-controlled.
   defp valid_checksum?(data) when byte_size(data) >= 20 do
     content_size = byte_size(data) - 20
-    <<content::binary-size(content_size), checksum::binary-size(20)>> = data
+    <<content::binary-size(^content_size), checksum::binary-size(20)>> = data
     :crypto.hash(:sha, content) == checksum
   end
 
@@ -193,7 +193,7 @@ defmodule Exgit.Index do
   # the real length is unknown and we must read until the next NUL.
   defp read_name(data, len) when len < 0xFFF do
     case data do
-      <<name::binary-size(len), 0, rest::binary>> -> {:ok, name, rest}
+      <<name::binary-size(^len), 0, rest::binary>> -> {:ok, name, rest}
       _ -> {:error, :truncated_name}
     end
   end
@@ -222,7 +222,7 @@ defmodule Exgit.Index do
     _ = pad
 
     if byte_size(data) >= pad_remaining do
-      <<_::binary-size(pad_remaining), rest::binary>> = data
+      <<_::binary-size(^pad_remaining), rest::binary>> = data
       {:ok, rest}
     else
       {:error, :truncated_padding}

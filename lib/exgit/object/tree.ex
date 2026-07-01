@@ -9,10 +9,10 @@ defmodule Exgit.Object.Tree do
   tree's SHA and corrupt verification.
 
   `new/1` applies git's canonical ordering (dirs sort as if they had a
-  trailing `/`) and — by default — normalizes regular file modes via
-  `canonical_mode/1`. Pass `strict: true` to error on unknown modes
-  instead of silently coercing, or build the struct directly for a
-  raw, unvalidated tree.
+  trailing `/`) and — by default — normalizes modes via
+  `canonical_mode/1`. Pass `strict: true` to raise on non-canonical
+  modes instead of silently coercing, or build the struct directly for
+  a raw, unvalidated tree.
 
   > #### Round-trip note {: .warning}
   >
@@ -44,10 +44,14 @@ defmodule Exgit.Object.Tree do
 
   Options:
 
-    * `:strict` — when `true`, reject unknown modes with a
-      `:invalid_mode` error. Default: `false` (unknown modes are
-      silently coerced to `100644` / `100755` based on the executable
-      bit).
+    * `:strict` — when `true`, raise `ArgumentError` on any mode that
+      is not one of the five canonical git modes (`40000`, `100644`,
+      `100755`, `120000`, `160000`). Default: `false`, which
+      canonicalizes via `canonical_mode/1`: zero-padded modes normalize
+      to their canonical form (`"040000"` → `"40000"`, `"0120000"` →
+      `"120000"`), other octal modes coerce to `100644` / `100755`
+      based on the executable bit, and non-octal strings pass through
+      unchanged.
   """
   @spec new([entry()], keyword()) :: t()
   def new(entries, opts \\ []) when is_list(entries) do
@@ -68,10 +72,14 @@ defmodule Exgit.Object.Tree do
   end
 
   @doc """
-  Normalize a file mode to one of the canonical git file modes. Used by
-  `new/1` but NOT by `decode/1`. Unknown modes are returned unchanged
-  by the one-arg form; the two-arg form with `strict: true` raises
-  on unknown input.
+  Normalize a mode string to the canonical git spelling. Used by `new/1`
+  but NOT by `decode/1`. Octal modes canonicalize by their file-type
+  bits: directories (`"040000"` → `"40000"`), symlinks (`"0120000"` →
+  `"120000"`) and gitlinks (`"0160000"` → `"160000"`) keep their type;
+  everything else coerces to `100644` / `100755` based on the
+  executable bit. Non-octal strings are returned unchanged by the
+  one-arg form; the two-arg form with `strict: true` raises
+  `ArgumentError` on any non-canonical input.
   """
   @spec canonical_mode(String.t()) :: String.t()
   def canonical_mode(mode), do: canonical_mode(mode, false)
@@ -87,7 +95,7 @@ defmodule Exgit.Object.Tree do
     # Parse as octal (git modes are always octal strings).
     case Integer.parse(mode, 8) do
       {n, ""} when not strict ->
-        if band(n, 0o111) != 0, do: "100755", else: "100644"
+        canonicalize_octal(n)
 
       {_n, ""} when strict ->
         raise ArgumentError, "invalid git tree mode: #{inspect(mode)}"
@@ -97,6 +105,18 @@ defmodule Exgit.Object.Tree do
 
       _ ->
         mode
+    end
+  end
+
+  # Canonicalize by the file-type bits (upper 4 octal digits of a
+  # 16-bit st_mode). A zero-padded "040000" must stay a directory —
+  # coercing it to a blob mode would silently corrupt the tree.
+  defp canonicalize_octal(n) do
+    case band(n, 0o170000) do
+      0o040000 -> "40000"
+      0o120000 -> "120000"
+      0o160000 -> "160000"
+      _ -> if band(n, 0o111) != 0, do: "100755", else: "100644"
     end
   end
 
@@ -180,7 +200,7 @@ defmodule Exgit.Object.Tree do
   defp take_until(data, byte) do
     case :binary.match(data, <<byte>>) do
       {pos, 1} ->
-        <<before::binary-size(pos), _::8, rest::binary>> = data
+        <<before::binary-size(^pos), _::8, rest::binary>> = data
         {:ok, before, rest}
 
       :nomatch ->
