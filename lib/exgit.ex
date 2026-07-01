@@ -239,7 +239,6 @@ defmodule Exgit do
 
       spec ->
         case Exgit.Filter.encode(spec) do
-          :none -> {:ok, :none}
           {:ok, wire} -> {:ok, wire}
           {:error, _} = err -> err
         end
@@ -585,7 +584,7 @@ defmodule Exgit do
   end
 
   defp collect_push_objects(store, sha, remote_refs) do
-    remote_shas = MapSet.new(Map.values(remote_refs))
+    remote_shas = Map.new(Map.values(remote_refs), &{&1, true})
     collect_reachable(store, [sha], remote_shas)
   end
 
@@ -593,17 +592,28 @@ defmodule Exgit do
   # `seen` accumulator so shared subtrees are visited exactly once, and
   # is bounded by O(heap) rather than O(stack) so it handles deep
   # histories (millions of commits) without stack overflow.
+  # `seen` is a plain map used as a membership set (`sha => true`) rather
+  # than a `MapSet`. MapSet is an opaque type, and threading it through this
+  # self-recursive accumulator — whose base clause binds `_seen` as a
+  # wildcard — trips a Dialyzer opacity false-positive. A plain map is
+  # semantically identical here (set of seen shas), not opaque, and a touch
+  # faster.
+  @typep seen_set :: %{optional(binary()) => true}
+
+  @spec collect_reachable(ObjectStore.t(), [binary()], seen_set()) :: [Exgit.Object.t()]
   defp collect_reachable(store, initial_shas, seen) do
     do_collect_reachable(store, initial_shas, seen, [])
   end
 
+  @spec do_collect_reachable(ObjectStore.t(), [binary()], seen_set(), [Exgit.Object.t()]) ::
+          [Exgit.Object.t()]
   defp do_collect_reachable(_store, [], _seen, acc), do: Enum.reverse(acc)
 
   defp do_collect_reachable(store, [sha | rest], seen, acc) do
-    if MapSet.member?(seen, sha) do
+    if Map.has_key?(seen, sha) do
       do_collect_reachable(store, rest, seen, acc)
     else
-      seen = MapSet.put(seen, sha)
+      seen = Map.put(seen, sha, true)
 
       case ObjectStore.get(store, sha) do
         {:ok, obj} ->
