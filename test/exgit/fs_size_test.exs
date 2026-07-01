@@ -93,7 +93,19 @@ defmodule Exgit.FsSizeTest do
       src_tree = Tree.new([{"40000", "deep", nested_tree_sha}])
       {:ok, src_sha, store} = ObjectStore.put(store, src_tree)
 
-      root = Tree.new([{"100644", "README.md", readme_sha}, {"40000", "src", src_sha}])
+      # Gitlink (submodule) entry: the SHA names a commit in the
+      # submodule's OWN repository, so it is never present in this
+      # object store — exactly the situation size/3 must not treat
+      # as a missing local object.
+      submodule_commit_sha = :crypto.strong_rand_bytes(20)
+
+      root =
+        Tree.new([
+          {"100644", "README.md", readme_sha},
+          {"160000", "vendored", submodule_commit_sha},
+          {"40000", "src", src_sha}
+        ])
+
       {:ok, root_sha, store} = ObjectStore.put(store, root)
 
       commit =
@@ -135,6 +147,23 @@ defmodule Exgit.FsSizeTest do
 
     test "rejects directories with :not_a_blob", %{repo: repo} do
       assert FS.size(repo, "HEAD", "src") == {:error, :not_a_blob}
+    end
+
+    test "returns :submodule for a gitlink entry instead of a doomed lookup", %{repo: repo} do
+      # Before the short-circuit, this fell through to an
+      # object_size lookup of the submodule's commit SHA and
+      # surfaced a misleading :not_found / :not_local.
+      assert FS.size(repo, "HEAD", "vendored") == {:error, :submodule}
+    end
+
+    test "read_path and stat agree on gitlink handling", %{repo: repo} do
+      # read_path must fail the same way as size/3 — before any
+      # object lookup of the submodule's commit SHA...
+      assert FS.read_path(repo, "HEAD", "vendored") == {:error, :submodule}
+
+      # ...while stat reports the entry without fetching anything.
+      assert {:ok, %{type: :submodule, mode: "160000", size: nil}, %Repository{}} =
+               FS.stat(repo, "HEAD", "vendored")
     end
 
     test "returns :not_found for a missing path", %{repo: repo} do

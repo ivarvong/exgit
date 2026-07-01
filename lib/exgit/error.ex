@@ -20,7 +20,8 @@ defmodule Exgit.Error do
   Well-known codes:
 
     * `:not_found` — object, ref, or path missing.
-    * `:invalid_ref_name` — ref name failed `Exgit.RefName.valid?/1`.
+    * `:invalid_ref_name` — ref name failed `Exgit.RefName.valid?/1`
+      (defensive validation of ref names, including wire input).
     * `:invalid_hex_header` — a commit/tag header expected 40-char
       hex and got something else.
     * `:malformed_tree_entry` — tree decode failed structurally.
@@ -30,7 +31,6 @@ defmodule Exgit.Error do
     * `:zlib_error` — zlib decompression failed on untrusted input.
     * `:resolved_too_large`, `:object_too_large`, `:pack_too_large` —
       pack parser resource-limit trip.
-    * `:invalid_ref_name` — defensive ref name validation tripped.
     * `:http_error` — non-2xx response from a transport.
     * `:compare_and_swap_failed` — ref store CAS check failed.
 

@@ -144,7 +144,7 @@ defmodule Exgit.Workspace do
   end
 
   @doc """
-  Stat the entry at `path`. Returns `%{type: :blob | :tree, mode:, size:}`.
+  Stat the entry at `path`. Returns `%{type: :blob | :tree | :submodule, mode:, size:}`.
   """
   @spec stat(t(), String.t()) :: {:ok, FS.stat(), t()} | {:error, term()}
   def stat(%__MODULE__{} = ws, path) do

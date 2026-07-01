@@ -40,7 +40,7 @@ defmodule Exgit.RepoHandle do
   reason — normal stop, crash, `Process.exit/2`, supervisor
   shutdown — the table is automatically destroyed by the BEAM.
   Callers holding a dead handle get `{:error, :dead_handle}` from
-  `get/1`.
+  `fetch/1`.
 
   Clients that want the handle to outlive a supervision tree are
   responsible for wiring it into the right supervisor themselves.
@@ -53,17 +53,17 @@ defmodule Exgit.RepoHandle do
       {:ok, task} = Exgit.FS.prefetch_async(handle)
 
       # Meanwhile, foreground reads work against the current snapshot.
-      repo_snapshot = Exgit.RepoHandle.get(handle)
+      repo_snapshot = Exgit.RepoHandle.fetch!(handle)
       Exgit.FS.grep(repo_snapshot, "HEAD", "auth", max_count: 10)
 
       # Wait for prefetch to finish, then do a full-repo search.
       :ok = Exgit.FS.await_prefetch(task)
-      fresh_snapshot = Exgit.RepoHandle.get(handle)
+      fresh_snapshot = Exgit.RepoHandle.fetch!(handle)
       Exgit.FS.grep(fresh_snapshot, "HEAD", "auth") |> Enum.to_list()
 
-  ## Why ETS and not `Agent.get/1`
+  ## Why ETS and not `Agent.get/2`
 
-  `Agent.get/1` still sends a message to the agent process and
+  `Agent.get/2` still sends a message to the agent process and
   copies the state back. For a `Repository` with a large Promisor
   cache that copy would be 10-100 MB per read — unacceptable for
   a LiveView that reads on every keystroke.
@@ -111,25 +111,8 @@ defmodule Exgit.RepoHandle do
   copy of the repo into this process's mailbox. Safe to call on
   every hot-loop iteration.
 
-  Raises `ArgumentError` if the handle is dead or if the table
-  doesn't exist. Callers that want to tolerate dead handles
-  should wrap in `try/rescue` or use `fetch/1`.
-  """
-  @spec get(t()) :: Repository.t()
-  def get(handle) do
-    case fetch(handle) do
-      {:ok, repo} ->
-        repo
-
-      {:error, reason} ->
-        raise ArgumentError,
-              "Exgit.RepoHandle.get/1: #{inspect(reason)} for handle #{inspect(handle)}"
-    end
-  end
-
-  @doc """
-  Non-raising variant of `get/1`. Returns `{:ok, repo}` on success
-  or `{:error, :dead_handle}` / `{:error, :no_table}`.
+  Returns `{:ok, repo}` on success or `{:error, :dead_handle}` /
+  `{:error, :no_table}`. See `fetch!/1` for a raising variant.
   """
   @spec fetch(t()) :: {:ok, Repository.t()} | {:error, :dead_handle | :no_table}
   def fetch(handle) do
@@ -145,6 +128,24 @@ defmodule Exgit.RepoHandle do
     end
   rescue
     ArgumentError -> {:error, :no_table}
+  end
+
+  @doc """
+  Same as `fetch/1`, but returns the repo directly and raises
+  `ArgumentError` if the handle is dead or if the table doesn't
+  exist. Callers that want to tolerate dead handles should use
+  `fetch/1`.
+  """
+  @spec fetch!(t()) :: Repository.t()
+  def fetch!(handle) do
+    case fetch(handle) do
+      {:ok, repo} ->
+        repo
+
+      {:error, reason} ->
+        raise ArgumentError,
+              "Exgit.RepoHandle.fetch!/1: #{inspect(reason)} for handle #{inspect(handle)}"
+    end
   end
 
   @doc """
@@ -192,7 +193,7 @@ defmodule Exgit.RepoHandle do
   Without dedup, each caller fires its own identical network call
   — wasteful.
 
-  With `fetch_once/3`:
+  With `fetch_once/4`:
 
     * First caller for `key` runs `fetch_fn(current_repo)` OUTSIDE
       the handle (in a linked Task) so the handle stays responsive
@@ -218,9 +219,16 @@ defmodule Exgit.RepoHandle do
   ## Errors
 
   `{:error, :dead_handle}` if the handle isn't running. Propagates
-  `fetch_fn`'s errors verbatim.
+  `fetch_fn`'s errors verbatim. If `fetch_fn` raises, throws, or
+  exits — or the fetch task is killed — all waiters receive
+  `{:error, {:fetch_crashed, reason}}`.
   """
-  @spec fetch_once(t(), term(), (Repository.t() -> {:ok, Repository.t()} | {:error, term()})) ::
+  @spec fetch_once(
+          t(),
+          term(),
+          (Repository.t() -> {:ok, Repository.t()} | {:error, term()}),
+          timeout()
+        ) ::
           {:ok, Repository.t()} | {:error, term()}
   def fetch_once(handle, key, fetch_fn, timeout \\ 300_000) when is_function(fetch_fn, 1) do
     GenServer.call(handle, {:fetch_once, key, fetch_fn}, timeout)
@@ -261,10 +269,11 @@ defmodule Exgit.RepoHandle do
 
     true = :ets.insert(table, {:repo, repo})
 
-    # `in_flight`: %{key => %{task_ref: ref, waiters: [from, ...]}}
+    # `in_flight`: %{key => %{monitor_ref: ref, waiters: [from, ...]}}
     # Entries are created when the first fetch_once for a key
-    # arrives; removed when the task completes and all waiters
-    # have been replied to.
+    # arrives; removed when the task completes (or dies — the
+    # monitor guarantees waiters are always replied to) and all
+    # waiters have been replied to.
     {:ok, %{table: table, in_flight: %{}}}
   end
 
@@ -302,16 +311,27 @@ defmodule Exgit.RepoHandle do
         # updates. We'll reply to `from` (and any waiters that
         # register before the task finishes) when it completes.
         handle_pid = self()
+        table = state.table
 
-        _ =
+        start_result =
           Task.Supervisor.start_child(Exgit.TaskSupervisor, fn ->
-            [{:repo, repo}] = :ets.lookup(state.table, :repo)
+            [{:repo, repo}] = :ets.lookup(table, :repo)
             result = safe_fetch(fetch_fn, repo)
             send(handle_pid, {:fetch_once_done, key, result})
           end)
 
-        entry = %{waiters: [from]}
-        {:noreply, %{state | in_flight: Map.put(state.in_flight, key, entry)}}
+        case start_result do
+          {:ok, pid} ->
+            # Monitor the task so waiters get a reply even if it
+            # dies without sending :fetch_once_done (e.g. a brutal
+            # kill that safe_fetch can't catch).
+            monitor_ref = Process.monitor(pid)
+            entry = %{monitor_ref: monitor_ref, waiters: [from]}
+            {:noreply, %{state | in_flight: Map.put(state.in_flight, key, entry)}}
+
+          other ->
+            {:reply, {:error, {:fetch_task_start_failed, other}}, state}
+        end
 
       %{waiters: waiters} = entry ->
         # Already in-flight for this key. Add to waiters.
@@ -328,7 +348,11 @@ defmodule Exgit.RepoHandle do
         # ourselves somehow. Log and continue.
         {:noreply, state}
 
-      {%{waiters: waiters}, remaining} ->
+      {%{monitor_ref: monitor_ref, waiters: waiters}, remaining} ->
+        # The task sent its result before exiting, so the pending
+        # :DOWN (if any) is stale — flush it.
+        Process.demonitor(monitor_ref, [:flush])
+
         # Commit the result to ETS if it succeeded, then reply to
         # all waiters with the same return value.
         reply_value =
@@ -349,10 +373,29 @@ defmodule Exgit.RepoHandle do
     end
   end
 
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    # A fetch task died without sending :fetch_once_done (a brutal
+    # kill — anything catchable is turned into an error tuple by
+    # safe_fetch). Reply to all waiters so nobody hangs until the
+    # call timeout, and clear the entry so the next fetch_once for
+    # this key re-runs the fetch.
+    case Enum.find(state.in_flight, fn {_key, entry} -> entry.monitor_ref == ref end) do
+      nil ->
+        {:noreply, state}
+
+      {key, %{waiters: waiters}} ->
+        for from <- Enum.reverse(waiters) do
+          GenServer.reply(from, {:error, {:fetch_crashed, reason}})
+        end
+
+        {:noreply, %{state | in_flight: Map.delete(state.in_flight, key)}}
+    end
+  end
+
   defp safe_fetch(fun, repo) do
     fun.(repo)
-  rescue
-    e -> {:error, {:fetch_fn_raised, e, __STACKTRACE__}}
+  catch
+    kind, reason -> {:error, {:fetch_crashed, {kind, reason, __STACKTRACE__}}}
   end
 
   @impl true

@@ -15,10 +15,12 @@ defmodule Exgit.LFS do
   text, not the file contents — a silent correctness cliff if the
   agent doesn't know to check.
 
-  `Exgit.FS.read_path/4` with `resolve_lfs_pointers: true` uses
+  `Exgit.FS.read_path/4` with `detect_lfs_pointers: true` uses
   `parse/1` here to surface detected pointers as a structured
   `{:lfs_pointer, info}` tuple instead of returning the pointer
-  text as if it were content.
+  text as if it were content. Detection is the whole story —
+  fetching the pointed-to content from the LFS server is left to
+  the caller.
 
   ## Strictness
 

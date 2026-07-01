@@ -161,7 +161,7 @@ defmodule Exgit.RepoRegistryTest do
       assert {:ok, ^handle} = RepoRegistry.lookup(url)
 
       # Can fetch through the handle.
-      assert %Exgit.Repository{} = RepoHandle.get(handle)
+      assert %Exgit.Repository{} = RepoHandle.fetch!(handle)
 
       RepoHandle.stop(handle)
     end

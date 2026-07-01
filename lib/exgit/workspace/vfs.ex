@@ -64,6 +64,11 @@ if Code.ensure_loaded?(VFS.Mountable) do
         {:ok, %{type: :tree}, ws} ->
           {:ok, %Stat{type: :directory, size: 0, mtime: @epoch}, ws}
 
+        # A submodule materializes as an (empty) directory, matching
+        # how `git checkout` presents gitlink entries.
+        {:ok, %{type: :submodule}, ws} ->
+          {:ok, %Stat{type: :directory, size: 0, mtime: @epoch}, ws}
+
         {:error, reason} ->
           {:error, error_for(reason, path)}
       end

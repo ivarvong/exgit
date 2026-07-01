@@ -61,10 +61,10 @@ defmodule Exgit.FSPrefetchAsyncTest do
     end
 
     test "handle is updated after task completes", %{handle: handle} do
-      before = RepoHandle.get(handle)
+      before = RepoHandle.fetch!(handle)
       {:ok, task} = FS.prefetch_async(handle)
       {:ok, :prefetched} = FS.await_prefetch(task)
-      after_ = RepoHandle.get(handle)
+      after_ = RepoHandle.fetch!(handle)
 
       # For Memory-backed store, the update is a no-op but the
       # call still runs (which is what we're testing — the task
@@ -81,7 +81,7 @@ defmodule Exgit.FSPrefetchAsyncTest do
 
       # 100 reads while the task is (was) running.
       for _ <- 1..100 do
-        assert %Repository{} = RepoHandle.get(handle)
+        assert %Repository{} = RepoHandle.fetch!(handle)
       end
 
       {:ok, :prefetched} = FS.await_prefetch(task)
