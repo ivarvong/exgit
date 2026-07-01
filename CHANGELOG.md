@@ -5,7 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-07-01
+
+Initial release: pure-Elixir git client for clone, fetch, push over
+smart HTTP v2, with lazy partial-clone support and a path-oriented FS
+API for agents.
+
+See [README](./README.md) and [BENCHMARKS on the smoketest
+repo](https://github.com/ivarvong/exgit_smoketest/blob/main/BENCHMARKS.md).
 
 ### Security — credential redaction + ref bounds
 
@@ -18,10 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:auth` field regardless — it was already redacted.
 - **`ls-refs` responses are capped at 1,000,000 refs.** A hostile or
   broken server can no longer stream unbounded refs into client
-  memory; the transport stream halts once the cap trips. Real repos
-  (linux, esp-idf) sit far below this.
+  memory; the transport stream halts once the cap trips and the
+  caller gets `{:error, {:too_many_refs, cap}}`. Tunable via the
+  `:max_refs` option on `Exgit.Transport.HTTP.new/2`. Real repos
+  (linux, esp-idf) sit far below the default.
 - **Dependencies bumped to clear HTTP-stack advisories.** `req`
-  `0.5.17 → 0.6.2` and `mint `1.7.1 → 1.9.0` resolve the decompression-
+  `0.5.17 → 0.6.2` and `mint` `1.7.1 → 1.9.0` resolve the decompression-
   bomb DoS (CVE-2026-49755), multipart header injection
   (CVE-2026-49756), and HTTP/2 CONTINUATION flood (CVE-2026-49754).
   The cross-origin credential-leak test suite was re-run against the
@@ -47,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the header. Resolving the path may fetch trees (small) on a lazy
   clone, but never the blob — an un-fetched blob returns
   `{:error, :not_local}` instead of triggering a possibly-multi-GB
-  fetch. Directories return `{:error, :not_a_blob}`.
+  fetch. Directories return `{:error, :not_a_blob}`; gitlink
+  (submodule) entries return `{:error, :submodule}` — as do
+  `read_path/4` lookups on them, while `stat/3` reports
+  `%{type: :submodule}` without fetching.
 - **`Exgit.ObjectStore.object_size/2`** — new protocol callback
   backing the above. Memory keeps a parallel `sha => size` index
   (no extra decompression); `Promisor` answers from cache or
@@ -64,7 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Exgit.Repository.memory_report/1`** — structured memory
   report (object counts by type, cache_bytes, max_cache_bytes,
   mode, backend) with consistent shape across all object-store
-  backends. Suitable for emission into observability stacks.
+  backends; counts report `:unknown` for backends that can't be
+  introspected (Disk). Suitable for emission into observability
+  stacks.
 - **`bench/agent_workload.exs`** — realistic agent-session
   benchmark: clone + prefetch + ls + grep + reads, with `:cold`
   and `:hot` variants. Reports per-op breakdown + peak cache
@@ -438,11 +452,3 @@ taking the opportunity to land the right shapes before v0.1.
   corrupt or tampered objects return tagged errors instead of
   crashing.
 
-## [0.1.0] — 2026-04-17
-
-Initial release: pure-Elixir git client for clone, fetch, push over
-smart HTTP v2, with lazy partial-clone support and a path-oriented FS
-API for agents.
-
-See [README](./README.md) and [BENCHMARKS on the smoketest
-repo](https://github.com/ivarvong/exgit_smoketest/blob/main/BENCHMARKS.md).

@@ -9,10 +9,10 @@ defmodule Exgit.MixProject do
       app: :exgit,
       version: @version,
       elixir: "~> 1.17",
-      # The library doesn't use any 1.19-only features; pinning the
+      # The library doesn't use any post-1.17 features; pinning the
       # lower bound at 1.17 keeps it installable for older consumers.
-      # CI matrix tests both 1.17 (minimum-supported) and 1.19
-      # (primary + stricter type checks).
+      # CI matrix tests 1.20/OTP 29 (primary, all quality gates),
+      # 1.19/OTP 28, and 1.17/OTP 27 (minimum-supported).
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -61,7 +61,7 @@ defmodule Exgit.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md", "SECURITY.md"],
+      extras: ["README.md", "CHANGELOG.md", "SECURITY.md", "docs/PERFORMANCE.md"],
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]
