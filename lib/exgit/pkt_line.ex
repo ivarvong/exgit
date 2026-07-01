@@ -55,7 +55,7 @@ defmodule Exgit.PktLine do
         with {len, ""} <- Integer.parse(hex_len, 16),
              true <- len >= 4,
              payload_len = len - 4,
-             <<payload::binary-size(payload_len), rest::binary>> <- rest do
+             <<payload::binary-size(^payload_len), rest::binary>> <- rest do
           {{:data, payload}, rest}
         else
           _ ->

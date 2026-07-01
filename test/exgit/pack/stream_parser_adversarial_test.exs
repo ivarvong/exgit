@@ -256,7 +256,7 @@ defmodule Exgit.Pack.StreamParserAdversarialTest do
       pack = Writer.build([blob])
       # Flip one bit only in the trailing 20-byte checksum (last byte).
       last = byte_size(pack) - 1
-      <<before::binary-size(last), final_byte>> = pack
+      <<before::binary-size(^last), final_byte>> = pack
       corrupted = <<before::binary, Bitwise.bxor(final_byte, 0x01)>>
       assert {:error, :checksum_mismatch} = parse_all(corrupted)
     end

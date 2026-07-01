@@ -279,7 +279,7 @@ if Code.ensure_loaded?(VFS.Mountable) do
           {rest, ""}
 
         rest ->
-          <<chunk::binary-size(chunk_size), more::binary>> = rest
+          <<chunk::binary-size(^chunk_size), more::binary>> = rest
           {chunk, more}
       end)
     end

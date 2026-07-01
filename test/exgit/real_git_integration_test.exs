@@ -68,7 +68,7 @@ defmodule Exgit.RealGitIntegrationTest do
       inflated = :zlib.uncompress(raw)
 
       {pos, 1} = :binary.match(inflated, <<0>>)
-      <<_header::binary-size(pos), 0, content::binary>> = inflated
+      <<_header::binary-size(^pos), 0, content::binary>> = inflated
 
       {:ok, tree} = Tree.decode(content)
       assert IO.iodata_to_binary(Tree.encode(tree)) == content

@@ -180,7 +180,7 @@ defmodule Exgit.Object.Tree do
   defp take_until(data, byte) do
     case :binary.match(data, <<byte>>) do
       {pos, 1} ->
-        <<before::binary-size(pos), _::8, rest::binary>> = data
+        <<before::binary-size(^pos), _::8, rest::binary>> = data
         {:ok, before, rest}
 
       :nomatch ->

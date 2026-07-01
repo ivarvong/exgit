@@ -140,7 +140,7 @@ defmodule Exgit.PktLine.DecoderTest do
 
   defp chunk_and_feed(bytes, [size | rest], original, decoder, acc) do
     n = min(size, byte_size(bytes))
-    <<chunk::binary-size(n), tail::binary>> = bytes
+    <<chunk::binary-size(^n), tail::binary>> = bytes
     {:ok, decoder, pkts} = Decoder.feed(decoder, chunk)
     chunk_and_feed(tail, rest, original, decoder, Enum.reverse(pkts) ++ acc)
   end

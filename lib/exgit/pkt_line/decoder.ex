@@ -68,7 +68,7 @@ defmodule Exgit.PktLine.Decoder do
         payload_len = len - 4
 
         case rest do
-          <<payload::binary-size(payload_len), tail::binary>> ->
+          <<payload::binary-size(^payload_len), tail::binary>> ->
             drain(tail, [{:data, payload} | acc])
 
           # Payload not fully arrived — preserve the WHOLE pkt-line

@@ -69,7 +69,7 @@ defmodule Exgit.Test.PackBuilder do
 
   defp chunk_inserts(data) do
     take = min(127, byte_size(data))
-    <<chunk::binary-size(take), rest::binary>> = data
+    <<chunk::binary-size(^take), rest::binary>> = data
     [<<take>>, chunk | chunk_inserts(rest)]
   end
 

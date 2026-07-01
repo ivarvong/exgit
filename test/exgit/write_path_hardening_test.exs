@@ -383,7 +383,7 @@ defmodule Exgit.WritePathHardeningTest do
   # Format: "<type> <size>\0<content>".
   defp strip_header(bytes) do
     {pos, 1} = :binary.match(bytes, <<0>>)
-    <<_::binary-size(pos), 0, content::binary>> = bytes
+    <<_::binary-size(^pos), 0, content::binary>> = bytes
     content
   end
 end

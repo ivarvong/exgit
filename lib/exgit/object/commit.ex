@@ -92,7 +92,7 @@ defmodule Exgit.Object.Commit do
   def decode(bytes) when is_binary(bytes) do
     case :binary.match(bytes, "\n\n") do
       {pos, 2} ->
-        <<raw_headers::binary-size(pos), "\n\n", message::binary>> = bytes
+        <<raw_headers::binary-size(^pos), "\n\n", message::binary>> = bytes
 
         case parse_headers(raw_headers) do
           {:ok, headers} ->
