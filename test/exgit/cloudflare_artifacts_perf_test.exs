@@ -369,7 +369,8 @@ defmodule Exgit.CloudflareArtifactsPerfTest do
     end
   end
 
-  defp mean([]), do: 0
+  # Only called from `format_bytes/1`'s `_` clause, i.e. with 2+ elements
+  # (the empty and single-element cases are handled before the call).
   defp mean(xs), do: Enum.sum(xs) / length(xs)
 
   # --- exgit helpers ---
