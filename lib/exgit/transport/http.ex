@@ -33,6 +33,12 @@ defmodule Exgit.Transport.HTTP do
   alias Exgit.PktLine
   alias Exgit.PktLine.Decoder
 
+  # Default backstop cap on refs accepted from a single ls-refs response.
+  # Real repos top out in the tens of thousands (linux, esp-idf); this
+  # bound exists only to stop a hostile server from streaming unbounded
+  # refs into client memory. Tunable per-transport via `:max_refs`.
+  @max_refs 1_000_000
+
   @enforce_keys [:url]
   defstruct [
     :url,
@@ -81,6 +87,9 @@ defmodule Exgit.Transport.HTTP do
     # git hosts do redirect (canonicalization, repo renames) — set
     # `:same_origin` for hosts where this is common.
     redirect: false,
+    # Cap on refs accepted from a single ls-refs response before the
+    # transport aborts with {:error, {:too_many_refs, cap}}.
+    max_refs: @max_refs,
     # Cached server capabilities (protocol v2 advertisements). `nil`
     # means "not yet discovered"; an `{:ok, caps}` / `{:error, _}`
     # tuple means the result is memoized. A fresh struct has `nil`
@@ -100,6 +109,30 @@ defmodule Exgit.Transport.HTTP do
 
   @type t :: %__MODULE__{url: String.t(), auth: auth(), user_agent: String.t()}
 
+  @doc """
+  Build a transport for the git smart-HTTP remote at `url`.
+
+  ## Options
+
+    * `:auth` — credentials; a bare auth tuple (auto-wrapped in a
+      host-bound `%Exgit.Credentials{}`) or an explicit
+      `%Exgit.Credentials{}` struct. See the module doc.
+    * `:user_agent` — the `user-agent` header value.
+    * `:connect_timeout` — connect timeout in milliseconds
+      (default 10_000).
+    * `:receive_timeout` — response-body timeout in milliseconds
+      (default 300_000); `:infinity` disables.
+    * `:verify_tls` — TLS peer verification (default `true`).
+    * `:connect_options` — extra transport options merged into the
+      library's TLS defaults (custom CA bundles, mTLS, SNI).
+    * `:redirect` — redirect policy: `false` (default),
+      `:same_origin`, or `:follow`.
+    * `:max_refs` — cap on refs accepted from a single ls-refs
+      response (default #{@max_refs}). `ls_refs/2` aborts with
+      `{:error, {:too_many_refs, cap}}` when a server exceeds it —
+      a backstop against a hostile server streaming unbounded refs
+      into client memory.
+  """
   @spec new(String.t(), keyword()) :: t()
   def new(url, opts \\ []) do
     trimmed_url = String.trim_trailing(url, "/")
@@ -112,7 +145,8 @@ defmodule Exgit.Transport.HTTP do
       receive_timeout: Keyword.get(opts, :receive_timeout, defaults.receive_timeout),
       verify_tls: Keyword.get(opts, :verify_tls, defaults.verify_tls),
       connect_options: Keyword.get(opts, :connect_options, defaults.connect_options),
-      redirect: Keyword.get(opts, :redirect, defaults.redirect)
+      redirect: Keyword.get(opts, :redirect, defaults.redirect),
+      max_refs: Keyword.get(opts, :max_refs, defaults.max_refs)
     )
   end
 
@@ -141,6 +175,20 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
+  @doc """
+  Discover the server's protocol-v2 capability advertisement.
+
+  Performs the `info/refs?service=git-upload-pack` discovery GET and
+  parses the advertisement into a map keyed by capability name
+  (string keys; well-known entries like `:version` get structured
+  values). Returns `{:error, :server_does_not_support_v2}` for
+  protocol-v1-only servers, `{:error, {:malformed_response, reason}}`
+  when the body is not valid pkt-line framing.
+
+  A struct carrying a memoized `capabilities_cache` (see
+  `capabilities_cached/1`) returns the cached result without HTTP.
+  """
+  @spec capabilities(t()) :: {:ok, map()} | {:error, term()}
   def capabilities(%__MODULE__{capabilities_cache: {:ok, _} = cached}), do: cached
   def capabilities(%__MODULE__{capabilities_cache: {:error, _} = cached}), do: cached
 
@@ -148,10 +196,7 @@ defmodule Exgit.Transport.HTTP do
     # Not cached — discover, but don't try to mutate the struct (pure
     # value). Callers who want memoization across many requests can
     # use `capabilities_cached/1` which returns an updated struct.
-    case discover(t, "git-upload-pack") do
-      {:ok, caps} -> {:ok, caps}
-      error -> error
-    end
+    discover(t, "git-upload-pack")
   end
 
   @doc """
@@ -171,11 +216,29 @@ defmodule Exgit.Transport.HTTP do
 
   def capabilities_cached(%__MODULE__{capabilities_cache: cached} = t), do: {cached, t}
 
-  # Backstop cap on refs accepted from a single ls-refs response. Real repos
-  # top out in the tens of thousands (linux, esp-idf); this bound exists only
-  # to stop a hostile server from streaming unbounded refs into client memory.
-  @max_refs 1_000_000
+  @doc """
+  List the remote's refs via the protocol-v2 `ls-refs` command.
 
+  Returns `{:ok, refs, meta}` where `refs` is a list of
+  `{ref_name, sha}` 2-tuples and `meta` carries protocol-v2
+  side-channel data (`:head` symref target, `:peeled` tag targets) —
+  see `t:Exgit.Transport.ls_refs_meta/0`. Invalid ref names from the
+  server are dropped (with `[:exgit, :security, :ref_rejected]`
+  telemetry); more than `max_refs` refs aborts with
+  `{:error, {:too_many_refs, cap}}`.
+
+  ## Options
+
+    * `:prefix` — ref-prefix filter or list of filters
+      (e.g. `"refs/heads/"`); default `[]` (all refs).
+    * `:symrefs` — ask for symref targets, revealing where HEAD
+      points (default `true`).
+    * `:peeled` — ask for `peeled:<sha>` attributes on annotated
+      tags (default `true`).
+  """
+  @spec ls_refs(t(), keyword()) ::
+          {:ok, [Exgit.Transport.ref_entry()], Exgit.Transport.ls_refs_meta()}
+          | {:error, term()}
   def ls_refs(%__MODULE__{} = t, opts \\ []) do
     Exgit.Telemetry.span(
       [:exgit, :transport, :ls_refs],
@@ -220,7 +283,7 @@ defmodule Exgit.Transport.HTTP do
     # linux), this keeps the transport's memory bound flat in ref count.
     # Map-shaped accumulator (not a tuple) so the streaming loop's
     # `%{error: e}` halt check fires the moment the ref cap trips.
-    init_acc = %{refs: [], meta: %{peeled: %{}}, count: 0, error: nil}
+    init_acc = %{refs: [], meta: %{peeled: %{}}, count: 0, error: nil, max_refs: t.max_refs}
     # Redact before it reaches `keep_ref?`'s security telemetry, which
     # echoes the source URL.
     source_url = redact_url(t.url)
@@ -321,10 +384,10 @@ defmodule Exgit.Transport.HTTP do
 
   # Add an entry to the accumulator and lift any attributes into `meta`.
   # HEAD's `symref-target` becomes `meta.head`; annotated tags' `peeled`
-  # target becomes `meta.peeled[tag_name]`. Past `@max_refs` we stop
+  # target becomes `meta.peeled[tag_name]`. Past `acc.max_refs` we stop
   # appending and set `acc.error` so the transport stream loop halts —
   # a hostile server can't grow the ref list without bound.
-  defp add_ref(%{refs: refs, meta: meta, count: count} = acc, ref, sha, attrs) do
+  defp add_ref(%{refs: refs, meta: meta, count: count, max_refs: max_refs} = acc, ref, sha, attrs) do
     meta =
       case Map.get(attrs, :symref_target) do
         nil -> meta
@@ -341,8 +404,8 @@ defmodule Exgit.Transport.HTTP do
         peeled_sha -> put_in(meta, [:peeled, ref], peeled_sha)
       end
 
-    if count + 1 > @max_refs do
-      %{acc | meta: meta, error: {:too_many_refs, @max_refs}}
+    if count + 1 > max_refs do
+      %{acc | meta: meta, error: {:too_many_refs, max_refs}}
     else
       %{acc | refs: [{ref, sha} | refs], meta: meta, count: count + 1}
     end
@@ -368,6 +431,29 @@ defmodule Exgit.Transport.HTTP do
     end)
   end
 
+  @doc """
+  Fetch a pack for the given `wants` (20-byte SHAs) via the
+  protocol-v2 `fetch` command.
+
+  Returns `{:ok, pack_bytes, summary}`. With `:object_store` the
+  pack is stream-parsed straight into the store — `pack_bytes` is
+  `<<>>` and `summary` carries `:objects` and the updated `:store`.
+  Without it, `pack_bytes` is the raw pack for the caller to parse.
+  Sideband channel-3 server messages surface as
+  `{:error, {:server_error, msg}}`.
+
+  ## Options
+
+    * `:haves` — SHAs the client already has, for negotiation.
+    * `:depth` — shallow-clone depth (`deepen`).
+    * `:filter` — partial-clone filter spec (e.g. `"blob:none"`).
+    * `:object_store` — an `Exgit.ObjectStore` to stream objects
+      into as they arrive (bounded memory on multi-GB packs).
+    * `:sideband`, `:thin_pack`, `:ofs_delta` — explicit feature
+      overrides; by default they're negotiated from the server's
+      advertised capabilities.
+  """
+  @spec fetch(t(), [binary()], keyword()) :: {:ok, binary(), map()} | {:error, term()}
   def fetch(%__MODULE__{} = t, wants, opts \\ []) do
     Exgit.Telemetry.span(
       [:exgit, :transport, :fetch],
@@ -473,8 +559,14 @@ defmodule Exgit.Transport.HTTP do
     init = init_fetch_state(Keyword.get(opts, :sideband), object_store)
 
     case stream_upload_pack(t, body, init, &handle_fetch_packet/2) do
+      # Binary errors are sideband channel-3 server messages.
       {:ok, %{error: msg}} when is_binary(msg) ->
         {:error, {:server_error, msg}}
+
+      # Anything else non-nil is a structured client-side reason
+      # (e.g. a StreamParser rejection) — pass it through as-is.
+      {:ok, %{error: reason}} when not is_nil(reason) ->
+        {:error, reason}
 
       # Streaming path: finalise the parser and return the updated store.
       {:ok, %{parser: %StreamParser{} = parser}} ->
@@ -617,6 +709,19 @@ defmodule Exgit.Transport.HTTP do
     end
   end
 
+  @doc """
+  Push ref `updates` and the accompanying `pack_bytes` via
+  `git-receive-pack`.
+
+  Each update is a `{ref, old_sha, new_sha}` 3-tuple (20-byte SHAs;
+  `nil` means the all-zero SHA, i.e. create/delete). Returns
+  `{:ok, %{ref_results: [{ref, :ok | :error}]}}` parsed from the
+  server's report-status response, or
+  `{:error, {:malformed_response, reason}}` when the report is not
+  valid pkt-line framing.
+  """
+  @spec push(t(), [Exgit.Transport.ref_update()], binary(), keyword()) ::
+          {:ok, %{ref_results: [{String.t(), :ok | :error}]}} | {:error, term()}
   def push(%__MODULE__{} = t, updates, pack_bytes, opts \\ []) do
     Exgit.Telemetry.span(
       [:exgit, :transport, :push],
@@ -651,7 +756,7 @@ defmodule Exgit.Transport.HTTP do
 
     case do_request(:post, url, headers, body, t) do
       {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
-        {:ok, parse_push_report(resp_body)}
+        parse_push_report(resp_body)
 
       {:ok, %{status: status, body: resp_body}} ->
         {:error, {:http_error, status, resp_body}}
@@ -687,8 +792,13 @@ defmodule Exgit.Transport.HTTP do
   # untrusted server input. Well-known capabilities additionally expose
   # structured values (e.g. :version -> integer).
   defp parse_capabilities(body) do
-    packets = PktLine.decode_all(body)
+    case PktLine.decode_all(body) do
+      {:error, reason} -> {:error, {:malformed_response, reason}}
+      packets -> parse_capability_packets(packets)
+    end
+  end
 
+  defp parse_capability_packets(packets) do
     caps =
       packets
       |> Enum.flat_map(fn
@@ -722,18 +832,21 @@ defmodule Exgit.Transport.HTTP do
   # --- Push response parsing ---
 
   defp parse_push_report(body) do
-    packets = PktLine.decode_all(body)
+    case PktLine.decode_all(body) do
+      {:error, reason} ->
+        {:error, {:malformed_response, reason}}
 
-    ref_results =
-      packets
-      |> Enum.flat_map(fn
-        {:data, "unpack ok\n"} -> []
-        {:data, <<"ok ", ref::binary>>} -> [{String.trim(ref), :ok}]
-        {:data, <<"ng ", rest::binary>>} -> [{String.trim(rest), :error}]
-        _ -> []
-      end)
+      packets ->
+        ref_results =
+          Enum.flat_map(packets, fn
+            {:data, "unpack ok\n"} -> []
+            {:data, <<"ok ", ref::binary>>} -> [{String.trim(ref), :ok}]
+            {:data, <<"ng ", rest::binary>>} -> [{String.trim(rest), :error}]
+            _ -> []
+          end)
 
-    %{ref_results: ref_results}
+        {:ok, %{ref_results: ref_results}}
+    end
   end
 
   # --- HTTP helpers ---
@@ -795,9 +908,7 @@ defmodule Exgit.Transport.HTTP do
 
     case Req.request(req_opts) do
       {:ok, %{status: status, private: %{exgit_stream: state}}} when status in 200..299 ->
-        with :ok <- Decoder.finalize(state.decoder) do
-          if state.error, do: {:error, state.error}, else: {:ok, state.handler_acc}
-        end
+        finalize_stream_state(state)
 
       {:ok, %{status: status, private: %{exgit_stream: state}}} ->
         {:error, {:http_error, status, state.error_body}}
@@ -809,6 +920,35 @@ defmodule Exgit.Transport.HTTP do
         err
     end
   end
+
+  # Resolve a finished 2xx stream into the caller's result. An error
+  # accumulated mid-stream — a decode failure on `state.error`, or a
+  # handler/domain error on the accumulator (sideband channel-3
+  # message, the ls-refs cap, a StreamParser rejection) — halts the
+  # body early, which legitimately leaves partial bytes in the
+  # decoder. So the accumulated error must win over the finalize
+  # truncation artifact, or the real reason gets masked by
+  # `{:truncated, _}`.
+  defp finalize_stream_state(state) do
+    cond do
+      state.error != nil ->
+        {:error, state.error}
+
+      acc_error(state.handler_acc) != nil ->
+        {:ok, state.handler_acc}
+
+      true ->
+        case Decoder.finalize(state.decoder) do
+          :ok -> {:ok, state.handler_acc}
+          {:error, _} = err -> err
+        end
+    end
+  end
+
+  # Handler accumulators are caller-shaped; both ls-refs and fetch use
+  # a map with an `:error` slot. Anything else has no domain error.
+  defp acc_error(%{error: e}), do: e
+  defp acc_error(_), do: nil
 
   # One streaming step: feed `chunk` through either the error buffer
   # (non-2xx) or the pkt-line decoder + handler (2xx), and stash the
@@ -1010,8 +1150,6 @@ defmodule Exgit.Transport.HTTP do
 end
 
 defimpl Inspect, for: Exgit.Transport.HTTP do
-  import Inspect.Algebra
-
   # Credentials live on %HTTP{}. Default Inspect would dump them into any
   # crash log, SASL report, or IEx session. Always redact.
   def inspect(%Exgit.Transport.HTTP{} = t, opts) do
@@ -1025,10 +1163,6 @@ defimpl Inspect, for: Exgit.Transport.HTTP do
   defp redact({:header, name, _}), do: {:header, name, "***"}
   defp redact({:callback, _}), do: {:callback, :fun}
   defp redact(_), do: :redacted
-
-  # Suppress unused-import warning from concat/2 et al — we keep the
-  # import in case future formatting needs it.
-  _ = &concat/2
 end
 
 defimpl Exgit.Transport, for: Exgit.Transport.HTTP do

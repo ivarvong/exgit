@@ -36,11 +36,12 @@ defmodule Exgit.PktLine.Decoder do
   Feed a chunk of bytes into the decoder. Returns the updated decoder
   and any complete packets that became decodable from `buffer ++ chunk`.
 
-  Returns `{:error, reason}` on malformed framing (length-prefix that
-  is not valid hex or claims a length below the 4-byte header).
+  Returns `{:error, {:malformed_pkt_line, hex}}` on malformed framing
+  (a length-prefix that is not valid hex or claims a length below the
+  4-byte header).
   """
   @spec feed(t(), binary()) ::
-          {:ok, t(), [PktLine.packet()]} | {:error, term()}
+          {:ok, t(), [PktLine.packet()]} | PktLine.decode_error()
   def feed(%__MODULE__{buffer: buf}, chunk) when is_binary(chunk) do
     drain(<<buf::binary, chunk::binary>>, [])
   end
@@ -78,7 +79,7 @@ defmodule Exgit.PktLine.Decoder do
         end
 
       _ ->
-        {:error, {:malformed_length, hex}}
+        {:error, {:malformed_pkt_line, hex}}
     end
   end
 

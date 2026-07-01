@@ -67,6 +67,62 @@ defmodule Exgit.Transport.HttpTest do
     end
   end
 
+  describe "hostile server bytes surface as error values" do
+    test "capabilities/1 returns an error tuple on garbage bytes" do
+      garbage = "ZZZZ" <> :binary.copy(<<0xFF>>, 32)
+
+      warm_server(garbage, fn port ->
+        t = HTTP.new("http://127.0.0.1:#{port}")
+
+        assert {:error, {:malformed_response, {:malformed_pkt_line, _}}} =
+                 HTTP.capabilities(t)
+      end)
+    end
+
+    test "push/4 returns an error tuple when the report-status body is garbage" do
+      warm_server("ZZZZnot-a-pkt-line", fn port ->
+        t = HTTP.new("http://127.0.0.1:#{port}")
+        update = {"refs/heads/main", nil, :binary.copy(<<1>>, 20)}
+
+        assert {:error, {:malformed_response, {:malformed_pkt_line, _}}} =
+                 HTTP.push(t, [update], "PACK")
+      end)
+    end
+  end
+
+  describe "ls-refs ref cap (:max_refs)" do
+    test "exceeding the cap surfaces as {:error, {:too_many_refs, cap}}" do
+      lines =
+        for i <- 1..5 do
+          sha = Base.encode16(:binary.copy(<<i>>, 20), case: :lower)
+          PktLine.encode("#{sha} refs/heads/b#{i}\n")
+        end
+
+      body = IO.iodata_to_binary([lines, PktLine.flush()])
+
+      warm_server(body, fn port ->
+        t = HTTP.new("http://127.0.0.1:#{port}", max_refs: 3)
+        assert {:error, {:too_many_refs, 3}} = HTTP.ls_refs(t)
+      end)
+    end
+
+    test "under the cap the same response lists all refs" do
+      lines =
+        for i <- 1..5 do
+          sha = Base.encode16(:binary.copy(<<i>>, 20), case: :lower)
+          PktLine.encode("#{sha} refs/heads/b#{i}\n")
+        end
+
+      body = IO.iodata_to_binary([lines, PktLine.flush()])
+
+      warm_server(body, fn port ->
+        t = HTTP.new("http://127.0.0.1:#{port}", max_refs: 5)
+        assert {:ok, refs, _meta} = HTTP.ls_refs(t)
+        assert length(refs) == 5
+      end)
+    end
+  end
+
   defp warm_server(body, fun) do
     {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, packet: :raw])
     {:ok, port} = :inet.port(listener)

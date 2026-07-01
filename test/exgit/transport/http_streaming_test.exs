@@ -54,6 +54,26 @@ defmodule Exgit.Transport.HttpStreamingTest do
       :gen_tcp.close(listener)
     end
 
+    test "channel 3 error wins over trailing truncated bytes" do
+      body =
+        IO.iodata_to_binary([
+          PktLine.encode("packfile\n"),
+          PktLine.encode(<<3, "fatal: boom">>),
+          # Trailing bytes of an incomplete pkt-line. Halting on the
+          # channel-3 error leaves these undecoded in the decoder —
+          # that truncation artifact must not mask the real error.
+          "00ff"
+        ])
+
+      {listener, port} = run_fetch_server(body)
+      t = HTTP.new("http://127.0.0.1:#{port}")
+
+      assert {:error, {:server_error, "fatal: boom"}} =
+               HTTP.fetch(t, [<<0::160>>], sideband: true)
+
+      :gen_tcp.close(listener)
+    end
+
     @tag :memory
     test "process heap stays bounded relative to pack size (regression guard)" do
       # 8 MB of pack bytes split into 4 KB sideband packets. Old non-streaming
