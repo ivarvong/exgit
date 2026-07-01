@@ -57,6 +57,21 @@ defmodule Exgit.ObjectStore.PromisorEvictionTest do
     :ok
   end
 
+  test "eviction drops the size index too — object_size never returns a stale size" do
+    # cap=1 byte: the commit is evicted by the same put that inserted it.
+    p = Promisor.new(%Stub{}, max_cache_bytes: 1)
+    {:ok, sha, p} = Promisor.put(p, make_commit("evict me\n"))
+
+    refute Promisor.has_object?(p, sha)
+    assert {:error, :not_local} = Promisor.object_size(p, sha)
+    assert {:error, :not_local} = Exgit.ObjectStore.object_size(p, sha)
+
+    # The desync lived in the underlying Memory cache: eviction removed
+    # the object from `objects` but left its `sizes` entry behind, so a
+    # direct size lookup returned the stale size for an evicted object.
+    assert {:error, :not_found} = Exgit.ObjectStore.Memory.object_size(p.cache, sha)
+  end
+
   test "large cap doesn't evict" do
     p = Promisor.new(%Stub{}, max_cache_bytes: 10_000)
 

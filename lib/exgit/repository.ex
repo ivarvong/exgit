@@ -88,14 +88,17 @@ defmodule Exgit.Repository do
   * `:max_cache_bytes` — configured cap (`:infinity` if unbounded)
   * `:mode` — repo mode (`:eager` or `:lazy`)
   * `:backend` — the object-store module
+
+  Counts and `:cache_bytes` are `:unknown` for backends that can't
+  be introspected (`Disk`, user-defined stores).
   """
   @type memory_report :: %{
-          object_count: non_neg_integer(),
-          cache_bytes: non_neg_integer(),
-          commit_count: non_neg_integer(),
-          tree_count: non_neg_integer(),
-          blob_count: non_neg_integer(),
-          tag_count: non_neg_integer(),
+          object_count: non_neg_integer() | :unknown,
+          cache_bytes: non_neg_integer() | :unknown,
+          commit_count: non_neg_integer() | :unknown,
+          tree_count: non_neg_integer() | :unknown,
+          blob_count: non_neg_integer() | :unknown,
+          tag_count: non_neg_integer() | :unknown,
           max_cache_bytes: non_neg_integer() | :infinity,
           mode: mode(),
           backend: module()
@@ -109,10 +112,9 @@ defmodule Exgit.Repository do
   cache growth, and alert when a configured cap is approached.
 
   Returns consistent shape across all object-store backends
-  (`Memory`, `Disk`, `Promisor`, `SharedPromisor`); counts for
-  backends without per-type bookkeeping (like `Disk`) are
-  `:unknown`. The `:cache_bytes` and `:max_cache_bytes` fields
-  are always present.
+  (`Memory`, `Disk`, `Promisor`, `SharedPromisor`); counts and
+  `:cache_bytes` for backends without per-type bookkeeping (like
+  `Disk`) are `:unknown`. All keys are always present.
 
   ## Examples
 
@@ -189,18 +191,18 @@ defmodule Exgit.Repository do
 
   defp store_report(other) do
     # Backends we don't introspect deeply (ObjectStore.Disk,
-    # user-defined stores). Report a degraded shape with
-    # placeholders so callers can still depend on the keys
-    # existing.
+    # user-defined stores). Report `:unknown` rather than a fake 0
+    # so monitoring callers can't mistake "not introspected" for
+    # "empty"; the keys still always exist.
     _ = other
 
     %{
-      object_count: 0,
-      cache_bytes: 0,
-      commit_count: 0,
-      tree_count: 0,
-      blob_count: 0,
-      tag_count: 0,
+      object_count: :unknown,
+      cache_bytes: :unknown,
+      commit_count: :unknown,
+      tree_count: :unknown,
+      blob_count: :unknown,
+      tag_count: :unknown,
       max_cache_bytes: :infinity
     }
   end

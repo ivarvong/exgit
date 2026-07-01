@@ -82,11 +82,12 @@ defmodule Exgit.ObjectStore.Disk do
   @doc """
   Uncompressed object size without materializing the object.
 
-  For a loose object this inflates only the header bytes (`"<type>
-  <size>\\0"`) — constant memory, no matter how large the blob. Packed
-  objects fall back to a full read (the delta chain must be resolved to
-  know the final size), so this is cheap for loose objects and
-  O(object) for packed ones.
+  For a loose object this reads and inflates only enough compressed
+  bytes to cover the header (`"<type> <size>\\0"`) — constant memory
+  AND constant I/O, no matter how large the blob. Packed objects fall
+  back to a full read (the delta chain must be resolved to know the
+  final size), so this is cheap for loose objects and O(object) for
+  packed ones.
   """
   @spec object_size(t(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   def object_size(%__MODULE__{root: root}, sha) when byte_size(sha) == 20 do
@@ -94,17 +95,29 @@ defmodule Exgit.ObjectStore.Disk do
     <<prefix::binary-size(2), rest::binary>> = hex
     path = Path.join([root, "objects", prefix, rest])
 
-    case File.read(path) do
-      {:ok, compressed} -> loose_object_size(compressed)
+    case loose_object_size(path) do
+      {:ok, size} -> {:ok, size}
       {:error, :enoent} -> packed_object_size(root, sha)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp loose_object_size(compressed) do
-    with {:ok, header} <- inflate_until_null(compressed),
-         {:ok, _type, size} <- parse_loose_header(header) do
-      {:ok, size}
+  defp loose_object_size(path) do
+    case :file.open(path, [:read, :raw, :binary]) do
+      {:ok, fd} ->
+        try do
+          with {:ok, header} <- inflate_until_null(fd) do
+            case parse_loose_header(header) do
+              {:ok, _type, size} -> {:ok, size}
+              {:error, _} = err -> err
+            end
+          end
+        after
+          :file.close(fd)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -112,14 +125,19 @@ defmodule Exgit.ObjectStore.Disk do
   # object can't make us inflate unbounded output hunting for a NUL.
   @max_header_bytes 64
 
+  # Compressed bytes read from disk per iteration while hunting for the
+  # header's NUL. The header fits in the first chunk for any real object.
+  @header_read_chunk_bytes 256
+
   # Stream-inflate only until the header's NUL terminator, returning the
-  # bytes before it. Bounded memory: never inflates the full object.
-  defp inflate_until_null(compressed) do
+  # bytes before it. Bounded memory AND bounded I/O: reads small
+  # compressed chunks from `fd` and never inflates the full object.
+  defp inflate_until_null(fd) do
     z = :zlib.open()
 
     try do
       :zlib.inflateInit(z)
-      drain_until_null(z, compressed, <<>>)
+      feed_until_null(z, fd, <<>>)
     rescue
       _ -> {:error, :zlib_error}
     catch
@@ -129,9 +147,30 @@ defmodule Exgit.ObjectStore.Disk do
     end
   end
 
+  defp feed_until_null(z, fd, acc) do
+    case :file.read(fd, @header_read_chunk_bytes) do
+      {:ok, chunk} ->
+        case drain_until_null(z, chunk, acc) do
+          {:need_input, acc} -> feed_until_null(z, fd, acc)
+          done -> done
+        end
+
+      # Truncated file: zlib still wants input but there is none.
+      :eof ->
+        {:error, :malformed_object_header}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Inflate `input` and any pending output, scanning for the NUL.
+  # `{:need_input, acc}` means zlib produced nothing more from this
+  # chunk — the caller must read more compressed bytes.
   defp drain_until_null(z, input, acc) do
     {status, out} = :zlib.safeInflate(z, input)
-    acc = acc <> IO.iodata_to_binary(out)
+    out = IO.iodata_to_binary(out)
+    acc = acc <> out
 
     case :binary.match(acc, <<0>>) do
       {pos, 1} ->
@@ -141,14 +180,17 @@ defmodule Exgit.ObjectStore.Disk do
         cond do
           byte_size(acc) > @max_header_bytes -> {:error, :malformed_object_header}
           status == :finished -> {:error, :malformed_object_header}
+          out == <<>> -> {:need_input, acc}
           true -> drain_until_null(z, [], acc)
         end
     end
   end
 
   defp packed_object_size(root, sha) do
-    case get_from_packs(root, sha) do
-      {:ok, obj} -> {:ok, IO.iodata_length(Exgit.Object.encode(obj))}
+    case raw_from_packs(root, sha) do
+      # `content` is the already-inflated (delta-resolved) object body;
+      # its byte_size IS the object size. No decode→re-encode round trip.
+      {:ok, _type, content} -> {:ok, byte_size(content)}
       {:error, _} = err -> err
     end
   end
@@ -324,6 +366,15 @@ defmodule Exgit.ObjectStore.Disk do
   defp hex_char?(_), do: false
 
   defp get_from_packs(root, sha) do
+    case raw_from_packs(root, sha) do
+      {:ok, type, content} -> Exgit.Object.decode(type, content)
+      {:error, _} = err -> err
+    end
+  end
+
+  # Locate `sha` in any pack and return its inflated (delta-resolved)
+  # type + content, without decoding into an `Exgit.Object`.
+  defp raw_from_packs(root, sha) do
     pack_dir = Path.join([root, "objects", "pack"])
 
     case File.ls(pack_dir) do
@@ -350,7 +401,7 @@ defmodule Exgit.ObjectStore.Disk do
       # the header we preserved). Parse at that offset, NOT the on-disk
       # offset.
       case Exgit.Pack.Reader.parse_at(pack_slice, 12) do
-        {:ok, {type, ^sha, content}} -> Exgit.Object.decode(type, content)
+        {:ok, {type, ^sha, content}} -> {:ok, type, content}
         _ -> find_in_packs(dir, rest, sha)
       end
     else
@@ -520,7 +571,18 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
     )
   end
 
-  def object_size(store, sha), do: Disk.object_size(store, sha)
+  def object_size(store, sha) do
+    Telemetry.span(
+      [:exgit, :object_store, :object_size],
+      %{store: :disk, sha: sha},
+      fn ->
+        case Disk.object_size(store, sha) do
+          {:ok, _} = ok -> {:span, ok, %{hit?: true}}
+          other -> {:span, other, %{hit?: false}}
+        end
+      end
+    )
+  end
 
   def import_objects(store, raw_objects) do
     failures =

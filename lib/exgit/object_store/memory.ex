@@ -62,6 +62,25 @@ defmodule Exgit.ObjectStore.Memory do
     end
   end
 
+  @doc """
+  Remove `sha` from the store, keeping the `objects` and `sizes`
+  indexes in lockstep. Returns `{:ok, freed_compressed_bytes, store}`
+  so callers tracking a byte budget (e.g. the Promisor's cache
+  accounting) know how much was reclaimed, or `{:error, :not_found}`
+  if the object is absent.
+  """
+  @spec delete_object(t(), binary()) :: {:ok, non_neg_integer(), t()} | {:error, :not_found}
+  def delete_object(%__MODULE__{objects: objects, sizes: sizes} = store, sha) do
+    case Map.pop(objects, sha) do
+      {nil, _} ->
+        {:error, :not_found}
+
+      {{_type, compressed}, new_objects} ->
+        {:ok, byte_size(compressed),
+         %{store | objects: new_objects, sizes: Map.delete(sizes, sha)}}
+    end
+  end
+
   @spec import_objects(t(), [{atom(), binary(), binary()}]) :: {:ok, t()}
   def import_objects(%__MODULE__{objects: objects, sizes: sizes} = store, raw_objects) do
     {new_objects, new_sizes} =
@@ -113,7 +132,18 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Memory do
     )
   end
 
-  def object_size(store, sha), do: Memory.object_size(store, sha)
+  def object_size(store, sha) do
+    Telemetry.span(
+      [:exgit, :object_store, :object_size],
+      %{store: :memory, sha: sha},
+      fn ->
+        case Memory.object_size(store, sha) do
+          {:ok, _} = ok -> {:span, ok, %{hit?: true}}
+          other -> {:span, other, %{hit?: false}}
+        end
+      end
+    )
+  end
 
   def import_objects(store, raw_objects),
     do: Memory.import_objects(store, raw_objects)

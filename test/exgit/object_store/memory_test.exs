@@ -27,6 +27,26 @@ defmodule Exgit.ObjectStore.MemoryTest do
     refute Memory.has_object?(store, :crypto.hash(:sha, "other"))
   end
 
+  test "delete_object removes the object AND its size index entry" do
+    store = Memory.new()
+    {:ok, sha, store} = Memory.put_object(store, Blob.new("hello"))
+    assert {:ok, 5} = Memory.object_size(store, sha)
+
+    assert {:ok, freed, store} = Memory.delete_object(store, sha)
+    assert freed > 0
+
+    refute Memory.has_object?(store, sha)
+    assert {:error, :not_found} = Memory.get_object(store, sha)
+    # The sizes index must be kept in lockstep — no stale size for a
+    # deleted object.
+    assert {:error, :not_found} = Memory.object_size(store, sha)
+  end
+
+  test "delete_object returns not_found for a missing sha" do
+    assert {:error, :not_found} =
+             Memory.delete_object(Memory.new(), :crypto.hash(:sha, "nope"))
+  end
+
   test "import_objects" do
     content = "imported"
     sha = Exgit.Object.sha(Blob.new(content))

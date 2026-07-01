@@ -541,22 +541,15 @@ defmodule Exgit.ObjectStore.Promisor do
       _ ->
         {_key, sha, q2} = :gb_trees.take_smallest(q)
 
-        # Drop the commit object from the Memory cache. Track the
-        # byte delta. We pattern-match `p.cache` into a
-        # `%ObjectStore.Memory{}` binding first so the subsequent
-        # struct-update is visible to Elixir 1.19's type checker
-        # (a struct update on a field-access expression is rejected
-        # under --warnings-as-errors because the type is dynamic()
-        # at that site).
-        %ObjectStore.Memory{objects: objs} = cache = p.cache
-
-        {dropped_bytes, new_objs} =
-          case Map.pop(objs, sha) do
-            {nil, o} -> {0, o}
-            {{_type, compressed}, o} -> {byte_size(compressed), o}
+        # Drop the commit object from the Memory cache via its delete
+        # helper — it keeps the `objects` and `sizes` indexes in
+        # lockstep, so `object_size/2` can never report a stale size
+        # for an evicted object.
+        {dropped_bytes, new_cache} =
+          case ObjectStore.Memory.delete_object(p.cache, sha) do
+            {:ok, freed, cache} -> {freed, cache}
+            {:error, :not_found} -> {0, p.cache}
           end
-
-        new_cache = %ObjectStore.Memory{cache | objects: new_objs}
 
         %{
           p
@@ -661,7 +654,18 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Promisor do
     )
   end
 
-  def object_size(store, sha), do: Promisor.object_size(store, sha)
+  def object_size(store, sha) do
+    Telemetry.span(
+      [:exgit, :object_store, :object_size],
+      %{store: :promisor, sha: sha},
+      fn ->
+        case Promisor.object_size(store, sha) do
+          {:ok, _} = ok -> {:span, ok, %{hit?: true}}
+          other -> {:span, other, %{hit?: false}}
+        end
+      end
+    )
+  end
 
   def import_objects(store, raw_objects),
     do: Promisor.import_objects(store, raw_objects)
