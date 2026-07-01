@@ -8,6 +8,18 @@ defprotocol Exgit.ObjectStore do
   @spec has?(t, binary()) :: boolean()
   def has?(store, sha)
 
+  # Uncompressed byte size of an object WITHOUT materializing its content.
+  # The point is a constant-memory size check: callers can decide whether a
+  # blob is too large to read before paying to inflate it into the heap.
+  #
+  # `{:error, :not_local}` is a meaningful, non-fatal result for lazy stores
+  # (`Promisor`): it means "knowing this size requires a network fetch" — so
+  # the caller can opt in rather than have a multi-GB fetch triggered behind
+  # a size check. `{:error, :not_found}` means the object is genuinely absent.
+  @spec object_size(t, binary()) ::
+          {:ok, non_neg_integer()} | {:error, :not_found | :not_local | term()}
+  def object_size(store, sha)
+
   @spec import_objects(t, [{atom(), binary(), binary()}]) :: {:ok, t}
   def import_objects(store, raw_objects)
 

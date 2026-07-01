@@ -3,10 +3,19 @@ defmodule Exgit.ObjectStore.Memory do
 
   # Stores objects as {type_atom, zlib_compressed_content} for memory efficiency.
   # Objects are decoded on demand when `get` is called.
+  #
+  # `sizes` is a parallel index of `sha => uncompressed_byte_size`, kept in
+  # lockstep with `objects` by every insert path (put/import/streaming close).
+  # It lets `object_size/2` answer the size of a blob in O(1) WITHOUT
+  # `:zlib.uncompress`-ing the whole object into the heap — the difference
+  # between a constant-memory size check and materializing a multi-GB blob.
 
-  defstruct objects: %{}
+  defstruct objects: %{}, sizes: %{}
 
-  @type t :: %__MODULE__{objects: %{binary() => {atom(), binary()}}}
+  @type t :: %__MODULE__{
+          objects: %{binary() => {atom(), binary()}},
+          sizes: %{binary() => non_neg_integer()}
+        }
 
   @spec new() :: t()
   def new, do: %__MODULE__{}
@@ -24,26 +33,44 @@ defmodule Exgit.ObjectStore.Memory do
   end
 
   @spec put_object(t(), Exgit.Object.t()) :: {:ok, binary(), t()}
-  def put_object(%__MODULE__{objects: objects} = store, object) do
+  def put_object(%__MODULE__{objects: objects, sizes: sizes} = store, object) do
     sha = Exgit.Object.sha(object)
     type = Exgit.Object.type(object)
     content = Exgit.Object.encode(object) |> IO.iodata_to_binary()
     compressed = :zlib.compress(content)
-    {:ok, sha, %{store | objects: Map.put(objects, sha, {type, compressed})}}
+
+    {:ok, sha,
+     %{
+       store
+       | objects: Map.put(objects, sha, {type, compressed}),
+         sizes: Map.put(sizes, sha, byte_size(content))
+     }}
   end
 
   @spec has_object?(t(), binary()) :: boolean()
   def has_object?(%__MODULE__{objects: objects}, sha), do: Map.has_key?(objects, sha)
 
+  @doc """
+  Uncompressed byte size of the stored object, in O(1) — without
+  decompressing it. Returns `{:error, :not_found}` if absent.
+  """
+  @spec object_size(t(), binary()) :: {:ok, non_neg_integer()} | {:error, :not_found}
+  def object_size(%__MODULE__{sizes: sizes}, sha) do
+    case Map.fetch(sizes, sha) do
+      {:ok, size} -> {:ok, size}
+      :error -> {:error, :not_found}
+    end
+  end
+
   @spec import_objects(t(), [{atom(), binary(), binary()}]) :: {:ok, t()}
-  def import_objects(%__MODULE__{objects: objects} = store, raw_objects) do
-    new_objects =
-      Enum.reduce(raw_objects, objects, fn {type, sha, content}, acc ->
+  def import_objects(%__MODULE__{objects: objects, sizes: sizes} = store, raw_objects) do
+    {new_objects, new_sizes} =
+      Enum.reduce(raw_objects, {objects, sizes}, fn {type, sha, content}, {objs, szs} ->
         compressed = :zlib.compress(content)
-        Map.put(acc, sha, {type, compressed})
+        {Map.put(objs, sha, {type, compressed}), Map.put(szs, sha, byte_size(content))}
       end)
 
-    {:ok, %{store | objects: new_objects}}
+    {:ok, %{store | objects: new_objects, sizes: new_sizes}}
   end
 end
 
@@ -86,6 +113,8 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Memory do
     )
   end
 
+  def object_size(store, sha), do: Memory.object_size(store, sha)
+
   def import_objects(store, raw_objects),
     do: Memory.import_objects(store, raw_objects)
 
@@ -113,27 +142,37 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Memory do
       store_type: type,
       sha_ctx: sha_ctx,
       deflate: z,
-      acc: []
+      acc: [],
+      # Actual uncompressed bytes seen, summed across chunks. We use this
+      # rather than `expected_size` so a caller that over- or under-declares
+      # the size can't desync the `sizes` index from the stored content.
+      usize: 0
     }
 
     {:ok, handle}
   end
 
-  def write_chunk(_store, %{deflate: z, sha_ctx: sha_ctx, acc: acc} = handle, chunk)
+  def write_chunk(_store, %{deflate: z, sha_ctx: sha_ctx, acc: acc, usize: usize} = handle, chunk)
       when is_binary(chunk) do
     sha_ctx = :crypto.hash_update(sha_ctx, chunk)
     compressed_chunks = :zlib.deflate(z, chunk)
-    {:ok, %{handle | sha_ctx: sha_ctx, acc: [acc | compressed_chunks]}}
+
+    {:ok,
+     %{handle | sha_ctx: sha_ctx, acc: [acc | compressed_chunks], usize: usize + byte_size(chunk)}}
   end
 
-  def close_write(%Memory{objects: objects} = store, %{__type__: :memory_write} = handle) do
+  def close_write(
+        %Memory{objects: objects, sizes: sizes} = store,
+        %{__type__: :memory_write} = handle
+      ) do
     sha = :crypto.hash_final(handle.sha_ctx)
     final_chunks = :zlib.deflate(handle.deflate, <<>>, :finish)
     :zlib.deflateEnd(handle.deflate)
     :zlib.close(handle.deflate)
     compressed = IO.iodata_to_binary([handle.acc | final_chunks])
     new_objects = Map.put(objects, sha, {handle.store_type, compressed})
-    {:ok, sha, %{store | objects: new_objects}}
+    new_sizes = Map.put(sizes, sha, handle.usize)
+    {:ok, sha, %{store | objects: new_objects, sizes: new_sizes}}
   end
 
   def cancel_write(_store, %{__type__: :memory_write, deflate: z}) do

@@ -270,6 +270,44 @@ defmodule Exgit.FS do
   end
 
   @doc """
+  Size in bytes of the blob at `path` — WITHOUT reading its content.
+
+  The size-aware companion to `read_path/4`: use it to decide whether a
+  blob is too large to pull into memory *before* you pull it. For the
+  in-memory store this is O(1) (the size is indexed, not recomputed);
+  for on-disk loose objects it inflates only the header.
+
+  Resolving the path may fetch *tree* objects (small) on a lazy clone,
+  but the blob itself is never fetched. For a lazy/partial clone whose
+  blob has not been materialized yet, returns `{:error, :not_local}`
+  rather than triggering a possibly-multi-GB fetch — call `read_path/4`
+  when you actually want the bytes. Directories return
+  `{:error, :not_a_blob}`.
+
+      {:ok, size, repo} = Exgit.FS.size(repo, "HEAD", "go.mod")
+
+  """
+  @spec size(Repository.t(), ref(), path()) ::
+          {:ok, non_neg_integer(), Repository.t()} | {:error, term()}
+  def size(%Repository{} = repo, reference, path) do
+    with {:ok, tree_sha, repo} <- resolve_tree(repo, reference),
+         {:ok, {mode, sha}, repo} <- walk_path(repo, tree_sha, normalize_path(path)) do
+      if dir_mode?(mode) do
+        {:error, :not_a_blob}
+      else
+        case ObjectStore.object_size(repo.object_store, sha) do
+          {:ok, size} -> {:ok, size, repo}
+          {:error, _} = err -> err
+        end
+      end
+    end
+  end
+
+  defp dir_mode?("40000"), do: true
+  defp dir_mode?("040000"), do: true
+  defp dir_mode?(_), do: false
+
+  @doc """
   Return true if the path exists under the given reference.
 
   Does not return the updated repo — this is a boolean shortcut. If you

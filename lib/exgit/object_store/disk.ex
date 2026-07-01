@@ -79,6 +79,80 @@ defmodule Exgit.ObjectStore.Disk do
       else: {:error, {:sha_mismatch, expected_sha}}
   end
 
+  @doc """
+  Uncompressed object size without materializing the object.
+
+  For a loose object this inflates only the header bytes (`"<type>
+  <size>\\0"`) — constant memory, no matter how large the blob. Packed
+  objects fall back to a full read (the delta chain must be resolved to
+  know the final size), so this is cheap for loose objects and
+  O(object) for packed ones.
+  """
+  @spec object_size(t(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
+  def object_size(%__MODULE__{root: root}, sha) when byte_size(sha) == 20 do
+    hex = Base.encode16(sha, case: :lower)
+    <<prefix::binary-size(2), rest::binary>> = hex
+    path = Path.join([root, "objects", prefix, rest])
+
+    case File.read(path) do
+      {:ok, compressed} -> loose_object_size(compressed)
+      {:error, :enoent} -> packed_object_size(root, sha)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp loose_object_size(compressed) do
+    with {:ok, header} <- inflate_until_null(compressed),
+         {:ok, _type, size} <- parse_loose_header(header) do
+      {:ok, size}
+    end
+  end
+
+  # The git object header is tiny; cap the scan so a corrupt or hostile
+  # object can't make us inflate unbounded output hunting for a NUL.
+  @max_header_bytes 64
+
+  # Stream-inflate only until the header's NUL terminator, returning the
+  # bytes before it. Bounded memory: never inflates the full object.
+  defp inflate_until_null(compressed) do
+    z = :zlib.open()
+
+    try do
+      :zlib.inflateInit(z)
+      drain_until_null(z, compressed, <<>>)
+    rescue
+      _ -> {:error, :zlib_error}
+    catch
+      _, _ -> {:error, :zlib_error}
+    after
+      :zlib.close(z)
+    end
+  end
+
+  defp drain_until_null(z, input, acc) do
+    {status, out} = :zlib.safeInflate(z, input)
+    acc = acc <> IO.iodata_to_binary(out)
+
+    case :binary.match(acc, <<0>>) do
+      {pos, 1} ->
+        {:ok, binary_part(acc, 0, pos)}
+
+      :nomatch ->
+        cond do
+          byte_size(acc) > @max_header_bytes -> {:error, :malformed_object_header}
+          status == :finished -> {:error, :malformed_object_header}
+          true -> drain_until_null(z, [], acc)
+        end
+    end
+  end
+
+  defp packed_object_size(root, sha) do
+    case get_from_packs(root, sha) do
+      {:ok, obj} -> {:ok, IO.iodata_length(Exgit.Object.encode(obj))}
+      {:error, _} = err -> err
+    end
+  end
+
   @spec put_object(t(), Exgit.Object.t()) :: {:ok, binary()} | {:error, term()}
   def put_object(%__MODULE__{root: root}, object) do
     {sha, raw} = object_raw(object)
@@ -199,7 +273,7 @@ defmodule Exgit.ObjectStore.Disk do
   defp parse_loose_object(raw) do
     case :binary.match(raw, <<0>>) do
       {pos, 1} ->
-        <<header::binary-size(pos), 0, content::binary>> = raw
+        <<header::binary-size(^pos), 0, content::binary>> = raw
 
         with {:ok, type, size} <- parse_loose_header(header),
              :ok <- check_loose_size(content, size) do
@@ -445,6 +519,8 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Disk do
       end
     )
   end
+
+  def object_size(store, sha), do: Disk.object_size(store, sha)
 
   def import_objects(store, raw_objects) do
     failures =

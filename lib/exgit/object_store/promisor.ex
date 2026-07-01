@@ -325,6 +325,22 @@ defmodule Exgit.ObjectStore.Promisor do
     ObjectStore.Memory.has_object?(cache, sha)
   end
 
+  @doc """
+  Uncompressed byte size of `sha` IF it is already cached locally —
+  without triggering a fetch. Returns `{:error, :not_local}` when the
+  object has not been fetched yet, so a size check can never silently
+  pull a multi-GB blob over the network.
+  """
+  @spec object_size(t(), binary()) ::
+          {:ok, non_neg_integer()} | {:error, :not_local}
+  def object_size(%__MODULE__{cache: cache}, sha) do
+    if ObjectStore.Memory.has_object?(cache, sha) do
+      ObjectStore.Memory.object_size(cache, sha)
+    else
+      {:error, :not_local}
+    end
+  end
+
   @doc "Merge `raw_objects` into the cache."
   @spec import_objects(t(), [{atom(), binary(), binary()}]) :: {:ok, t()}
   def import_objects(%__MODULE__{cache: cache} = p, raw_objects) do
@@ -644,6 +660,8 @@ defimpl Exgit.ObjectStore, for: Exgit.ObjectStore.Promisor do
       end
     )
   end
+
+  def object_size(store, sha), do: Promisor.object_size(store, sha)
 
   def import_objects(store, raw_objects),
     do: Promisor.import_objects(store, raw_objects)
