@@ -20,6 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broken server can no longer stream unbounded refs into client
   memory; the transport stream halts once the cap trips. Real repos
   (linux, esp-idf) sit far below this.
+- **Dependencies bumped to clear HTTP-stack advisories.** `req`
+  `0.5.17 → 0.6.2` and `mint `1.7.1 → 1.9.0` resolve the decompression-
+  bomb DoS (CVE-2026-49755), multipart header injection
+  (CVE-2026-49756), and HTTP/2 CONTINUATION flood (CVE-2026-49754).
+  The cross-origin credential-leak test suite was re-run against the
+  new `req` line. The only remaining `mix hex.audit` advisories are in
+  `cowlib`, reachable solely through the `only: :test` `bypass`
+  dependency — never part of the published package or a consumer's
+  runtime.
 
 ### Notes
 
