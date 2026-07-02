@@ -84,8 +84,8 @@ The on-disk format is a standard bare git repo — `git log`, `git fsck`, and fr
 
 There's a runnable worked example at
 [`examples/partial_clone_demo.exs`](examples/partial_clone_demo.exs) —
-`Mix.install`, partial clone, one file read, and a `memory_report/1`
-comparison proving exactly one blob crossed the wire:
+`Mix.install`, partial clone, one file read, with `memory_report/1`
+showing `blob_count: 0 -> 1` around the read:
 
 ```sh
 elixir examples/partial_clone_demo.exs
