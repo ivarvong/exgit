@@ -1244,6 +1244,13 @@ defmodule Exgit.FS do
 
   @doc """
   Write `content` to `path`. Returns `{:ok, new_tree_sha, repo}`.
+
+  An unborn base — a ref *name* with no entry in the ref store, as on a
+  freshly initialized or cloned-empty repository — starts from the empty
+  tree, mirroring how `Exgit.Workspace.commit/2` treats an unborn ref as
+  parentless. A raw SHA that fails to resolve stays `{:error, :not_found}`:
+  in a lazy clone that is a missing object, and starting from empty there
+  would silently drop every existing entry from the produced tree.
   """
   @spec write_path(Repository.t(), ref(), path(), binary(), keyword()) ::
           {:ok, binary(), Repository.t()} | {:error, term()}
@@ -1254,14 +1261,39 @@ defmodule Exgit.FS do
     if segments == [] do
       {:error, :cannot_write_root}
     else
-      with {:ok, tree_sha, repo} <- resolve_tree(repo, reference) do
+      with {:ok, base, repo} <- resolve_base_tree_for_write(repo, reference) do
         blob = Blob.new(content)
         {:ok, blob_sha, store} = ObjectStore.put(repo.object_store, blob)
         repo = %{repo | object_store: store}
 
-        insert_blob_into_tree(repo, tree_sha, segments, mode, blob_sha)
+        case base do
+          {:tree, tree_sha} -> insert_blob_into_tree(repo, tree_sha, segments, mode, blob_sha)
+          :unborn -> insert_blob_into_empty(repo, segments, mode, blob_sha)
+        end
       end
     end
+  end
+
+  defp resolve_base_tree_for_write(repo, reference) do
+    case resolve_tree(repo, reference) do
+      {:ok, tree_sha, repo} ->
+        {:ok, {:tree, tree_sha}, repo}
+
+      {:error, :not_found} = err ->
+        if unborn_ref?(repo, reference), do: {:ok, :unborn, repo}, else: err
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  # Unborn means the reference is a ref name (per the same heuristic
+  # resolve_tree/2 uses to tell names from raw SHAs) that the ref store
+  # has no entry for. A ref that resolves to a SHA whose object is
+  # missing is NOT unborn — that is a lazy-clone fetch miss.
+  defp unborn_ref?(repo, reference) do
+    ref_name? = byte_size(reference) != 20 or printable_ascii_ref?(reference)
+    ref_name? and match?({:error, :not_found}, RefStore.resolve(repo.ref_store, reference))
   end
 
   defp insert_blob_into_tree(repo, tree_sha, [name], mode, blob_sha) do
