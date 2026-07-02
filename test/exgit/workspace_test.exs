@@ -287,3 +287,42 @@ defmodule Exgit.WorkspaceTest do
     end
   end
 end
+
+defmodule Exgit.WorkspaceUnbornRefTest do
+  use ExUnit.Case, async: true
+
+  alias Exgit.Workspace
+
+  describe "workspace over an unborn branch" do
+    test "write starts from the empty tree; commit and read work" do
+      {:ok, repo} = Exgit.init()
+      ws = Workspace.open(repo, "refs/heads/main")
+
+      assert {:ok, ws} = Workspace.write(ws, "/hello.txt", "hi\n")
+
+      assert {:ok, _sha, ws} =
+               Workspace.commit(ws,
+                 message: "first",
+                 author: %{name: "t", email: "t@t"},
+                 update_ref: "refs/heads/main"
+               )
+
+      assert {:ok, "hi\n", _ws} = Workspace.read(ws, "/hello.txt")
+    end
+
+    test "nested paths build intermediate trees from nothing" do
+      {:ok, repo} = Exgit.init()
+      ws = Workspace.open(repo, "refs/heads/main")
+
+      assert {:ok, ws} = Workspace.write(ws, "/a/b/c.txt", "deep\n")
+      assert {:ok, "deep\n", _ws} = Workspace.read(ws, "/a/b/c.txt")
+    end
+
+    test "a missing raw SHA base is still an error, not an empty tree" do
+      {:ok, repo} = Exgit.init()
+      ws = Workspace.open(repo, <<0::160>>)
+
+      assert {:error, :not_found} = Workspace.write(ws, "/hello.txt", "hi\n")
+    end
+  end
+end
