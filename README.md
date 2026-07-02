@@ -82,6 +82,15 @@ refetch. Perfect for agent loops that want snapshot semantics.
 
 The on-disk format is a standard bare git repo — `git log`, `git fsck`, and friends all work on it.
 
+There's a runnable worked example at
+[`examples/partial_clone_demo.exs`](examples/partial_clone_demo.exs) —
+`Mix.install`, partial clone, one file read, and a `memory_report/1`
+comparison proving exactly one blob crossed the wire:
+
+```sh
+elixir examples/partial_clone_demo.exs
+```
+
 ### Private repos
 
 ```elixir
